@@ -1,0 +1,2898 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🎙️ Plauder</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161a21;
+      --panel-2: #1d222b;
+      --text: #e6e8ec;
+      --muted: #8b93a3;
+      --accent: #7aa2ff;
+      --accent-2: #a78bfa;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --err: #f87171;
+      --border: #232a36;
+      --mic-active: #ef4444;
+      --bubble-user: #2a3a5c;
+      --bubble-agent: #3a2e52;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      height: 100%;
+    }
+    body { display: flex; flex-direction: column; min-height: 100vh; }
+    header {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 14px;
+    }
+    /* Mic lebt jetzt im Header (kompakter als der frühere 96px-Hero). */
+    header .mic-btn { width: 48px; height: 48px; font-size: 22px; border-width: 2px; flex: 0 0 auto; }
+    .header-meter { width: 90px; flex: 0 0 auto; }
+
+    /* Body: Chat + (optional rechts angedockter) Einstellungen-Drawer */
+    .body { flex: 1; display: flex; min-height: 0; }
+    section.chat { flex: 1; min-width: 0; }
+
+    /* Footer: Status links, Stats rechts */
+    footer {
+      padding: 8px 16px; border-top: 1px solid var(--border);
+      background: var(--panel); display: flex; align-items: center; gap: 14px;
+      font-size: 12.5px; flex-wrap: wrap;
+    }
+    footer .mic-status { text-align: left; min-height: 0; }
+    .foot-stats { margin-left: auto; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; color: var(--muted); }
+    .foot-stats strong { font-variant-numeric: tabular-nums; color: var(--text); }
+    .foot-stats .qs-sub { opacity: .55; font-size: 11px; }
+    .foot-stats .fs-sep { opacity: .3; }
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .label {
+      font-size: 11px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.8px;
+      margin-bottom: 6px;
+    }
+    .value { font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--muted); flex-shrink: 0;
+      transition: background .2s, box-shadow .3s;
+    }
+    .dot.ok   { background: var(--ok);   box-shadow: 0 0 0 4px rgba(74,222,128,.15); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 0 4px rgba(251,191,36,.15); }
+    .dot.err  { background: var(--err);  box-shadow: 0 0 0 4px rgba(248,113,113,.15); }
+    button {
+      appearance: none;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font: inherit; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #232a36; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+
+    /* Mikro */
+    .mic-wrap {
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      padding: 16px 12px;
+    }
+    .mic-btn {
+      width: 96px; height: 96px;
+      border-radius: 50%;
+      background: var(--panel-2);
+      border: 2px solid var(--border);
+      color: var(--text);
+      font-size: 38px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; position: relative;
+      transition: background .2s, border-color .2s, transform .15s;
+    }
+    .mic-btn.active { background: var(--mic-active); border-color: var(--mic-active); color: #fff; }
+    .mic-btn.active::before {
+      content: ""; position: absolute; inset: -8px;
+      border-radius: 50%;
+      border: 2px solid var(--mic-active);
+      opacity: 0.6;
+      animation: ring 1.6s ease-out infinite;
+    }
+    @keyframes ring {
+      0%   { transform: scale(0.85); opacity: 0.7; }
+      100% { transform: scale(1.25); opacity: 0; }
+    }
+    .mic-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+    .mic-status { font-size: 13px; color: var(--muted); text-align: center; min-height: 1.4em; }
+    .mic-status.speaking { color: var(--ok); font-weight: 600; }
+    .mic-status.thinking { color: var(--accent-2); font-weight: 600; }
+    .mic-status.collecting { color: var(--warn); font-weight: 600; }
+
+    .meter {
+      height: 8px; border-radius: 4px; background: var(--bg);
+      border: 1px solid var(--border); overflow: hidden;
+    }
+    .meter-bar {
+      height: 100%; width: 0%;
+      /* Gradient ist über background-size (JS) an die volle SPUR-Breite gekoppelt,
+         nicht an die Balkenbreite → bei niedrigem Pegel sieht man nur den grünen
+         Anfang; Gelb/Rot tauchen erst auf, wenn der Pegel groß wird. */
+      background: linear-gradient(to right, var(--ok) 0%, var(--ok) 55%, var(--warn) 82%, var(--err) 100%);
+      background-repeat: no-repeat;
+      transition: width 80ms linear;
+    }
+
+    /* VAD-Live-Sprach-Pegel mit Schwellen-Markierung */
+    .vad-prob {
+      position: relative; height: 10px; margin-top: 8px;
+      border-radius: 5px; background: var(--bg);
+      border: 1px solid var(--border); overflow: hidden;
+    }
+    .vad-prob-bar {
+      height: 100%; width: 0%;
+      background: linear-gradient(to right, var(--ok), var(--warn));
+      transition: width 60ms linear;
+    }
+    .vad-prob-mark {
+      position: absolute; top: -2px; bottom: -2px; width: 2px;
+      background: var(--err); left: 60%;
+      box-shadow: 0 0 2px var(--err);
+    }
+
+    /* Slider Card */
+    .slider-row { display: flex; align-items: center; gap: 10px; }
+    .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .slider-row .num { font-variant-numeric: tabular-nums; min-width: 4em; text-align: right; }
+
+    /* Input-Mode Pills */
+    .input-mode-row { display: flex; gap: 8px; }
+    .mode-pill {
+      flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 8px 10px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; cursor: pointer;
+      font-size: 13px;
+      transition: background .15s, border-color .15s;
+    }
+    .mode-pill input { accent-color: var(--accent); margin: 0; }
+    .mode-pill:has(input:checked) {
+      background: rgba(122,162,255,0.12);
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    /* PTT: visueller Recording-State am Mic-Button (rot pulsierend wie active) */
+    .mic-btn.recording {
+      background: var(--mic-active);
+      border-color: var(--mic-active);
+      color: #fff;
+      transform: scale(0.96);
+    }
+
+    /* Chat */
+    section.chat {
+      display: flex; flex-direction: column;
+      padding: 18px 24px;
+      min-height: 0;
+    }
+    .chat-log {
+      flex: 1;
+      overflow-y: auto;
+      display: flex; flex-direction: column;
+      gap: 10px;
+      padding: 8px 4px;
+    }
+
+    /* Composer (Text + Upload) */
+    .composer {
+      margin-top: 12px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .composer-images {
+      display: flex; flex-wrap: wrap; gap: 8px;
+    }
+    .composer-images:empty { display: none; }
+    .img-chip {
+      position: relative;
+      width: 60px; height: 60px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+    }
+    .img-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .img-chip.uploading::after {
+      content: "⏳";
+      position: absolute; inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px;
+    }
+    .img-chip.error { border-color: var(--err); }
+    .img-chip.error::after {
+      content: "!";
+      position: absolute; top: 2px; right: 4px;
+      color: var(--err); font-weight: 700;
+    }
+    .img-chip .x {
+      position: absolute; top: 2px; right: 2px;
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.7); color: #fff;
+      border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; line-height: 1;
+    }
+    .composer-row {
+      display: flex; align-items: flex-end; gap: 8px;
+    }
+    .composer-row textarea {
+      flex: 1;
+      resize: none;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: inherit; line-height: 1.4;
+      min-height: 42px; max-height: 200px;
+      outline: none;
+    }
+    .composer-row textarea:focus { border-color: var(--accent); }
+    .composer-row .icon-btn {
+      width: 42px; height: 42px;
+      padding: 0;
+      border-radius: 10px;
+      font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      flex: 0 0 auto;
+    }
+    .composer-row .send-btn {
+      background: var(--accent); color: #0f1115; border-color: var(--accent);
+      font-weight: 600;
+    }
+    .composer-row .send-btn:hover:not(:disabled) { background: #8fb3ff; }
+    .composer-row .send-btn:disabled { background: var(--panel-2); color: var(--muted); border-color: var(--border); }
+    .composer-hint {
+      font-size: 11px; color: var(--muted);
+      padding: 0 4px;
+    }
+
+    /* Bilder in User-Bubbles */
+    .bubble .images {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      margin-bottom: 6px;
+    }
+    .bubble .images img {
+      max-width: 140px; max-height: 140px;
+      border-radius: 8px; display: block;
+    }
+    .bubble {
+      max-width: 75%;
+      padding: 10px 14px;
+      border-radius: 16px;
+      line-height: 1.4;
+      font-size: 14px;
+      word-wrap: break-word;
+      animation: slide-in .2s ease-out;
+    }
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .bubble .meta {
+      font-size: 10.5px; color: var(--muted);
+      margin-top: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: var(--bubble-user);
+      border-bottom-right-radius: 4px;
+    }
+    .bubble.agent {
+      align-self: flex-start;
+      background: var(--bubble-agent);
+      border-bottom-left-radius: 4px;
+    }
+    .bubble.sys {
+      align-self: center;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      padding: 4px 10px;
+    }
+    .bubble.err {
+      align-self: center;
+      background: rgba(248,113,113,.12);
+      border: 1px solid rgba(248,113,113,.3);
+      color: var(--err);
+      font-size: 12px;
+    }
+    /* Externe Messages aus Telegram — dieselbe Seite wie User/Agent, aber
+       andere Farbe + kleines Telegram-Icon vorne. */
+    .bubble.ext-user {
+      align-self: flex-end;
+      background: rgba(56, 161, 230, 0.18); /* Telegram-Blau, gedimmt */
+      border: 1px solid rgba(56, 161, 230, 0.45);
+      border-bottom-right-radius: 4px;
+    }
+    .bubble.ext-agent {
+      align-self: flex-start;
+      background: rgba(56, 161, 230, 0.10);
+      border: 1px solid rgba(56, 161, 230, 0.30);
+      border-bottom-left-radius: 4px;
+    }
+    .bubble.ext-user::before, .bubble.ext-agent::before {
+      content: "✈ Telegram";
+      display: block;
+      font-size: 10px;
+      color: rgba(56, 161, 230, 0.95);
+      letter-spacing: 0.04em;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .bubble.pending { opacity: 0.7; border: 1px dashed rgba(255,255,255,.15); }
+    .bubble.partial { font-style: italic; opacity: 0.8; }
+    .bubble.wake-ignored { opacity: 0.5; font-size: 0.85em; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.12); }
+    .bubble.wake-armed { color: var(--ok); }
+    .bubble.silent { opacity: 0.65; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.18); }
+    .bubble.discarded {
+      opacity: 0.4;
+      text-decoration: line-through;
+      text-decoration-color: rgba(255,255,255,.5);
+    }
+    .bubble.collecting::after {
+      content: " ●";
+      animation: pulse 1.2s infinite;
+      color: var(--warn);
+    }
+    @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+    /* === Markdown-Rendering in Agent-Bubbles === */
+    .bubble .md > *:first-child { margin-top: 0; }
+    .bubble .md > *:last-child  { margin-bottom: 0; }
+    .bubble .md p { margin: 0 0 8px 0; }
+    .bubble .md p:last-child { margin-bottom: 0; }
+    .bubble .md h1, .bubble .md h2, .bubble .md h3,
+    .bubble .md h4, .bubble .md h5, .bubble .md h6 {
+      margin: 10px 0 4px;
+      font-weight: 600;
+      line-height: 1.25;
+    }
+    .bubble .md h1 { font-size: 1.25em; }
+    .bubble .md h2 { font-size: 1.15em; }
+    .bubble .md h3 { font-size: 1.05em; }
+    .bubble .md h4, .bubble .md h5, .bubble .md h6 { font-size: 1em; }
+    .bubble .md ul, .bubble .md ol { margin: 4px 0 8px; padding-left: 22px; }
+    .bubble .md li { margin: 2px 0; }
+    .bubble .md code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.92em;
+      background: rgba(255,255,255,0.08);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .bubble .md pre {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 6px 0;
+      overflow-x: auto;
+      font-size: 0.88em;
+      line-height: 1.4;
+    }
+    .bubble .md pre code {
+      background: transparent; padding: 0; border-radius: 0;
+      font-size: inherit;
+    }
+    .bubble .md blockquote {
+      margin: 6px 0;
+      padding: 4px 12px;
+      border-left: 3px solid rgba(255,255,255,0.2);
+      color: var(--muted);
+    }
+    .bubble .md a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-color: rgba(122,162,255,0.4);
+    }
+    .bubble .md a:hover { text-decoration-color: var(--accent); }
+    .bubble .md hr {
+      border: none;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      margin: 10px 0;
+    }
+    .bubble .md strong { font-weight: 600; }
+    .bubble .md em { font-style: italic; }
+    .bubble .md del { opacity: 0.6; }
+    .bubble .md table {
+      border-collapse: collapse;
+      margin: 6px 0;
+      font-size: 0.92em;
+    }
+    .bubble .md th, .bubble .md td {
+      border: 1px solid rgba(255,255,255,0.12);
+      padding: 4px 8px;
+      text-align: left;
+    }
+    .bubble .md th { background: rgba(255,255,255,0.04); font-weight: 600; }
+
+    .footer-note {
+      padding: 10px 14px;
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      color: var(--muted); font-size: 12px;
+    }
+
+    /* === Header: Status-Pills + Burger === */
+    .header-status { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+    .status-pill { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+    .status-pill .dot { width: 9px; height: 9px; }
+    .burger {
+      width: 40px; height: 40px; padding: 0; font-size: 18px;
+      display: flex; align-items: center; justify-content: center; border-radius: 10px;
+    }
+    @media (max-width: 760px) { .status-pill .lbl { display: none; } }
+
+    /* === Mic-Zustände (Farbe = Modus/Status) === */
+    /* grün: Wake-Modus, wartet aufs Weckwort */
+    .mic-btn.wake-idle { background: rgba(74,222,128,.14); border-color: var(--ok); color: var(--ok); }
+    .mic-btn.wake-idle::before {
+      content: ""; position: absolute; inset: -7px; border-radius: 50%;
+      border: 2px solid var(--ok); animation: breathe 2.8s ease-in-out infinite;
+    }
+    @keyframes breathe {
+      0%,100% { transform: scale(.9);  opacity: .12; }
+      50%     { transform: scale(1.05); opacity: .5; }
+    }
+    /* rot + lebhafte Aura: Wake-Fenster aktiv (Gespräch offen) */
+    .mic-btn.wake-open { animation: wakeAura 1.25s ease-out infinite; }
+    @keyframes wakeAura {
+      0%   { box-shadow: 0 0 0 0   rgba(239,68,68,.55), 0 0 20px 5px  rgba(239,68,68,.35); }
+      70%  { box-shadow: 0 0 0 18px rgba(239,68,68,0),  0 0 30px 10px rgba(239,68,68,.12); }
+      100% { box-shadow: 0 0 0 0   rgba(239,68,68,0),  0 0 20px 5px  rgba(239,68,68,0); }
+    }
+
+    /* === Antwortzeit-Kurzstat (Sidebar) === */
+    .quickstat { display: flex; align-items: baseline; gap: 8px; }
+    .quickstat .qs-key { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
+    .quickstat strong { font-variant-numeric: tabular-nums; color: var(--accent); font-size: 16px; }
+    .quickstat .qs-sub { opacity: .55; font-size: 11px; }
+
+    /* === Einstellungen-Drawer === */
+    .drawer-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55);
+      opacity: 0; visibility: hidden; transition: opacity .2s; z-index: 40;
+    }
+    .drawer-overlay.open { opacity: 1; visibility: visible; }
+    .drawer {
+      position: fixed; top: 0; right: 0; height: 100%;
+      width: 380px; max-width: 92vw;
+      background: var(--panel); border-left: 1px solid var(--border);
+      transform: translateX(100%); transition: transform .25s ease;
+      z-index: 50; overflow-y: auto; padding: 18px;
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer-head { display: flex; align-items: center; justify-content: space-between; }
+    .drawer-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+    .close-btn { width: 36px; height: 36px; padding: 0; border-radius: 10px; font-size: 16px; }
+
+    /* Mic-Button signalisiert „läuft – Klick stoppt" (⏹) während Verarbeitung. */
+    .mic-btn.busy { cursor: pointer; }
+
+    /* Drawer: mobil/schmal = modal über dem Chat (Backdrop sichtbar).
+       Ab genug Breite = rechts angedockt, schiebt den Chat zusammen, kein
+       Backdrop → man kann ihn offen lassen und weiter chatten. */
+    @media (min-width: 1100px) {
+      .drawer {
+        position: relative; transform: none; z-index: auto;
+        height: auto; width: 0; max-width: none; padding: 0;
+        overflow: hidden; flex: 0 0 auto;
+        transition: width .25s ease, padding .25s ease;
+      }
+      .drawer.open { width: 360px; padding: 18px; overflow-y: auto; }
+      .drawer-overlay { display: none !important; }
+      .close-btn { display: none; }   /* angedockt: schließen per ☰ */
+    }
+
+    /* === Mobil/schmal: aufgeräumter, kompakter === */
+    @media (max-width: 760px) {
+      /* Footer: nur die End-to-End-Latenz, Detailwerte weglassen */
+      .foot-stats .fs-item:not(.fs-e2e), .foot-stats .fs-sep { display: none; }
+      .foot-stats .fs-e2e .qs-sub { display: none; }   /* nur die Zahl */
+      /* Composer-Hinweis ausblenden (Platz sparen) */
+      .composer-hint { display: none; }
+      /* Chat kompakter */
+      section.chat { padding: 10px 12px; }
+      .chat-log { gap: 6px; padding: 4px 2px; }
+      .bubble { font-size: 13px; padding: 8px 11px; max-width: 90%; }
+      .composer { padding: 8px; margin-top: 8px; }
+      header { padding: 8px 12px; gap: 10px; }
+      footer { padding: 6px 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="micBtn" class="mic-btn" disabled title="Mikrofon — Klick stoppt eine laufende Antwort">🎤</button>
+    <div class="meter header-meter"><div id="meterBar" class="meter-bar"></div></div>
+    <div class="header-status">
+      <span class="status-pill" title="WebSocket-Verbindung zum Server">
+        <span id="wsDot" class="dot"></span><span class="lbl" id="wsStatus">verbinde…</span>
+      </span>
+      <span class="status-pill" title="Voice Activity Detection (Browser-VAD)">
+        <span id="vadDot" class="dot"></span><span class="lbl" id="vadStatus">VAD</span>
+      </span>
+      <button id="settingsBtn" class="burger" title="Einstellungen">☰</button>
+    </div>
+  </header>
+
+  <div class="body">
+    <section class="chat">
+      <div id="chatLog" class="chat-log" aria-live="polite"></div>
+      <div class="composer">
+        <div id="composerImages" class="composer-images"></div>
+        <div class="composer-row">
+          <button id="attachBtn" class="icon-btn" title="Bild anhängen">📎</button>
+          <input id="fileInput" type="file" accept="image/*" multiple style="display:none" />
+          <textarea id="textInput" rows="1" placeholder="Nachricht … (Enter = senden, Shift+Enter = neue Zeile)"></textarea>
+          <button id="sendBtn" class="icon-btn send-btn" title="Senden" disabled>➤</button>
+        </div>
+        <div class="composer-hint">Text öffnet den Voice-Flow nicht – Mikro läuft parallel weiter. Bilder per 📎, Drag&amp;Drop oder Strg+V einfügen.</div>
+      </div>
+    </section>
+
+    <!-- Einstellungen-Drawer: rechts angedockt (breit) bzw. modal (mobil) -->
+    <aside id="settingsDrawer" class="drawer" aria-hidden="true">
+      <div class="drawer-head">
+        <h2>⚙️ Einstellungen</h2>
+        <button id="closeSettingsBtn" class="close-btn" title="Schließen">✕</button>
+      </div>
+
+      <!-- Eingabe-Modus: VAD / Wake-Word / Push-to-Talk -->
+      <div class="card">
+        <div class="label">Eingabe-Modus</div>
+        <div class="input-mode-row">
+          <label class="mode-pill">
+            <input type="radio" name="inputMode" value="vad" checked />
+            <span>VAD (auto)</span>
+          </label>
+          <label class="mode-pill">
+            <input type="radio" name="inputMode" value="wake" />
+            <span>Wake-Word</span>
+          </label>
+          <label class="mode-pill">
+            <input type="radio" name="inputMode" value="ptt" />
+            <span>Push-to-Talk</span>
+          </label>
+        </div>
+        <div id="inputModeHint" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+          VAD: Mikro starten – Sprache wird automatisch erkannt und gesendet.
+        </div>
+      </div>
+
+      <!-- VAD-Empfindlichkeit: Schwelle + Live-Sprach-Pegel -->
+    <div class="card" id="vadThreshCard">
+      <div class="label">VAD-Empfindlichkeit</div>
+      <div class="slider-row">
+        <input id="vadThreshold" type="range" min="0.1" max="0.95" step="0.05" value="0.6" />
+        <span id="vadThresholdLabel" class="num">0.60</span>
+      </div>
+      <div class="vad-prob" title="Live-Sprach-Pegel der VAD">
+        <div id="vadProbBar" class="vad-prob-bar"></div>
+        <div id="vadProbMark" class="vad-prob-mark"></div>
+      </div>
+      <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+        Niedriger = empfindlicher (reagiert auf leise/kurze Laute). Höher = du musst
+        deutlicher sprechen. Sprich zum Testen: bleibt der grüne Pegel <b>unter</b> der
+        roten Linie, wenn nur Hintergrundgeräusch/TTS läuft, und schießt <b>darüber</b>,
+        wenn du sprichst — dann sitzt die Schwelle richtig.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Sprechgeschwindigkeit</div>
+      <div class="slider-row">
+        <input id="speed" type="range" min="0.7" max="1.2" step="0.05" value="0.95" />
+        <span id="speedLabel" class="num">0.95x</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Denkpausen-Toleranz</div>
+      <div class="slider-row">
+        <input id="debounce" type="range" min="400" max="5000" step="100" value="1200" />
+        <span id="debounceLabel" class="num">1.2s</span>
+      </div>
+      <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+        Wie lange darfst du innerhalb eines Satzes pausieren, ohne dass der Agent vorzeitig antwortet?
+        Wirkt sowohl auf das Browser-VAD als auch auf den Server-Debounce.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Lautstärke</div>
+      <div class="slider-row">
+        <input id="volume" type="range" min="0" max="100" value="80" />
+        <span id="volumeLabel" class="num">80%</span>
+      </div>
+      <div style="font-size: 11px; color: var(--muted); margin-top: 8px;">
+        Wake-Töne (Pling/Plong) · 0 = aus
+      </div>
+      <div class="slider-row">
+        <input id="cueVolume" type="range" min="0" max="100" value="70" />
+        <span id="cueVolumeLabel" class="num">70%</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">Verbindung / Session</div>
+      <div class="row" style="margin-bottom:8px;">
+        <button id="pingBtn">Ping</button>
+        <button id="reconnectBtn">Reconnect</button>
+      </div>
+      <div class="row">
+        <button id="newSessionBtn" title="Bisherigen Gesprächsverlauf verwerfen und in einer frischen LLM-Session weitermachen">🆕 Neue Session</button>
+      </div>
+    </div>
+
+      <div class="footer-note" id="footerNote">
+        Sprich → Pause → der Agent antwortet.<br />
+        Sprich nochmal während der Agent denkt → sein Reply wird verworfen.
+      </div>
+    </aside>
+  </div>
+
+  <!-- Backdrop nur im modalen (schmalen) Modus sichtbar -->
+  <div id="drawerOverlay" class="drawer-overlay"></div>
+
+  <footer>
+    <span id="micStatus" class="mic-status">Mikro nicht aktiv</span>
+    <div class="foot-stats">
+      <span class="fs-item fs-e2e" title="Zeit von 'fertig gesprochen' bis die Wiedergabe startet (End-to-End, inkl. Debounce-Pause).">
+        Antwort <strong id="lastE2e">–</strong>
+        <span class="qs-sub" id="e2eBreakdown">bis Wiedergabe</span>
+      </span>
+      <span class="fs-sep">·</span>
+      <span class="fs-item">STT <strong id="lastLatency">–</strong></span>
+      <span class="fs-item"><span id="statsAgentLabel">Agent</span> <strong id="lastLlm">–</strong></span>
+      <span class="fs-item">TTS <strong id="lastTts">–</strong></span>
+      <span class="fs-item">Seg <strong id="segCount">0</strong></span>
+    </div>
+  </footer>
+
+  <script src="/static/vendor/ort.js"></script>
+  <script>
+    // ort sucht die WASM-Dateien standardmäßig im Build-Verzeichnis.
+    // Wir hosten sie unter /static/vendor/ — darauf zeigen wir hier.
+    if (window.ort && window.ort.env && window.ort.env.wasm) {
+      window.ort.env.wasm.wasmPaths = '/static/vendor/';
+    }
+  </script>
+  <script src="/static/vendor/bundle.min.js"></script>
+
+  <script>
+    /* ===== Agent-Name & Input-Mode =====
+       AGENT_NAME wird vom Server im `hello`-Frame überschrieben.
+       inputMode steuert, ob VAD automatisch segmentiert oder ob der User
+       per Push-to-Talk (Mikro-Button gedrückt halten) aufnimmt.
+    */
+    let AGENT_NAME = 'Agent';
+    // 'vad'  = Dauerhören, VAD segmentiert automatisch.
+    // 'wake' = wie VAD, aber der Server reagiert nur nach dem Wake-Word.
+    // 'ptt'  = Push-to-Talk (Mikro-Button gedrückt halten).
+    let inputMode = 'vad';
+    // VAD-artige Modi (Dauerhören mit Auto-Segmentierung): VAD und Wake-Word.
+    // Push-to-Talk verhält sich anders (Mic-Button = Aufnahme).
+    const vadLike = () => inputMode === 'vad' || inputMode === 'wake';
+    // Zuletzt gewählter Modus (über Reloads gemerkt); null = keiner gespeichert.
+    const STORED_MODE = (() => {
+      const m = localStorage.getItem('inputMode');
+      return (m === 'vad' || m === 'wake' || m === 'ptt') ? m : null;
+    })();
+
+    function applyAgentName(name) {
+      if (!name || typeof name !== 'string') return;
+      AGENT_NAME = name;
+      try {
+        document.title = `🎙️ Plauder – ${AGENT_NAME}`;
+        const h = document.getElementById('headerTitle');
+        if (h) h.textContent = `Plauder – ${AGENT_NAME}`;
+        const lbl = document.getElementById('statsAgentLabel');
+        if (lbl) lbl.textContent = AGENT_NAME;
+      } catch (_) {}
+    }
+
+    /* ===== DOM ===== */
+    const chatLog       = document.getElementById('chatLog');
+    const wsDot         = document.getElementById('wsDot');
+    const wsStatus      = document.getElementById('wsStatus');
+    const vadDot        = document.getElementById('vadDot');
+    const vadStatus     = document.getElementById('vadStatus');
+    const segCount      = document.getElementById('segCount');
+    const lastLatency   = document.getElementById('lastLatency');
+    const lastLlm       = document.getElementById('lastLlm');
+    const lastTts       = document.getElementById('lastTts');
+    const lastE2e       = document.getElementById('lastE2e');
+    const e2eBreakdown  = document.getElementById('e2eBreakdown');
+
+    // Latenz-Stats: "erste / gesamt" pro Phase. First-Werte kommen mit
+    // audio.start (Streaming), Gesamt-Werte mit reply/audio.end.
+    let statLlmFirst = null, statLlmTotal = null;
+    let statTtsFirst = null, statTtsTotal = null;
+    const fmtMs = (v) => (v == null ? '–' : `${v}ms`);
+    function renderLlmStat() {
+      lastLlm.textContent = (statLlmFirst != null)
+        ? `${statLlmFirst}ms / ${fmtMs(statLlmTotal)}` : fmtMs(statLlmTotal);
+    }
+    function renderTtsStat() {
+      lastTts.textContent = (statTtsFirst != null)
+        ? `${statTtsFirst}ms / ${fmtMs(statTtsTotal)}` : fmtMs(statTtsTotal);
+    }
+    const pingBtn       = document.getElementById('pingBtn');
+    const reconnectBtn  = document.getElementById('reconnectBtn');
+    const newSessionBtn = document.getElementById('newSessionBtn');
+    const micBtn        = document.getElementById('micBtn');
+    const micStatus     = document.getElementById('micStatus');
+    const meterBar      = document.getElementById('meterBar');
+    const volume        = document.getElementById('volume');
+    const volumeLabel   = document.getElementById('volumeLabel');
+    const cueVolume     = document.getElementById('cueVolume');
+    const cueVolumeLabel = document.getElementById('cueVolumeLabel');
+    const speed         = document.getElementById('speed');
+    const speedLabel    = document.getElementById('speedLabel');
+    const debounce      = document.getElementById('debounce');
+    const debounceLabel = document.getElementById('debounceLabel');
+    const vadThreshold      = document.getElementById('vadThreshold');
+    const vadThresholdLabel = document.getElementById('vadThresholdLabel');
+    const vadProbBar        = document.getElementById('vadProbBar');
+    const vadProbMark       = document.getElementById('vadProbMark');
+
+    /* ===== Markdown-Renderer =====
+       Kompakter, eigenständiger Markdown→HTML-Renderer.
+       Die Agent-Antworten sind Markdown; im UI wollen wir sie gerendert sehen,
+       während die TTS-Stimme schon serverseitig den gereinigten Plaintext bekommt.
+
+       Sicher: jeder rohe Input wird ZUERST HTML-escapet, danach werden nur
+       Markdown-Konstrukte zu HTML promoted. Keine Lib, kein eval, kein innerHTML
+       mit nicht-escaptem User-Content.
+
+       Unterstützt:
+         - Fenced-Code-Blöcke ```lang ... ```
+         - Inline-Code `...`
+         - Überschriften # bis ######
+         - Listen (- * +) und nummeriert (1. 2.)
+         - Blockzitate >
+         - Horizontale Linien ---
+         - **bold**, *italic*, ~~strike~~
+         - [Text](url)  (nur http/https/mailto)
+         - Tabellen (GFM-Style mit |)
+         - Automatische http(s)://-Links
+    */
+    const MD_PLACEHOLDER_RE = /\u0000MD(\d+)\u0000/g;
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function safeUrl(url) {
+      // Erlaubt http(s)://, mailto:, und relative #anchor / /path
+      const u = String(url).trim();
+      if (/^(https?:\/\/|mailto:)/i.test(u)) return u;
+      if (/^[#\/]/.test(u)) return u;
+      return null;
+    }
+    function renderInline(text) {
+      // ACHTUNG: text muss bereits HTML-escapet sein!
+      let s = text;
+      // Inline-Code: `...`  — Inhalt wird KEINE weitere Inline-Verarbeitung erfahren.
+      // Wir entfernen temporär mit Platzhaltern.
+      const codeSlots = [];
+      s = s.replace(/`([^`\n]+)`/g, (_, code) => {
+        codeSlots.push(`<code>${code}</code>`);
+        return `\u0000IC${codeSlots.length - 1}\u0000`;
+      });
+      // Links: [text](url)
+      s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label, url) => {
+        const safe = safeUrl(url);
+        if (!safe) return m; // unsicher → unverändert lassen
+        return `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+      });
+      // Auto-Links http(s)://… (nur wenn nicht schon innerhalb eines href stehen)
+      s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)\]]+)/g, (m, pre, url) => {
+        const safe = safeUrl(url);
+        if (!safe) return m;
+        return `${pre}<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+      });
+      // Bold: **x** oder __x__
+      s = s.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/__([^_\n]+?)__/g, '<strong>$1</strong>');
+      // Italic: *x* oder _x_  (kein Wort-mittiges _)
+      s = s.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+      s = s.replace(/(^|\W)_([^_\n]+?)_(?!\w)/g, '$1<em>$2</em>');
+      // Strike: ~~x~~
+      s = s.replace(/~~([^~\n]+?)~~/g, '<del>$1</del>');
+      // Code-Platzhalter zurück einsetzen
+      s = s.replace(/\u0000IC(\d+)\u0000/g, (_, i) => codeSlots[Number(i)]);
+      return s;
+    }
+    function parseTableRow(line) {
+      // "| a | b | c |"  → ["a","b","c"]  (leading/trailing pipe optional)
+      let cells = line.trim();
+      if (cells.startsWith('|')) cells = cells.slice(1);
+      if (cells.endsWith('|')) cells = cells.slice(0, -1);
+      return cells.split('|').map(c => c.trim());
+    }
+    function isTableSeparator(line) {
+      // "|---|---|" oder "---|---"
+      const t = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+      if (!t.includes('|') && !t.includes('-')) return false;
+      return t.split('|').every(seg => /^\s*:?-{3,}:?\s*$/.test(seg));
+    }
+    function renderMarkdown(src) {
+      if (!src) return '';
+      // 1) Fenced code blocks extrahieren — ihr Inhalt darf NICHT inline-verarbeitet werden.
+      const codeBlocks = [];
+      let text = String(src).replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const langClass = lang ? ` class="lang-${escapeHtml(lang)}"` : '';
+        codeBlocks.push(`<pre><code${langClass}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+        return `\u0000MD${codeBlocks.length - 1}\u0000`;
+      });
+      // 2) HTML escapen — jetzt sicher
+      text = escapeHtml(text);
+      // 3) Zeilenweise blockbasiert parsen
+      const lines = text.split('\n');
+      const out = [];
+      let i = 0;
+      let para = [];
+      const flushPara = () => {
+        if (para.length) {
+          out.push(`<p>${renderInline(para.join(' ').trim())}</p>`);
+          para = [];
+        }
+      };
+      while (i < lines.length) {
+        const line = lines[i];
+        // Platzhalter (Code-Block) als eigene Zeile
+        if (/^\u0000MD\d+\u0000\s*$/.test(line)) {
+          flushPara();
+          out.push(line.trim());
+          i++; continue;
+        }
+        // Leerzeile → Absatz beenden
+        if (/^\s*$/.test(line)) {
+          flushPara();
+          i++; continue;
+        }
+        // Horizontale Linie
+        if (/^\s*(-\s*){3,}\s*$/.test(line) || /^\s*(\*\s*){3,}\s*$/.test(line) || /^\s*(_\s*){3,}\s*$/.test(line)) {
+          flushPara();
+          out.push('<hr>');
+          i++; continue;
+        }
+        // Überschriften
+        const h = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
+        if (h) {
+          flushPara();
+          const level = h[1].length;
+          out.push(`<h${level}>${renderInline(h[2])}</h${level}>`);
+          i++; continue;
+        }
+        // Tabelle (GFM)
+        if (/\|/.test(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+          flushPara();
+          const headers = parseTableRow(line);
+          i += 2; // überspringe Header + Separator
+          const rows = [];
+          while (i < lines.length && /\|/.test(lines[i]) && !/^\s*$/.test(lines[i])) {
+            rows.push(parseTableRow(lines[i]));
+            i++;
+          }
+          const thead = '<thead><tr>' + headers.map(h => `<th>${renderInline(h)}</th>`).join('') + '</tr></thead>';
+          const tbody = '<tbody>' + rows.map(r => '<tr>' + r.map(c => `<td>${renderInline(c)}</td>`).join('') + '</tr>').join('') + '</tbody>';
+          out.push(`<table>${thead}${tbody}</table>`);
+          continue;
+        }
+        // Blockzitat — nach escapeHtml ist ">" jetzt "&gt;".
+        if (/^\s{0,3}&gt;\s?/.test(line)) {
+          flushPara();
+          const quote = [];
+          while (i < lines.length && /^\s{0,3}&gt;\s?/.test(lines[i])) {
+            quote.push(lines[i].replace(/^\s{0,3}&gt;\s?/, ''));
+            i++;
+          }
+          out.push(`<blockquote>${renderInline(quote.join(' '))}</blockquote>`);
+          continue;
+        }
+        // Listen (ul/ol)
+        const ulMatch = line.match(/^(\s*)[-*+]\s+(.*)$/);
+        const olMatch = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+        if (ulMatch || olMatch) {
+          flushPara();
+          const ordered = !!olMatch;
+          const items = [];
+          while (i < lines.length) {
+            const m1 = lines[i].match(/^(\s*)[-*+]\s+(.*)$/);
+            const m2 = lines[i].match(/^(\s*)(\d+)\.\s+(.*)$/);
+            const matched = ordered ? m2 : m1;
+            if (!matched) break;
+            items.push(renderInline(matched[ordered ? 3 : 2]));
+            i++;
+            // Fortsetzungszeilen (eingerckt) zum vorherigen Item hängen
+            while (i < lines.length && /^ {2,}\S/.test(lines[i]) && !lines[i].match(/^\s*([-*+]|\d+\.)\s+/)) {
+              items[items.length - 1] += ' ' + renderInline(lines[i].trim());
+              i++;
+            }
+          }
+          const tag = ordered ? 'ol' : 'ul';
+          out.push(`<${tag}>${items.map(it => `<li>${it}</li>`).join('')}</${tag}>`);
+          continue;
+        }
+        // Sonst: Paragraph-Zeile
+        para.push(line);
+        i++;
+      }
+      flushPara();
+      // 4) Code-Block-Platzhalter zurück einsetzen
+      let html = out.join('\n');
+      html = html.replace(MD_PLACEHOLDER_RE, (_, idx) => codeBlocks[Number(idx)] || '');
+      return html;
+    }
+
+    /* ===== Hilfsfunktionen ===== */
+    function ts() {
+      const d = new Date();
+      const p = n => String(n).padStart(2,'0');
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+    function addBubble(cls, text, meta) {
+      const el = document.createElement('div');
+      el.className = `bubble ${cls}`;
+      el.textContent = text;
+      if (meta) {
+        const m = document.createElement('div');
+        m.className = 'meta'; m.textContent = meta;
+        el.appendChild(m);
+      }
+      chatLog.appendChild(el);
+      chatLog.scrollTop = chatLog.scrollHeight;
+      return el;
+    }
+    function setMeta(el, text) {
+      if (!el) return;
+      let m = el.querySelector('.meta');
+      if (!m) { m = document.createElement('div'); m.className = 'meta'; el.appendChild(m); }
+      m.textContent = text;
+    }
+
+    /* ===== Transkript über Reloads erhalten =====
+       Finalisierte User-/Agent-Nachrichten werden in localStorage gespeichert und
+       beim Laden wieder angezeigt. (Der LLM-Kontext bleibt serverseitig ohnehin
+       erhalten — gleicher session_user —, nur die Browser-Anzeige ging verloren.) */
+    const TRANSCRIPT_MAX = 80;
+    let savedTranscript = (() => {
+      try { return JSON.parse(localStorage.getItem('transcript') || '[]'); } catch (_) { return []; }
+    })();
+    function persistMsg(role, text, meta) {
+      const t = (text || '').trim();
+      if (!t) return;
+      savedTranscript.push({ role, text: t, meta: meta || '' });
+      if (savedTranscript.length > TRANSCRIPT_MAX) savedTranscript = savedTranscript.slice(-TRANSCRIPT_MAX);
+      try { localStorage.setItem('transcript', JSON.stringify(savedTranscript)); } catch (_) {}
+    }
+    function clearTranscript() {
+      savedTranscript = [];
+      try { localStorage.removeItem('transcript'); } catch (_) {}
+    }
+    function restoreTranscript() {
+      if (!savedTranscript.length) return;
+      addBubble('sys', '— vorherige Sitzung —');
+      for (const msg of savedTranscript) {
+        if (msg.role === 'agent') {
+          const el = document.createElement('div');
+          el.className = 'bubble agent';
+          const md = document.createElement('div'); md.className = 'md';
+          md.innerHTML = renderMarkdown(msg.text || '');
+          el.appendChild(md);
+          if (msg.meta) { const mm = document.createElement('div'); mm.className = 'meta'; mm.textContent = msg.meta; el.appendChild(mm); }
+          chatLog.appendChild(el);
+        } else {
+          const el = addBubble('user', msg.text);
+          if (msg.meta) setMeta(el, msg.meta);
+        }
+      }
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+    // Wake-Word: verworfenes Segment dezent anzeigen. Direkt aufeinanderfolgende
+    // Ignores werden in EINER Bubble gezählt, damit Hintergrundgerede nicht spammt.
+    let _lastIgnoredBubble = null;
+    let _lastIgnoredCount = 0;
+    function showIgnoredBubble(text) {
+      const t = (text || '').trim();
+      if (_lastIgnoredBubble && _lastIgnoredBubble.parentNode &&
+          chatLog.lastElementChild === _lastIgnoredBubble) {
+        _lastIgnoredCount += 1;
+        _lastIgnoredBubble.firstChild.nodeValue =
+          `🔇 ignoriert (kein Wake-Word) · ${_lastIgnoredCount}×`;
+        return;
+      }
+      _lastIgnoredCount = 1;
+      _lastIgnoredBubble = addBubble('wake-ignored', `🔇 „${t}" — ignoriert (kein Wake-Word)`);
+    }
+
+    /* ===== Status-Indikatoren ===== */
+    function setWs(state, label) {
+      wsDot.className = 'dot ' + state;
+      wsStatus.textContent = label;
+      pingBtn.disabled = state !== 'ok';
+    }
+    function setVad(state, label) {
+      vadDot.className = 'dot ' + state;
+      vadStatus.textContent = label;
+    }
+    // Wake-Fenster offen? (Gespräch aktiv) → steuert die Mic-Farbe im Wake-Modus.
+    let wakeWindowActive = false;
+    function setWakeWindowActive(v) {
+      wakeWindowActive = !!v;
+      updateMicVisual();
+    }
+    // Verarbeitung läuft? (Agent denkt ODER Audio spielt) → Mic wird zum Stopp.
+    let agentBusy = false;
+    function setAgentBusy(v) {
+      agentBusy = !!v;
+      updateMicVisual();
+    }
+    function isBusy() { return agentBusy || anyAudioPlaying(); }
+    // Mic-Button-Optik = Modus + Zustand:
+    //   läuft gerade was   → ⏹ rot (Klick stoppt; im Wake-Modus mit Aura)
+    //   VAD hört zu        → 🎤 rot (active)
+    //   Wake, wartet       → 🎤 grün (wake-idle)
+    //   Wake, Fenster offen→ 🎤 rot + lebhafte Aura (active + wake-open)
+    //   PTT-Aufnahme       → eigener .recording-Look (unberührt lassen)
+    function updateMicVisual() {
+      const b = micBtn;
+      b.classList.remove('active', 'wake-idle', 'wake-open', 'busy');
+      if (b.classList.contains('recording')) { b.textContent = '🎤'; return; }
+      const busy = isBusy();
+      b.textContent = busy ? '⏹' : '🎤';
+      let red = false, wakeOpen = false, green = false;
+      if (busy) {
+        red = true;
+        if (inputMode === 'wake') wakeOpen = true;
+      } else if (micActive) {
+        if (inputMode === 'wake') { if (wakeWindowActive) { red = true; wakeOpen = true; } else green = true; }
+        else if (inputMode === 'vad') red = true;
+      }
+      if (red) b.classList.add('active');
+      if (wakeOpen) b.classList.add('wake-open');
+      if (green) b.classList.add('wake-idle');
+      if (busy) b.classList.add('busy');
+    }
+    function setMicUi(state) {
+      updateMicVisual();
+      micStatus.classList.remove('speaking','thinking','collecting');
+      const wakeWord = (serverWake && serverWake.word) ? serverWake.word : AGENT_NAME;
+      const wakeListen = inputMode === 'wake'
+        ? (wakeWindowActive ? 'Gespräch offen – sprich weiter …' : `Höre auf „${wakeWord}" …`)
+        : 'Höre zu …';
+      const map = {
+        idle:       inputMode === 'ptt' ? 'PTT: Mikro-Button gedrückt halten' : 'Mikro nicht aktiv',
+        loading:    'Lade VAD-Modell …',
+        listening:  inputMode === 'ptt' ? 'PTT bereit – Button halten zum Sprechen' : wakeListen,
+        speaking:   '🗣  Sprache erkannt',
+        recording:  '🔴  Aufnahme läuft …',
+        collecting: '⏳  Sammle Eingabe …',
+        thinking:   `⚙️  ${AGENT_NAME} denkt …`,
+        playing:    `🔊  ${AGENT_NAME} spricht …`,
+        error:      'Fehler – siehe Log',
+      };
+      micStatus.textContent = map[state] || state;
+      if (state === 'speaking') micStatus.classList.add('speaking');
+      else if (state === 'thinking' || state === 'playing') micStatus.classList.add('thinking');
+      else if (state === 'collecting') micStatus.classList.add('collecting');
+    }
+
+    /* ===== Turn-State im Browser =====
+       Wir behalten Verweise auf die aktive Turn-Bubble (rechts) und die
+       Reply-Bubble (links) je Turn, um sie bei discarded zu durchstreichen
+       und bei pending zu updaten.
+    */
+    const turnUserBubble  = new Map();   // turnId -> User-Bubble el
+    const turnAgentBubble  = new Map();   // turnId -> Agent-Bubble el
+    let segmentCounter = 0;
+    // Sprecher-ID Hold-Logik: Zeitstempel (Date.now(), ms) des letzten VAD-
+    // Sprech-Starts. Wird ans naechste Segment gehaengt, damit der Server das
+    // Hold-Fenster gegen den SPRECH-START misst (nicht gegen die
+    // Transkriptions-Ankunft). pendingBargeIn merkt sich, ob diesem Segment
+    // ein Barge-In vorausging.
+    let lastSpeechStartTs = null;
+    let pendingBargeIn = false;
+
+    function getOrCreateUserBubble(turnId) {
+      let el = turnUserBubble.get(turnId);
+      if (!el) {
+        el = addBubble('user pending collecting', '…', `Turn ${turnId.substr(0,4)}`);
+        turnUserBubble.set(turnId, el);
+      }
+      return el;
+    }
+    function updateUserBubble(turnId, text, debounceMs) {
+      const el = getOrCreateUserBubble(turnId);
+      el.firstChild.nodeValue = text || '…';
+      el.classList.add('collecting');
+      el.classList.remove('pending');
+      if (debounceMs) setMeta(el, `Turn ${turnId.substr(0,4)} · sammelt (${(debounceMs/1000).toFixed(1)}s Pause-Toleranz)`);
+    }
+    function commitUserBubble(turnId, text) {
+      const el = getOrCreateUserBubble(turnId);
+      el.firstChild.nodeValue = text;
+      el.classList.remove('pending','collecting','partial');
+      setMeta(el, `Turn ${turnId.substr(0,4)}`);
+    }
+    // B2: provisorisches Zwischen-Transkript (während noch gesprochen wird).
+    function showPartialUserBubble(turnId, text) {
+      if (!text) return;
+      const el = getOrCreateUserBubble(turnId);
+      el.firstChild.nodeValue = text + ' …';
+      el.classList.add('collecting', 'partial');
+      el.classList.remove('pending');
+      setMeta(el, `Turn ${turnId.substr(0,4)} · höre zu …`);
+    }
+    function discardTurn(turnId) {
+      // Aktuelle User-Bubble bleibt; Agent-Bubble (falls existent) wird durchgestrichen
+      const agentBubble = turnAgentBubble.get(turnId);
+      if (agentBubble) {
+        agentBubble.classList.remove('pending');
+        agentBubble.classList.add('discarded');
+        setMeta(agentBubble, `Turn ${turnId.substr(0,4)} · verworfen (Folgesprache erkannt)`);
+        turnAgentBubble.delete(turnId);
+      }
+    }
+    function addPendingAgentBubble(turnId) {
+      // Eigene Bubble-Struktur für den Agenten: leerer .md-Container + Meta.
+      // (addBubble setzt firstChild=textNode — das würden wir hier nur ersetzen.)
+      const el = document.createElement('div');
+      el.className = 'bubble agent pending';
+      const md = document.createElement('div');
+      md.className = 'md';
+      md.textContent = `🧠 ${AGENT_NAME} denkt nach`;
+      el.appendChild(md);
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = `Turn ${turnId.substr(0, 4)}`;
+      el.appendChild(meta);
+      chatLog.appendChild(el);
+      chatLog.scrollTop = chatLog.scrollHeight;
+      turnAgentBubble.set(turnId, el);
+      return el;
+    }
+    function setAgentBubbleMd(el, text) {
+      // Rendert Markdown (sicher, da renderMarkdown selbst escapet) und ersetzt
+      // den .md-Container. Falls die Bubble noch keinen .md-Container hat
+      // (ältere Struktur), legen wir einen an und entfernen das alte Textchild.
+      let md = el.querySelector(':scope > .md');
+      if (!md) {
+        md = document.createElement('div');
+        md.className = 'md';
+        // Wenn die Bubble noch einen Plain-TextNode hat, weg damit
+        for (const n of [...el.childNodes]) {
+          if (n.nodeType === 3) el.removeChild(n);
+        }
+        el.insertBefore(md, el.firstChild);
+      }
+      md.innerHTML = renderMarkdown(text);
+    }
+    function finalizeAgentBubble(turnId, text, llmMs) {
+      const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
+      el.classList.remove('pending');
+      setAgentBubbleMd(el, text);
+      setMeta(el, `LLM ${llmMs}ms`);
+    }
+    function finalizeSilentAgentBubble(turnId, reason, llmMs) {
+      const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
+      el.classList.remove('pending');
+      el.classList.add('silent');
+      const label = reason === 'no_reply' ? `🤍 ${AGENT_NAME} schweigt` : '🤍 (still)';
+      setAgentBubbleMd(el, label);
+      setMeta(el, `LLM ${llmMs}ms · keine Antwort`);
+    }
+    function appendTtsToAgentBubble(turnId, ttsMs) {
+      const el = turnAgentBubble.get(turnId);
+      if (!el) return;
+      const m = el.querySelector('.meta');
+      if (m) m.textContent += ` · TTS ${ttsMs}ms`;
+    }
+    // Live-Antworttext (A1): Deltas werden fortlaufend in die Bubble gerendert.
+    const turnReplyText = new Map();   // turnId -> bisheriger Antworttext
+    function appendAgentBubbleDelta(turnId, delta) {
+      const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
+      const acc = (turnReplyText.get(turnId) || '') + (delta || '');
+      turnReplyText.set(turnId, acc);
+      setAgentBubbleMd(el, acc);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    /* ===== Server-Fähigkeiten (aus hello) ===== */
+    let serverStreaming = false;   // Server streamt LLM→TTS als PCM-Chunks (A1+A2)
+    let streamInputEnabled = false; // Server akzeptiert gestreamte Eingangs-Frames (B1)
+    let serverWake = { available: false, enabled: false }; // Wake-Word-Info (aus hello)
+    let helloSeen = false;               // Start-Modus nur beim ersten hello vorwählen
+
+    /* ===== Akustisches Wake-Word-Feedback =====
+       'on'  = aufsteigendes Pling, sobald das Weckwort erkannt wurde (auch schon
+               im Partial-Transkript, also noch während man spricht).
+       'off' = abfallender Ton, wenn das Konversationsfenster ausläuft und man das
+               Weckwort erneut sagen muss. */
+    let cueCtx = null;
+    // Lautstärke der Wake-Töne (0..1); 0 = stumm. Über Reloads gemerkt.
+    let cueVolumeFrac = (() => {
+      const v = parseFloat(localStorage.getItem('cueVolume') || '');
+      return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.7;
+    })();
+    function playCue(kind, force = false) {
+      if (!force && inputMode !== 'wake') return;   // Feedback nur im Wake-Modus
+      if (cueVolumeFrac <= 0) return;       // Regler auf 0 → aus
+      const peak = 0.3 * cueVolumeFrac;     // Spitzenpegel der Hüllkurve
+      try {
+        if (!cueCtx) cueCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (cueCtx.state === 'suspended') cueCtx.resume();
+        const t0 = cueCtx.currentTime;
+        const dur = 0.12;
+        const notes = (kind === 'on')
+          ? [[880, 0.0], [1320, 0.09]]      // „pling" (aufsteigend)
+          : [[620, 0.0], [415, 0.10]];      // „plong" (absteigend)
+        for (const [freq, off] of notes) {
+          const osc = cueCtx.createOscillator();
+          const g = cueCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = freq;
+          const start = t0 + off;
+          g.gain.setValueAtTime(0.0001, start);
+          g.gain.exponentialRampToValueAtTime(peak, start + 0.012);
+          g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+          osc.connect(g).connect(cueCtx.destination);
+          osc.start(start);
+          osc.stop(start + dur + 0.02);
+        }
+      } catch (_) { /* Audio nicht verfügbar → still ignorieren */ }
+    }
+
+    // Fenster-Ablauf-Timer: der Server schickt bei jedem Öffnen/Auffrischen ein
+    // `wake.window` mit der Restdauer; wir (re)starten den Timer und spielen beim
+    // Auslaufen den 'off'-Ton (sofern weiterhin Wake-Modus).
+    let wakeWindowTimer = null;
+    function armWakeWindowTimer(windowS) {
+      cancelWakeWindowTimer();
+      const ms = Math.max(0, (Number(windowS) || 0)) * 1000;
+      if (!ms) return;
+      wakeWindowTimer = setTimeout(() => {
+        wakeWindowTimer = null;
+        setWakeWindowActive(false);   // Fenster zu → Mic zurück auf grün
+        playCue('off');
+      }, ms);
+    }
+    function cancelWakeWindowTimer() {
+      if (wakeWindowTimer) { clearTimeout(wakeWindowTimer); wakeWindowTimer = null; }
+    }
+
+    /* ===== Audio-Playback ===== */
+    let currentAudioEl = null;
+    let currentAudioId = null;
+    let currentTurnId = null;
+
+    /* ===== Progressive PCM-Wiedergabe (A2, VCT2-Chunks via Web Audio) =====
+       Statt einer fertigen WAV-Datei kommen rohe PCM-Chunks an, sobald der
+       Server sie hat. Wir reihen sie über einen eigenen AudioContext lückenlos
+       aneinander (AudioBufferSourceNode pro Chunk, zeitlich geplant). */
+    let playbackCtx = null;
+    let playbackGain = null;
+    // Aktueller Streaming-Player: { turnId, audioId, sampleRate, nextTime,
+    //   sources:Set, ended:bool, donePending:bool }
+    let streamPlayer = null;
+
+    function ensurePlaybackCtx() {
+      if (!playbackCtx) {
+        playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+        playbackGain = playbackCtx.createGain();
+        playbackGain.connect(playbackCtx.destination);
+      }
+      if (playbackCtx.state === 'suspended') { try { playbackCtx.resume(); } catch (_) {} }
+      if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
+      return playbackCtx;
+    }
+
+    function startStreamPlayback(turnId, audioId, sampleRate) {
+      // Evtl. laufende Wiedergabe (anderer Turn) hart stoppen.
+      stopStreamPlayback();
+      stopCurrentAudio();
+      ensurePlaybackCtx();
+      streamPlayer = {
+        turnId, audioId, sampleRate: sampleRate || 24000,
+        nextTime: 0, sources: new Set(), ended: false, donePending: true,
+      };
+      currentTurnId = turnId;
+      currentAudioId = audioId;
+      if (micActive) setMicUi('playing');
+    }
+
+    function pushStreamChunk(turnId, int16) {
+      if (!streamPlayer || streamPlayer.turnId !== turnId) return;
+      if (!int16 || !int16.length) return;
+      const ctx = ensurePlaybackCtx();
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
+      const buf = ctx.createBuffer(1, f32.length, streamPlayer.sampleRate);
+      buf.getChannelData(0).set(f32);
+      const node = ctx.createBufferSource();
+      node.buffer = buf;
+      node.connect(playbackGain);
+      const now = ctx.currentTime;
+      // Kleiner Vorlauf beim ersten Chunk, damit nichts verschluckt wird.
+      if (streamPlayer.nextTime < now) streamPlayer.nextTime = now + 0.04;
+      const startAt = streamPlayer.nextTime;
+      node.start(startAt);
+      streamPlayer.nextTime = startAt + buf.duration;
+      streamPlayer.sources.add(node);
+      node.onended = () => {
+        if (!streamPlayer) return;
+        streamPlayer.sources.delete(node);
+        maybeFinishStream();
+      };
+    }
+
+    function maybeFinishStream() {
+      if (!streamPlayer || !streamPlayer.ended) return;
+      if (streamPlayer.sources.size > 0) return;
+      const turnId = streamPlayer.turnId, audioId = streamPlayer.audioId;
+      const fireDone = streamPlayer.donePending;
+      streamPlayer = null;
+      if (currentTurnId === turnId) { currentTurnId = null; currentAudioId = null; }
+      setAgentBusy(false);   // Antwort fertig ausgespielt → Mic zurück auf 🎤
+      if (micActive && !currentAudioEl) setMicUi('listening');
+      // House-Mode Speaker-ID: regulär zu Ende → Konversationsfenster öffnen.
+      if (fireDone) {
+        try {
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'playback.done', turnId, audioId, ts: Date.now() }));
+          }
+        } catch (_) {}
+      }
+    }
+
+    function endStreamPlayback(turnId) {
+      if (!streamPlayer || streamPlayer.turnId !== turnId) return;
+      streamPlayer.ended = true;
+      maybeFinishStream();
+    }
+
+    function stopStreamPlayback() {
+      if (!streamPlayer) return;
+      const sp = streamPlayer;
+      streamPlayer = null;            // erst lösen, damit onended nichts mehr tut
+      for (const n of sp.sources) { try { n.stop(); } catch (_) {} try { n.disconnect(); } catch (_) {} }
+      if (currentTurnId === sp.turnId) { currentTurnId = null; currentAudioId = null; }
+    }
+
+    function anyAudioPlaying() {
+      return !!currentAudioEl || !!streamPlayer;
+    }
+    // Pro Turn aktive Audio-IDs, damit wir bei discardTurn alle stoppen können.
+    const turnAudioIds = new Map(); // turnId -> Set<audioId>
+
+    // Parsed das WAV-Frame-Format des Servers:
+    //   Magic "VCT1" + 1 Byte ID-Länge + N Bytes Turn-ID (ASCII) + WAV-Bytes
+    // Rückgabe: { turnId, wav } oder null wenn kein gültiger Header.
+    const WAV_FRAME_MAGIC = [0x56, 0x43, 0x54, 0x31]; // "VCT1"
+    function parseFramedWav(arrayBuffer) {
+      if (arrayBuffer.byteLength < 6) return null;
+      const view = new Uint8Array(arrayBuffer);
+      for (let i = 0; i < 4; i++) if (view[i] !== WAV_FRAME_MAGIC[i]) return null;
+      const idLen = view[4];
+      if (idLen === 0 || arrayBuffer.byteLength < 5 + idLen) return null;
+      const idBytes = view.subarray(5, 5 + idLen);
+      const turnId = new TextDecoder('ascii').decode(idBytes);
+      const wav = arrayBuffer.slice(5 + idLen);
+      return { turnId, wav };
+    }
+
+    // Parsed das VCT2-Streaming-Frame (progressive PCM-Chunks):
+    //   "VCT2" + 1 Byte ID-Länge + Turn-ID + 2 Byte Seq (BE) + PCM16LE
+    const PCM_CHUNK_MAGIC = [0x56, 0x43, 0x54, 0x32]; // "VCT2"
+    function parsePcmChunk(arrayBuffer) {
+      if (arrayBuffer.byteLength < 7) return null;
+      const view = new Uint8Array(arrayBuffer);
+      for (let i = 0; i < 4; i++) if (view[i] !== PCM_CHUNK_MAGIC[i]) return null;
+      const idLen = view[4];
+      if (idLen === 0 || arrayBuffer.byteLength < 7 + idLen) return null;
+      const turnId = new TextDecoder('ascii').decode(view.subarray(5, 5 + idLen));
+      const seq = (view[5 + idLen] << 8) | view[6 + idLen];
+      // 16-bit-PCM ab Offset (7+idLen). Int16Array braucht 2-Byte-Ausrichtung,
+      // daher über DataView/copy, nicht direkt auf dem ArrayBuffer.
+      const pcmBytes = new Uint8Array(arrayBuffer, 7 + idLen);
+      const n = pcmBytes.length >> 1;
+      const int16 = new Int16Array(n);
+      for (let i = 0; i < n; i++) int16[i] = (pcmBytes[2 * i] | (pcmBytes[2 * i + 1] << 8)) << 16 >> 16;
+      return { turnId, seq, int16 };
+    }
+
+    function playWavBytes(turnId, audioId, arrayBuffer) {
+      try {
+        const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        if (currentAudioEl) {
+          try { currentAudioEl.pause(); } catch(_) {}
+          try { URL.revokeObjectURL(currentAudioEl.src); } catch(_) {}
+        }
+        const a = new Audio(url);
+        a.volume = parseInt(volume.value, 10) / 100;
+        currentAudioEl = a;
+        currentAudioId = audioId;
+        currentTurnId = turnId;
+        if (micActive) setMicUi('playing');
+        a.addEventListener('ended', () => {
+          URL.revokeObjectURL(url);
+          if (currentAudioEl === a) {
+            currentAudioEl = null; currentAudioId = null; currentTurnId = null;
+            setAgentBusy(false);
+            if (micActive) setMicUi('listening');
+          }
+          // House-Mode Speaker-ID: TTS regulaer zu Ende gespielt -> Server
+          // startet das 3-s-Konversationsfenster. NUR hier senden, NICHT in
+          // stopCurrentAudio() (Barge-In/Stop) -> dort kein Fenster-Start.
+          try {
+            if (ws && ws.readyState === 1) {
+              ws.send(JSON.stringify({
+                type: 'playback.done', turnId: turnId, audioId: audioId, ts: Date.now(),
+              }));
+            }
+          } catch (_) {}
+        });
+        a.addEventListener('error', () => {
+          addBubble('err', 'Audio-Playback fehlgeschlagen.');
+          URL.revokeObjectURL(url);
+        });
+        a.play().catch(err => {
+          addBubble('err', `Auto-Play blockiert: ${err.message || err}. Klick irgendwo auf die Seite.`);
+        });
+      } catch (err) {
+        addBubble('err', `Audio-Fehler: ${err.message || err}`);
+      }
+    }
+
+    function stopCurrentAudio() {
+      if (currentAudioEl) {
+        try { currentAudioEl.pause(); } catch(_) {}
+        try { URL.revokeObjectURL(currentAudioEl.src); } catch(_) {}
+        currentAudioEl = null; currentAudioId = null; currentTurnId = null;
+      }
+    }
+
+    function stopAudioForTurn(turnId) {
+      if (!turnId) return;
+      if (currentTurnId === turnId) stopCurrentAudio();
+      if (streamPlayer && streamPlayer.turnId === turnId) stopStreamPlayback();
+      turnAudioIds.delete(turnId);
+    }
+
+    /* ===== Barge-In =========================================================
+       "Dem Agenten ins Wort fallen": Wenn der User zu sprechen beginnt,
+       waehrend die TTS-Wiedergabe laeuft, muss das Audio SOFORT stoppen.
+
+       Zwei Ausloeser, bewusst unterschiedlich aggressiv:
+         - VAD  (Variante B): erst wenn die VAD anhaltende Sprache bestaetigt
+                 (onSpeechStart feuert nach minSpeechFrames). Robust gegen
+                 Selbst-Echo / kurze Stoergeraeusche, weil der Lautsprecher
+                 waehrend der Wiedergabe laeuft.
+         - PTT  (Variante A): sofort beim Tastendruck — klare Nutzerabsicht,
+                 kein Debounce noetig.
+
+       bargeInStop() ist idempotent und latenzarm: lokaler Stop passiert
+       SOFORT (unabhaengig vom Server-Roundtrip); zusaetzlich informieren wir
+       den Server, damit er noch laufende Agent-/TTS-Generierung abbricht
+       (sonst kommt gleich das naechste Audio-Stueck hinterher).
+    */
+    function bargeInStop(reason) {
+      const wasPlaying = anyAudioPlaying();
+      // 1) Lokal sofort stoppen (das ist der entscheidende, latenzfreie Teil).
+      stopCurrentAudio();
+      stopStreamPlayback();
+      setAgentBusy(false);   // Verarbeitung abgebrochen → Mic zurück auf 🎤
+      // 2) Server informieren: laufende Generierung (Agent/TTS) abbrechen.
+      //    Auch wenn lokal nichts mehr spielte, kann serverseitig noch ein
+      //    TTS-Stueck in Arbeit sein, das sonst gleich nachgeschoben wird.
+      try {
+        if (ws && ws.readyState === 1) {
+          // playing = es lief noch (gepufferte) Wiedergabe → echte Unterbrechung.
+          // Der Server hält dann das Wake-Fenster offen (Gespräch geht weiter).
+          ws.send(JSON.stringify({ type: 'barge_in', reason: reason || 'speech', playing: wasPlaying, ts: Date.now() }));
+        }
+      } catch (_) {}
+      // Wenn der User dem Agenten ins Wort faellt, soll das daraus folgende
+      // (oft kurze) Segment den letzten Sprecher halten duerfen.
+      if (wasPlaying) pendingBargeIn = true;
+      if (wasPlaying && micActive) setMicUi('speaking');
+      return wasPlaying;
+    }
+
+    /* ===== WebSocket ===== */
+    let ws = null;
+    let reconnectTimer = null;
+    let reconnectDelay = 1000;
+
+    function connect() {
+      if (ws && ws.readyState <= 1) return;
+      setWs('warn', 'verbinde…');
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = `${proto}://${location.host}/ws`;
+      try { ws = new WebSocket(url); }
+      catch (err) {
+        setWs('err', 'fehler');
+        addBubble('err', `WebSocket: ${err.message || err}`);
+        scheduleReconnect();
+        return;
+      }
+      ws.binaryType = 'arraybuffer';
+
+      ws.addEventListener('open', () => {
+        reconnectDelay = 1000;
+        setWs('ok', 'verbunden');
+        // Initial-Settings senden
+        sendSettings();
+        if (typeof refreshSendButton === 'function') refreshSendButton();
+      });
+
+      ws.addEventListener('message', (ev) => {
+        if (typeof ev.data !== 'string') {
+          // Binär: entweder ein progressiver PCM-Chunk (VCT2, Streaming) oder
+          // eine komplette WAV-Datei (VCT1, klassischer Pfad).
+          const chunk = parsePcmChunk(ev.data);
+          if (chunk) {
+            pushStreamChunk(chunk.turnId, chunk.int16);
+            return;
+          }
+          const parsed = parseFramedWav(ev.data);
+          if (parsed) {
+            playWavBytes(parsed.turnId, `audio-${parsed.turnId}`, parsed.wav);
+          } else {
+            // Legacy-Fallback: alter Server ohne Frame-Header
+            addBubble('err', 'Audio-Frame ohne Turn-Header empfangen (Server-Update nötig?).');
+          }
+          return;
+        }
+        let m = null;
+        try { m = JSON.parse(ev.data); } catch (_) { return; }
+        handleMessage(m);
+      });
+
+      ws.addEventListener('close', (ev) => {
+        setWs('err', `getrennt (${ev.code})`);
+        scheduleReconnect();
+        if (typeof refreshSendButton === 'function') refreshSendButton();
+      });
+      ws.addEventListener('error', () => setWs('err', 'fehler'));
+    }
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+        connect();
+      }, reconnectDelay);
+    }
+
+    function handleMessage(m) {
+      switch (m.type) {
+        case 'hello':
+          if (m.agent_name) applyAgentName(m.agent_name);
+          else if (m.agent && m.agent.name) applyAgentName(m.agent.name);
+          serverStreaming = !!m.streaming;
+          streamInputEnabled = !!m.streamInput;
+          serverWake = m.wakeWord || { available: false, enabled: false };
+          addBubble('sys', `🟢 ${m.msg}`);
+          // Beim ersten hello den Start-Modus festlegen: gemerkte Wahl des Nutzers
+          // (localStorage) hat Vorrang, sonst der Server-Default (wakeWord.enabled).
+          if (!helloSeen) {
+            if (STORED_MODE) {
+              selectInputMode(STORED_MODE);
+            } else if (serverWake.enabled) {
+              selectInputMode('wake');
+            }
+            if (inputMode === 'wake') {
+              addBubble('sys', `🔔 Wake-Word-Modus aktiv: sag „${serverWake.word}", um ${AGENT_NAME} anzusprechen.`);
+            }
+          }
+          helloSeen = true;
+          updateInputModeHint();
+          if (m.turn) {
+            // Slider auf Server-Range justieren, falls nötig
+            if (Number.isFinite(m.turn.debounce_ms_min)) debounce.min = String(m.turn.debounce_ms_min);
+            if (Number.isFinite(m.turn.debounce_ms_max)) debounce.max = String(m.turn.debounce_ms_max);
+            if (Number.isFinite(m.turn.debounce_ms)) {
+              debounce.value = String(m.turn.debounce_ms);
+              debounceLabel.textContent = (m.turn.debounce_ms / 1000).toFixed(1) + 's';
+            }
+            applyServerVadParams(m.turn.vad);
+          }
+          break;
+        case 'settings.ack':
+          applyServerVadParams(m.vad);
+          break;
+        case 'session.reset.ack':
+          newSessionBtn.disabled = false;
+          addBubble('sys', `🆕 Neue Session aktiv (key: …${(m.sessionKey || '').slice(-12)})`);
+          break;
+        case 'segment.received':
+          // Optional: Pegel-Tick im UI
+          break;
+        case 'transcript.partial':
+          // B2: Zwischen-Transkript, während noch gesprochen wird → live in die
+          // User-Bubble (provisorisch). Wird vom finalen transcript/turn.pending
+          // überschrieben.
+          showPartialUserBubble(m.turnId, m.text);
+          if (micActive) setMicUi('collecting');
+          break;
+        case 'transcript.ignored':
+          // Wake-Word: Segment war nicht an die KI gerichtet → verworfen.
+          showIgnoredBubble(m.text);
+          if (micActive) setMicUi('listening');
+          break;
+        case 'wake.detected':
+          // Weckwort erkannt (ggf. schon im Partial) → Pling + Mic wird rot/aktiv.
+          setWakeWindowActive(true);
+          playCue('on');
+          break;
+        case 'wake.window':
+          // Fenster offen → Mic rot/aktiv. Idle-Ablauf-Timer nur starten, wenn
+          // Antonia wartet/fertig ist ('armed'/'done'); bei eingehendem Befehl
+          // ('command') folgt eine Antwort → Timer stoppen, damit das Fenster
+          // nicht WÄHREND der Antwort ausläuft, sondern erst danach.
+          setWakeWindowActive(true);
+          if (m.reason === 'armed' || m.reason === 'done') armWakeWindowTimer(m.windowS);
+          else cancelWakeWindowTimer();
+          break;
+        case 'wake.closed':
+          // Fenster manuell beendet (Stop-Kommando) → Timer aus + Abschluss-Ton.
+          cancelWakeWindowTimer();
+          setWakeWindowActive(false);
+          playCue('off');
+          addBubble('sys', '🔇 Wake-Fenster beendet');
+          break;
+        case 'wake.armed':
+          // Nur das Wake-Word gesagt → KI hört jetzt zu (Konversationsfenster).
+          addBubble('sys wake-armed', `🟢 ${AGENT_NAME} hört zu …`);
+          if (micActive) setMicUi('listening');
+          break;
+        case 'transcript':
+          // Wir schreiben den Text direkt in die Pending-User-Bubble
+          // (überschrieben durch turn.pending unten, aber für Edge-Cases)
+          lastLatency.textContent = `${m.sttMs}ms`;
+          if (!m.text) {
+            // ignorieren — turn.pending kommt nicht
+          }
+          break;
+        case 'turn.pending':
+          updateUserBubble(m.turnId, m.text, m.debounceMs);
+          if (micActive) setMicUi('collecting');
+          break;
+        case 'turn.discarded':
+          discardTurn(m.turnId);
+          // Audio des verworfenen Turns auch beenden, falls gerade laufend.
+          stopAudioForTurn(m.turnId);
+          setAgentBusy(false);
+          break;
+        case 'turn.commit':
+          if (m.source === 'text' || m.source === 'mixed') {
+            // Text- oder gemischter Turn: User-Bubble haben wir lokal schon
+            // beim Send erzeugt (Pre-Bubble → wird beim turn.commit umgemappt,
+            // siehe wrapping handleMessage weiter unten).
+            const el = turnUserBubble.get(m.turnId);
+            if (el) {
+              el.classList.remove('pending','collecting');
+              // Bei mixed: Voice-Text wurde vom Server in m.text reinüberführt.
+              // Bubble-Text neu setzen, damit Voice-Anteil sichtbar ist.
+              if (m.source === 'mixed' && m.text) {
+                // Suche den Textknoten (letzter Textnode) und ersetze
+                let txtNode = null;
+                for (const n of el.childNodes) {
+                  if (n.nodeType === Node.TEXT_NODE) txtNode = n;
+                }
+                if (txtNode) txtNode.nodeValue = m.text;
+                else el.appendChild(document.createTextNode(m.text));
+              }
+              const tag = m.source === 'mixed' ? 'Voice + Text' : 'Text';
+              setMeta(el, `Turn ${m.turnId.substr(0,4)} · ${tag}` + (m.imageCount ? ` · ${m.imageCount} Bild(er)` : ''));
+            } else {
+              // Kein Pre-Mapping (z.B. mixed kam ohne Send-Click — Server
+              // hat Voice+vorher gestackten Text gemerged). Erzeuge Bubble.
+              commitUserBubble(m.turnId, m.text);
+            }
+            if (micActive) setMicUi('thinking');
+          } else {
+            // Pur Voice
+            commitUserBubble(m.turnId, m.text);
+            if (micActive) setMicUi('thinking');
+          }
+          persistMsg('user', m.text);   // für Reload-Wiederherstellung merken
+          break;
+        case 'reply.start':
+          addPendingAgentBubble(m.turnId);
+          turnReplyText.delete(m.turnId);
+          // Antonia arbeitet/antwortet jetzt → Fenster-Ablauf-Timer pausieren.
+          // Er startet erst neu, wenn sie fertig ist (playback.done bzw. bei
+          // stumm/Fehler unten). So schließt der Kanal nicht mitten in einer
+          // langen Antwort.
+          cancelWakeWindowTimer();
+          setAgentBusy(true);   // Mic wird zum ⏹ (Klick = Antwort abbrechen)
+          // Neuer Turn → Latenz-Anzeige zurücksetzen; Werte folgen pro Phase.
+          // (STT/lastLatency bleibt: es wurde schon beim transcript dieses Turns
+          // gesetzt. Antwort/Agent/TTS auf '–', damit stille/fehlerhafte Turns
+          // nicht die Zahlen des vorigen Turns weiterzeigen.)
+          statLlmFirst = statTtsFirst = statLlmTotal = statTtsTotal = null;
+          renderLlmStat();
+          renderTtsStat();
+          lastE2e.textContent = '–';
+          e2eBreakdown.textContent = 'bis Wiedergabe';
+          break;
+        case 'reply.delta':
+          // A1: Antworttext live, sobald die Token eintreffen.
+          appendAgentBubbleDelta(m.turnId, m.delta);
+          break;
+        case 'reply':
+          turnReplyText.delete(m.turnId);
+          finalizeAgentBubble(m.turnId, m.text, m.llmMs);
+          statLlmTotal = m.llmMs;
+          renderLlmStat();
+          persistMsg('agent', m.text);   // für Reload-Wiederherstellung merken
+          break;
+        case 'reply.silent':
+          turnReplyText.delete(m.turnId);
+          finalizeSilentAgentBubble(m.turnId, m.reason || 'no_reply', m.llmMs || 0);
+          if (m.llmMs) { statLlmTotal = m.llmMs; renderLlmStat(); }
+          setAgentBusy(false);
+          // Keine Sprachausgabe → kein playback.done. Idle-Timer jetzt starten.
+          if (inputMode === 'wake') armWakeWindowTimer(serverWake.windowS);
+          break;
+        case 'reply.error':
+          turnReplyText.delete(m.turnId);
+          finalizeAgentBubble(m.turnId, `⚠ ${m.error}`, 0);
+          setAgentBusy(false);
+          if (inputMode === 'wake') armWakeWindowTimer(serverWake.windowS);
+          break;
+        case 'audio.start':
+          // A2: progressive PCM-Wiedergabe starten (Chunks folgen als VCT2-Binary).
+          startStreamPlayback(m.turnId, m.audioId, m.sampleRate);
+          // E2E-Latenz bis zur ersten Wiedergabe + First-Werte für Agent/TTS.
+          if (Number.isFinite(m.e2eMs)) {
+            lastE2e.textContent = `${m.e2eMs}ms`;
+            // Aufschlüsselung: wie viel davon war die (gewollte) Debounce-Pause?
+            if (Number.isFinite(m.debounceMs) && m.debounceMs > 0) {
+              const net = Math.max(0, m.e2eMs - m.debounceMs);
+              e2eBreakdown.textContent = `${m.debounceMs}ms Pause + ${net}ms System`;
+            }
+          }
+          if (Number.isFinite(m.llmFirstMs)) { statLlmFirst = m.llmFirstMs; renderLlmStat(); }
+          if (Number.isFinite(m.ttsFirstMs)) { statTtsFirst = m.ttsFirstMs; renderTtsStat(); }
+          break;
+        case 'audio.end':
+          // Alle Chunks gesendet → Player als "fertig" markieren; playback.done
+          // feuert, wenn der letzte Buffer ausgespielt ist.
+          endStreamPlayback(m.turnId);
+          if (Number.isFinite(m.ttsMs)) {
+            appendTtsToAgentBubble(m.turnId, m.ttsMs);
+            statTtsTotal = m.ttsMs;
+            renderTtsStat();
+          }
+          break;
+        case 'audio.meta':
+          // Klassischer Pfad (STREAMING=0): WAV folgt als VCT1-Binary.
+          appendTtsToAgentBubble(m.turnId, m.ttsMs);
+          statTtsTotal = m.ttsMs;
+          renderTtsStat();
+          break;
+        case 'audio.stop':
+          // Stop kann sich auf eine spezifische audioId beziehen, oder — wenn
+          // ohne audioId — auf alles aktive.
+          if (!m.audioId) { stopCurrentAudio(); stopStreamPlayback(); }
+          else {
+            if (currentAudioId === m.audioId) stopCurrentAudio();
+            if (streamPlayer && streamPlayer.audioId === m.audioId) stopStreamPlayback();
+          }
+          break;
+        case 'audio.error':
+          addBubble('err', `TTS: ${m.error}`);
+          break;
+        case 'transcript.error':
+          addBubble('err', `STT: ${m.error}`);
+          break;
+        case 'ack':
+          break;
+        case 'external.message':
+          addExternalBubble(m.role, m.text);
+          break;
+        default:
+          // console.debug('unhandled', m);
+      }
+    }
+
+    function addExternalBubble(role, text) {
+      const cls = role === 'assistant' ? 'ext-agent' : 'ext-user';
+      // Für assistant rendern wir Markdown wie bei normalen Agent-Antworten
+      if (role === 'assistant') {
+        const el = document.createElement('div');
+        el.className = 'bubble ' + cls;
+        const md = document.createElement('div');
+        md.className = 'md';
+        md.innerHTML = renderMarkdown(text || '');
+        el.appendChild(md);
+        chatLog.appendChild(el);
+      } else {
+        addBubble(cls, text || '');
+      }
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    /* ===== Settings senden ===== */
+    function sendSettings() {
+      if (!ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({
+        type: 'settings',
+        speed: parseFloat(speed.value),
+        debounceMs: parseInt(debounce.value, 10),
+        wakeWordEnabled: (inputMode === 'wake'),
+      }));
+    }
+
+    pingBtn.addEventListener('click', () => {
+      if (!ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    });
+    reconnectBtn.addEventListener('click', () => {
+      // Alten Socket sauber abhängen, damit dessen close-Listener nicht
+      // später einen weiteren Reconnect triggert (Race: zwei parallele ws).
+      if (ws) {
+        try { ws.onclose = null; ws.onerror = null; ws.onmessage = null; ws.onopen = null; } catch(_) {}
+        try { ws.close(); } catch(_) {}
+        ws = null;
+      }
+      reconnectDelay = 500;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      connect();
+    });
+    newSessionBtn.addEventListener('click', () => {
+      // Verwirft die LLM-Session bei OpenClaw — ein frischer session_user-Suffix
+      // führt zu einem neuen agent:<id>:openai-user:<random>-Session-Key.
+      if (!ws || ws.readyState !== 1) {
+        addBubble('err', 'Nicht verbunden — keine neue Session möglich.');
+        return;
+      }
+      // Laufendes Audio sofort stoppen.
+      stopCurrentAudio();
+      newSessionBtn.disabled = true;
+      ws.send(JSON.stringify({ type: 'session.reset', ts: Date.now() }));
+      // Optimistisch UI leeren — finaler ACK kommt über session.reset.ack.
+      chatLog.innerHTML = '';
+      turnUserBubble.clear();
+      turnAgentBubble.clear();
+      pendingTextLocalTurnIds.length = 0;
+      clearTranscript();   // gespeichertes Transkript verwerfen → Reload startet frisch
+      addBubble('sys', '✍️  Neue Session angefordert …');
+    });
+
+    volume.addEventListener('input', () => {
+      volumeLabel.textContent = volume.value + '%';
+      if (currentAudioEl) currentAudioEl.volume = parseInt(volume.value, 10) / 100;
+      if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
+    });
+
+    /* ===== Einstellungen-Drawer (☰) ===== */
+    const settingsBtn      = document.getElementById('settingsBtn');
+    const settingsDrawer   = document.getElementById('settingsDrawer');
+    const drawerOverlay    = document.getElementById('drawerOverlay');
+    const closeSettingsBtn = document.getElementById('closeSettingsBtn');
+    const wideScreen = () => window.matchMedia('(min-width: 1100px)').matches;
+    function openSettings() {
+      settingsDrawer.classList.add('open');
+      drawerOverlay.classList.add('open');   // Backdrop nur im schmalen Modus sichtbar (CSS)
+      settingsDrawer.setAttribute('aria-hidden', 'false');
+      try { localStorage.setItem('settingsOpen', '1'); } catch (_) {}
+    }
+    function closeSettings() {
+      settingsDrawer.classList.remove('open');
+      drawerOverlay.classList.remove('open');
+      settingsDrawer.setAttribute('aria-hidden', 'true');
+      try { localStorage.setItem('settingsOpen', '0'); } catch (_) {}
+    }
+    function toggleSettings() {
+      settingsDrawer.classList.contains('open') ? closeSettings() : openSettings();
+    }
+    settingsBtn.addEventListener('click', toggleSettings);
+    closeSettingsBtn.addEventListener('click', closeSettings);
+    drawerOverlay.addEventListener('click', closeSettings);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && settingsDrawer.classList.contains('open')) closeSettings();
+    });
+    // Auf breiten Screens darf das Panel angedockt offen bleiben → gemerkten
+    // Zustand wiederherstellen (auf Mobil NICHT automatisch modal aufpoppen).
+    if (wideScreen() && localStorage.getItem('settingsOpen') === '1') openSettings();
+
+    // Wake-Ton-Lautstärke: Regler ↔ cueVolumeFrac (0..1), 0 = aus. Gemerkt.
+    function renderCueVolumeLabel() {
+      cueVolumeLabel.textContent = cueVolumeFrac <= 0 ? 'aus' : Math.round(cueVolumeFrac * 100) + '%';
+    }
+    cueVolume.value = String(Math.round(cueVolumeFrac * 100));
+    renderCueVolumeLabel();
+    cueVolume.addEventListener('input', () => {
+      cueVolumeFrac = parseInt(cueVolume.value, 10) / 100;
+      renderCueVolumeLabel();
+    });
+    cueVolume.addEventListener('change', () => {
+      localStorage.setItem('cueVolume', String(cueVolumeFrac));
+      if (cueVolumeFrac > 0) playCue('on', true);   // kurze Hörprobe beim Loslassen
+    });
+
+    speed.addEventListener('input', () => {
+      speedLabel.textContent = parseFloat(speed.value).toFixed(2) + 'x';
+    });
+    speed.addEventListener('change', sendSettings);
+
+    debounce.addEventListener('input', () => {
+      debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
+    });
+    debounce.addEventListener('change', sendSettings);
+
+    // Vom User gewaehlte VAD-Aktivierungsschwelle (0..1). Hoeher = unempfindlicher
+    // (lauter sprechen noetig). Persistiert im localStorage. MUSS vor dem
+    // Slider-Wiring stehen (let -> keine Hoisting/TDZ).
+    let vadActivationThreshold = (() => {
+      const v = parseFloat(localStorage.getItem('vadThreshold') || '');
+      return Number.isFinite(v) && v > 0 && v < 1 ? v : 0.6;
+    })();
+
+    // VAD-Empfindlichkeit: Slider setzt die Aktivierungsschwelle. Wirkt sofort
+    // auf den Barge-In-Vergleich (vadActivationThreshold) und — beim naechsten
+    // VAD-Restart — auf positiveSpeechThreshold der Segmentierung.
+    function positionVadMark() {
+      if (!vadProbMark) return;
+      const min = 0.1, max = 0.95;
+      const pct = ((vadActivationThreshold - min) / (max - min)) * 100;
+      vadProbMark.style.left = Math.max(0, Math.min(100, pct)) + '%';
+    }
+    if (vadThreshold) {
+      vadThreshold.value = String(vadActivationThreshold);
+      vadThresholdLabel.textContent = vadActivationThreshold.toFixed(2);
+      positionVadMark();
+      vadThreshold.addEventListener('input', () => {
+        vadActivationThreshold = parseFloat(vadThreshold.value);
+        vadThresholdLabel.textContent = vadActivationThreshold.toFixed(2);
+        positionVadMark();
+      });
+      vadThreshold.addEventListener('change', () => {
+        localStorage.setItem('vadThreshold', String(vadActivationThreshold));
+        // Neue Schwelle in die laufende VAD-Segmentierung uebernehmen.
+        if (vadLike() && micActive) restartVadSoon();
+      });
+    }
+
+    /* ===== Mikrofon + VAD ===== */
+    let micActive = false;
+    let vad = null;
+    let audioCtx = null;
+    let micStream = null;
+    let analyser = null;
+    let meterRaf = null;
+
+    /* ===== B1: Eingangs-Streaming (VAD-Modus) =====
+       Ein ScriptProcessor zapft denselben Mic-Stream wie der Pegel-Analyser an
+       und schickt 16-kHz-Frames laufend an den Server, während gesprochen wird.
+       So ist beim Sprech-Ende fast nichts mehr hochzuladen → STT startet quasi
+       sofort. Ein Ring-Buffer liefert ~300 ms Vorlauf vor dem Sprech-Start. */
+    let inputTapNode = null;
+    let inputTapSink = null;
+    let inputPreRoll = [];            // Ring-Buffer (Float32Array @16k)
+    let inputStreaming = false;       // true zwischen stream.start und commit
+    let vadStreamSegId = null;        // Segment-ID des aktuell gestreamten Segments
+    const INPUT_PREROLL_SAMPLES = 16000 * 0.3;
+
+    function downsampleTo16k(float32, inRate) {
+      if (!inRate || inRate === 16000) return new Float32Array(float32);
+      const ratio = inRate / 16000;
+      const outLen = Math.max(1, Math.floor(float32.length / ratio));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const idx = i * ratio;
+        const lo = Math.floor(idx);
+        const hi = Math.min(lo + 1, float32.length - 1);
+        const frac = idx - lo;
+        out[i] = float32[lo] * (1 - frac) + float32[hi] * frac;
+      }
+      return out;
+    }
+
+    function streamInputActive() {
+      return vadLike() && streamInputEnabled && ws && ws.readyState === 1;
+    }
+
+    function beginInputStream(segmentId) {
+      if (!streamInputActive()) return false;
+      try {
+        ws.send(JSON.stringify({
+          type: 'segment.stream.start', segmentId,
+          speechStartTs: lastSpeechStartTs, clientNow: Date.now(),
+          bargeIn: pendingBargeIn,
+        }));
+        inputStreaming = true;
+        // Vorlauf (Ring-Buffer) voranstellen.
+        for (const fr of inputPreRoll) ws.send(f32ToBytes(fr));
+        lastSpeechStartTs = null;
+        pendingBargeIn = false;
+        return true;
+      } catch (_) { inputStreaming = false; return false; }
+    }
+
+    function commitInputStream(segmentId) {
+      if (!inputStreaming) return;
+      inputStreaming = false;
+      try { ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId })); } catch (_) {}
+    }
+
+    function abortInputStream() {
+      if (!inputStreaming) { vadStreamSegId = null; return; }
+      inputStreaming = false;
+      vadStreamSegId = null;
+      try {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'segment.stream.abort' }));
+      } catch (_) {}
+    }
+
+    // Vom Server gepflegte VAD-Parameter (kommen via hello / settings.ack)
+    let currentVadParams = {
+      redemptionFrames: 12,
+      minSpeechFrames: 3,
+      preSpeechPadFrames: 8,
+      frameMs: 32,
+    };
+
+    // Barge-In: bewusst SIMPEL gehalten. Sobald die VAD Sprache erkennt oder
+    // PTT gedrueckt wird, wird die Audioausgabe sofort gestoppt — keine
+    // Konfig, kein ENV. Die VAD-Empfindlichkeit regelt der User direkt ueber
+    // den Schwellen-Slider (positiveSpeechThreshold) im Web-Client.
+    // (vadActivationThreshold ist weiter oben deklariert — vor dem Slider-Wiring.)
+    let vadRestartTimer = null;
+    let vadRestartInFlight = null;  // Promise-Mutex: serialisiert Restarts
+
+    function applyServerVadParams(params) {
+      if (!params) return;
+      const next = {
+        redemptionFrames: Number.isFinite(params.redemptionFrames) ? params.redemptionFrames : currentVadParams.redemptionFrames,
+        minSpeechFrames:  Number.isFinite(params.minSpeechFrames)  ? params.minSpeechFrames  : currentVadParams.minSpeechFrames,
+        preSpeechPadFrames: Number.isFinite(params.preSpeechPadFrames) ? params.preSpeechPadFrames : currentVadParams.preSpeechPadFrames,
+        frameMs: Number.isFinite(params.frameMs) ? params.frameMs : currentVadParams.frameMs,
+      };
+      // Direkter Vergleich statt JSON.stringify (robuster gegen Field-Order).
+      const changed =
+           next.redemptionFrames   !== currentVadParams.redemptionFrames
+        || next.minSpeechFrames    !== currentVadParams.minSpeechFrames
+        || next.preSpeechPadFrames !== currentVadParams.preSpeechPadFrames
+        || next.frameMs            !== currentVadParams.frameMs;
+      currentVadParams = next;
+      if (changed && micActive) restartVadSoon();
+    }
+
+    // Debounced + serialisiert: wenn ein Restart noch laeuft, haengt der
+    // naechste daran an, statt parallel ein zweites Mikro zu starten.
+    // Genutzt von applyServerVadParams (neue Server-Params) UND vom
+    // VAD-Empfindlichkeits-Slider (neue Schwelle).
+    function restartVadSoon() {
+      if (!micActive) return;
+      if (vadRestartTimer) clearTimeout(vadRestartTimer);
+      vadRestartTimer = setTimeout(() => {
+        vadRestartTimer = null;
+        if (!micActive) return;
+        const prev = vadRestartInFlight || Promise.resolve();
+        vadRestartInFlight = prev.then(async () => {
+          if (!micActive) return;
+          try {
+            await stopMic(true);
+            await startMic(true);
+          } catch (e) {
+            addBubble('err', `VAD-Restart: ${e.message || e}`);
+          }
+        }).finally(() => {
+          if (vadRestartInFlight === prev) vadRestartInFlight = null;
+        });
+      }, 400);
+    }
+
+    function f32ToBytes(float32) {
+      return new Uint8Array(float32.buffer, float32.byteOffset, float32.byteLength);
+    }
+
+    async function startMic(silent = false) {
+      try {
+        if (!silent) setMicUi('loading');
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true, noiseSuppression: true,
+            autoGainControl: true, channelCount: 1, sampleRate: 16000,
+          },
+          video: false,
+        });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = audioCtx.createMediaStreamSource(micStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        src.connect(analyser);
+        startMeter();
+
+        // B1: Tap für Eingangs-Streaming (Ring-Buffer + Live-Frames).
+        inputPreRoll = [];
+        inputStreaming = false;
+        try {
+          const tap = audioCtx.createScriptProcessor(2048, 1, 1);
+          tap.onaudioprocess = (ev) => {
+            const ch = ev.inputBuffer.getChannelData(0);
+            const ds = downsampleTo16k(ch, audioCtx.sampleRate);
+            // Ring-Buffer pflegen (immer).
+            inputPreRoll.push(ds);
+            let total = 0;
+            for (const f of inputPreRoll) total += f.length;
+            while (total > INPUT_PREROLL_SAMPLES && inputPreRoll.length > 1) {
+              total -= inputPreRoll.shift().length;
+            }
+            // Während aktivem Sprech-Segment: Frame sofort streamen.
+            if (inputStreaming && ws && ws.readyState === 1) {
+              try { ws.send(f32ToBytes(ds)); } catch (_) {}
+            }
+          };
+          src.connect(tap);
+          const sink = audioCtx.createGain(); sink.gain.value = 0;
+          tap.connect(sink).connect(audioCtx.destination);
+          inputTapNode = tap;
+          inputTapSink = sink;
+        } catch (_) { inputTapNode = null; }
+
+        if (!window.vad) throw new Error('vad-web nicht geladen');
+        if (!silent) setVad('warn', 'lade …');
+        vad = await window.vad.MicVAD.new({
+          // Lokale Asset-Pfade (kein CDN)
+          modelURL: '/static/vendor/silero_vad.onnx',
+          workletURL: '/static/vendor/vad.worklet.bundle.min.js',
+          // Vom User per Slider gewaehlte Aktivierungsschwelle. negative liegt
+          // konventionell ~0.15 darunter (Hysterese), min. 0.05.
+          positiveSpeechThreshold: vadActivationThreshold,
+          negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
+          minSpeechFrames: currentVadParams.minSpeechFrames,
+          preSpeechPadFrames: currentVadParams.preSpeechPadFrames,
+          redemptionFrames: currentVadParams.redemptionFrames,
+          // BARGE-IN (simpel + schnell): onFrameProcessed feuert pro VAD-Frame
+          // (~32ms) mit der Sprach-Wahrscheinlichkeit. Sobald sie die vom User
+          // gewaehlte Schwelle erreicht UND gerade Audio spielt, wird die
+          // Wiedergabe SOFORT gestoppt — kein Warten auf onSpeechStart oder
+          // die Transkription. Latenz ~ ein Frame (~32ms).
+          onFrameProcessed: (probs) => {
+            const p = probs && Number.isFinite(probs.isSpeech) ? probs.isSpeech : 0;
+            // Live-Sprach-Pegel im UI anzeigen (zum Einstellen der Schwelle).
+            if (vadProbBar) vadProbBar.style.width = Math.round(p * 100) + '%';
+            // Barge-In: spielt gerade Audio UND Pegel ueber Schwelle -> sofort stoppen.
+            if (anyAudioPlaying() && p >= vadActivationThreshold) bargeInStop('vad-frame');
+          },
+          onSpeechStart: () => {
+            // Sprech-Start fuer Sprecher-ID-Hold festhalten (vor bargeInStop,
+            // da das hier der echte Sprech-Beginn ist).
+            lastSpeechStartTs = Date.now();
+            // Wake-Modus: solange gesprochen wird, darf das Fenster NICHT ablaufen
+            // (der Plong-Timer wird pausiert) — sonst schließt es mitten im Satz.
+            if (inputMode === 'wake' && wakeWindowActive) cancelWakeWindowTimer();
+            // Sicherheitsnetz: falls der Frame-Pfad mal nicht greift.
+            bargeInStop('vad-speech');
+            // B1: Eingangs-Streaming starten (Frames laufen ab jetzt live mit).
+            if (streamInputActive()) {
+              segmentCounter += 1;
+              segCount.textContent = String(segmentCounter);
+              vadStreamSegId = String(segmentCounter);
+              beginInputStream(vadStreamSegId);
+            }
+            setMicUi('speaking');
+          },
+          onSpeechEnd: (audio) => {
+            if (inputStreaming && vadStreamSegId) {
+              // Bereits live gestreamt → nur noch committen, NICHT erneut senden.
+              commitInputStream(vadStreamSegId);
+              vadStreamSegId = null;
+            } else {
+              segmentCounter += 1;
+              segCount.textContent = String(segmentCounter);
+              sendSegment(String(segmentCounter), audio);
+            }
+            // Wake-Fenster war offen → Timer wieder aufnehmen (ab jetzt). Bei
+            // akzeptierten Segmenten übernimmt gleich der Server (reply.start →
+            // pausiert, playback.done → neu); diese Wiederaufnahme deckt die
+            // Fälle ohne Turn ab (leer/halluziniert), damit nichts hängen bleibt.
+            if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
+            setTimeout(() => { if (micActive) setMicUi('listening'); }, 100);
+          },
+          onVADMisfire: () => {
+            // Zu kurze Sprache → kein Segment. Laufenden Eingangs-Stream verwerfen.
+            if (inputStreaming) abortInputStream();
+            vadStreamSegId = null;
+            if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
+            if (micActive) setMicUi('listening');
+          },
+        });
+        await vad.start();
+        setVad('ok', 'aktiv');
+        micActive = true;
+        // Bei silent-Restart vorher laufenden UI-State (z.B. 'playing') nicht
+        // überschreiben — sonst flackert es.
+        if (!silent) setMicUi('listening');
+        else if (!currentAudioEl) setMicUi('listening');
+      } catch (err) {
+        addBubble('err', `Mikro/VAD: ${err.message || err}`);
+        setVad('err', 'fehler');
+        setMicUi('error');
+        await stopMic(true);
+      }
+    }
+
+    function sendSegment(segmentId, float32) {
+      if (!ws || ws.readyState !== 1) {
+        addBubble('err', 'WebSocket nicht verbunden – Segment verworfen.');
+        return;
+      }
+      ws.send(JSON.stringify({
+        type: 'segment.start',
+        segmentId,
+        samples: float32.length,
+        sampleRate: 16000,
+        format: 'f32le',
+        // Sprecher-ID Hold: Sprech-Start + aktuelle Client-Uhr (beide ms,
+        // Date.now()). Der Server rechnet daraus den Sprech-Start in seiner
+        // eigenen Zeitbasis. bargeIn markiert Ins-Wort-Fallen.
+        speechStartTs: lastSpeechStartTs,
+        clientNow: Date.now(),
+        bargeIn: pendingBargeIn,
+      }));
+      ws.send(f32ToBytes(float32));
+      // Verbraucht -> zuruecksetzen, damit das naechste Segment frische Werte
+      // bekommt (sonst klebt ein alter Sprech-Start/Barge-In am Folgesegment).
+      lastSpeechStartTs = null;
+      pendingBargeIn = false;
+    }
+
+    async function stopMic(silent = false) {
+      micActive = false;
+      if (inputStreaming) abortInputStream();
+      vadStreamSegId = null;
+      try { if (vad) await vad.destroy(); } catch (_) {}
+      vad = null;
+      stopMeter();
+      try { if (inputTapNode) inputTapNode.disconnect(); } catch (_) {}
+      try { if (inputTapSink) inputTapSink.disconnect(); } catch (_) {}
+      inputTapNode = null; inputTapSink = null; inputPreRoll = [];
+      try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+      micStream = null;
+      try { if (audioCtx) await audioCtx.close(); } catch (_) {}
+      audioCtx = null;
+      analyser = null;
+      meterBar.style.width = '0%';
+      if (vadProbBar && !silent) vadProbBar.style.width = '0%';
+      if (!silent) {
+        // Bei silent-Restart die UI nicht auf 'gestoppt/idle' werfen — das
+        // verursachte sichtbares Flackern bei jeder Slider-Änderung.
+        setVad('warn', 'gestoppt');
+        setMicUi('idle');
+      }
+    }
+
+    function startMeter() {
+      const buf = new Uint8Array(analyser.fftSize);
+      // Gradient an die Spurbreite koppeln (einmalig beim Start) → siehe CSS.
+      const trackW = (meterBar.parentElement && meterBar.parentElement.clientWidth) || 90;
+      meterBar.style.backgroundSize = trackW + 'px 100%';
+      const tick = () => {
+        if (!analyser) return;
+        analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = (buf[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / buf.length);
+        const pct = Math.min(100, Math.round(rms * 250));
+        meterBar.style.width = pct + '%';
+        meterRaf = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+    function stopMeter() {
+      if (meterRaf) cancelAnimationFrame(meterRaf);
+      meterRaf = null;
+    }
+
+    /* ===== Push-to-Talk =====
+       Im PTT-Modus läuft kein VAD. Stattdessen:
+         mousedown / touchstart  -> startPttRecording()
+         mouseup / mouseleave / touchend -> stopPttRecording() (sendet Segment)
+
+       Wichtig: Der ScriptProcessor läuft DAUERHAFT (sobald der PTT-Modus
+       aktiv ist), nicht nur während der Taste gedrückt ist. Das löst zwei
+       klassische PTT-Probleme:
+
+         1. Pre-Roll: Die ersten paar Hundert ms nach dem Tastendruck
+            werden sonst abgeschnitten, weil der User sofort losquatscht.
+            Wir pflegen einen Ring-Buffer mit den letzten ~300ms und
+            stellen die beim Press dem Aufnahme-Buffer voran.
+
+         2. Post-Roll: Die letzten ~200ms nach dem Loslassen werden sonst
+            abgeschnitten, weil das Audio noch im Browser-Buffer steht.
+            Wir lassen den Processor noch kurz weiterlaufen.
+    */
+    const PTT_PREROLL_MS = 300;
+    const PTT_POSTROLL_MS = 200;
+    const PTT_FRAME_SIZE = 4096;       // ~256 ms bei 16k
+    const PTT_PREROLL_FRAMES = Math.ceil((PTT_PREROLL_MS / 1000 * 16000) / PTT_FRAME_SIZE);
+    const PTT_POSTROLL_FRAMES = Math.ceil((PTT_POSTROLL_MS / 1000 * 16000) / PTT_FRAME_SIZE);
+
+    let pttCtx = null;
+    let pttStream = null;
+    let pttNode = null;
+    let pttSource = null;
+    let pttGainSink = null;
+    let pttPreRoll = [];               // Ring-Buffer der letzten N Frames
+    let pttBuffers = [];               // Aktiver Aufnahme-Buffer
+    let pttRecording = false;
+    let pttPostRollFramesLeft = 0;     // wenn > 0, sammeln wir noch weiter
+    let pttPendingFinalize = null;     // {segmentId, resolve} für Post-Roll
+    let pttArming = false;
+
+    async function ensurePttCtx() {
+      // Wir starten den Audio-Stream + Processor schon beim Modus-Wechsel,
+      // damit der Ring-Buffer vorgefuellt ist, wenn der User die Taste
+      // drückt. Stream + Context bleiben während des PTT-Modus offen.
+      if (pttCtx && pttStream && pttSource && pttNode) return;
+      pttStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true, noiseSuppression: true,
+          autoGainControl: true, channelCount: 1, sampleRate: 16000,
+        },
+        video: false,
+      });
+      pttCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      if (pttCtx.state === 'suspended') {
+        try { await pttCtx.resume(); } catch(_) {}
+      }
+      pttSource = pttCtx.createMediaStreamSource(pttStream);
+
+      // Analyser-Tap für Pegel-Meter
+      analyser = pttCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      pttSource.connect(analyser);
+      startMeter();
+
+      // Permanent laufender ScriptProcessor; sammelt in Ring-Buffer und
+      // — wenn pttRecording — auch in pttBuffers.
+      const node = pttCtx.createScriptProcessor(PTT_FRAME_SIZE, 1, 1);
+      node.onaudioprocess = (ev) => {
+        const ch = ev.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(ch);
+        // Ring-Buffer pflegen (immer)
+        pttPreRoll.push(copy);
+        if (pttPreRoll.length > PTT_PREROLL_FRAMES) pttPreRoll.shift();
+        // Aktiv aufnehmen
+        if (pttRecording) {
+          pttBuffers.push(copy);
+        } else if (pttPostRollFramesLeft > 0) {
+          // Post-Roll: nach Release noch ein paar Frames sammeln,
+          // damit der Wortendpunkt nicht abgeschnitten wird.
+          pttBuffers.push(copy);
+          pttPostRollFramesLeft -= 1;
+          if (pttPostRollFramesLeft === 0 && pttPendingFinalize) {
+            const fin = pttPendingFinalize;
+            pttPendingFinalize = null;
+            // im nächsten Tick finalisieren, damit der laufende Callback
+            // sauber zurückkehrt
+            setTimeout(() => fin(), 0);
+          }
+        }
+      };
+      pttSource.connect(node);
+      // ScriptProcessor muss an die Destination, sonst feuert audioprocess nicht.
+      // Gain 0, damit man sich nicht selbst hört.
+      const gain = pttCtx.createGain(); gain.gain.value = 0;
+      node.connect(gain).connect(pttCtx.destination);
+      pttGainSink = gain;
+      pttNode = node;
+    }
+
+    async function startPttRecording() {
+      if (pttRecording || pttArming) return;
+      // Sprech-Start fuer Sprecher-ID-Hold = Moment des Tastendrucks (PTT hat
+      // keinen VAD-onSpeechStart). Vor bargeInStop setzen.
+      lastSpeechStartTs = Date.now();
+      // Barge-In Variante A: Tastendruck = klare Absicht "ich rede jetzt".
+      // Laufende TTS-Wiedergabe SOFORT stoppen, ohne Debounce.
+      bargeInStop('ptt-press');
+      pttArming = true;
+      try {
+        await ensurePttCtx();
+      } catch (err) {
+        addBubble('err', `Mikro: ${err.message || err}`);
+        setMicUi('error');
+        pttArming = false;
+        return;
+      }
+      if (pttCtx.state === 'suspended') {
+        try { await pttCtx.resume(); } catch(_) {}
+      }
+      // Pre-Roll: bisher gesammelte Ring-Buffer-Frames als Lead-in nutzen.
+      // Kopie nehmen, damit der Ring-Buffer ungehindert weiterläuft.
+      pttBuffers = pttPreRoll.slice();
+      pttPostRollFramesLeft = 0;
+      pttPendingFinalize = null;
+      pttRecording = true;
+      pttArming = false;
+      micBtn.classList.add('recording');
+      setMicUi('recording');
+    }
+
+    async function stopPttRecording() {
+      if (!pttRecording) return;
+      pttRecording = false;
+      micBtn.classList.remove('recording');
+
+      // Statt sofort abzuschneiden: Post-Roll-Frames noch sammeln lassen.
+      // Wenn keine weiteren Callbacks mehr kommen (z.B. Context schon weg),
+      // wird der Timeout-Fallback triggern.
+      const finalize = () => {
+        let total = 0;
+        for (const b of pttBuffers) total += b.length;
+        const captured = pttBuffers;
+        pttBuffers = [];
+        if (total < 16000 * 0.20) {   // <200ms inkl. Pre-Roll: verwerfen
+          setMicUi('listening');
+          return;
+        }
+        const out = new Float32Array(total);
+        let off = 0;
+        for (const b of captured) { out.set(b, off); off += b.length; }
+        segmentCounter += 1;
+        segCount.textContent = String(segmentCounter);
+        sendSegment(String(segmentCounter), out);
+        setMicUi('thinking');
+      };
+      pttPostRollFramesLeft = PTT_POSTROLL_FRAMES;
+      pttPendingFinalize = finalize;
+      // Fallback: wenn Post-Roll-Callbacks ausbleiben (Context closed o.ä.)
+      setTimeout(() => {
+        if (pttPendingFinalize === finalize) {
+          pttPendingFinalize = null;
+          pttPostRollFramesLeft = 0;
+          finalize();
+        }
+      }, PTT_POSTROLL_MS + 200);
+    }
+
+    async function teardownPttCtx() {
+      pttRecording = false;
+      pttPostRollFramesLeft = 0;
+      pttPendingFinalize = null;
+      pttBuffers = [];
+      pttPreRoll = [];
+      try { if (pttNode) pttNode.disconnect(); } catch(_) {}
+      pttNode = null;
+      try { if (pttGainSink) pttGainSink.disconnect(); } catch(_) {}
+      pttGainSink = null;
+      stopMeter();
+      try { if (pttSource) pttSource.disconnect(); } catch(_) {}
+      pttSource = null;
+      try { if (pttStream) pttStream.getTracks().forEach(t => t.stop()); } catch(_) {}
+      pttStream = null;
+      try { if (pttCtx) await pttCtx.close(); } catch(_) {}
+      pttCtx = null;
+      analyser = null;
+      meterBar.style.width = '0%';
+    }
+
+    /* ===== Mode-Switch =====
+       Wechsel zwischen VAD, Wake-Word und PTT. VAD und Wake-Word teilen sich die
+       VAD-Pipeline; der Unterschied ist nur das serverseitige Wake-Gate (per
+       'settings' an-/abgeschaltet). Aktive Pipelines werden sauber heruntergefahren.
+    */
+    async function setInputMode(mode) {
+      if (mode === inputMode) return;
+      const wasVadLike = vadLike();
+      // alten Modus runterfahren
+      if (wasVadLike && !(mode === 'vad' || mode === 'wake') && micActive) {
+        // Nur stoppen, wenn wir die VAD-Pipeline ganz verlassen (→ PTT).
+        await stopMic();
+      }
+      if (inputMode === 'ptt' && (pttCtx || pttStream)) {
+        if (pttRecording) await stopPttRecording();
+        await teardownPttCtx();
+      }
+      inputMode = mode;
+      try { localStorage.setItem('inputMode', mode); } catch (_) {}
+      // Wake-Modus verlassen → Fenster-Ablauf-Timer (akustisches Feedback) stoppen.
+      if (mode !== 'wake') cancelWakeWindowTimer();
+      // Fensterzustand zurücksetzen → Mic-Farbe sofort passend (Wake = grün).
+      setWakeWindowActive(false);
+      updateInputModeHint();
+      // Server über den (de)aktivierten Wake-Modus informieren.
+      sendSettings();
+      // UI/Status
+      if (mode === 'ptt') {
+        setVad('warn', 'PTT aktiv (VAD aus)');
+        micBtn.disabled = false;
+        setMicUi('idle');
+      } else {
+        // VAD/Wake-Modus: VAD nicht automatisch starten – User drückt Mic-Button.
+        if (window.vad && window.vad.MicVAD) {
+          setVad('warn', micActive ? (mode === 'wake' ? 'Wake-Word aktiv' : 'aktiv') : 'bereit');
+          micBtn.disabled = false;
+        } else {
+          setVad('err', 'bundle fehlt');
+          micBtn.disabled = true;
+        }
+        if (!micActive) setMicUi('idle');
+      }
+    }
+
+    function updateInputModeHint() {
+      const hint = document.getElementById('inputModeHint');
+      if (!hint) return;
+      if (inputMode === 'ptt') {
+        hint.textContent = 'PTT: Mikro-Button gedrückt halten zum Aufnehmen, loslassen zum Senden.';
+      } else if (inputMode === 'wake') {
+        const w = (serverWake && serverWake.word) ? serverWake.word : AGENT_NAME;
+        hint.textContent = `Wake-Word: Mikro starten und mit „${w}, …" sprechen. Folgefragen kurz danach gehen ohne Wake-Word durch.`;
+      } else {
+        hint.textContent = 'VAD: Mikro starten – Sprache wird automatisch erkannt und gesendet.';
+      }
+    }
+
+    // Mic-Button: Verhalten hängt vom Modus ab.
+    // VAD: Click = Toggle Listen.
+    // PTT: mousedown/touchstart = Aufnahme, mouseup/leave/touchend = Senden.
+    micBtn.addEventListener('click', async (ev) => {
+      // Läuft gerade eine Antwort/Verarbeitung? → ein Klick stoppt sie (lokal
+      // sofort + Server-Abbruch via barge_in). Gilt in allen Modi.
+      if (isBusy()) {
+        bargeInStop('manual');
+        setMicUi(micActive ? 'listening' : 'idle');
+        return;
+      }
+      if (!vadLike()) return;   // im PTT-Modus: Click sonst ignoriert
+      micBtn.disabled = true;
+      try {
+        if (!micActive) await startMic();
+        else            await stopMic();
+      } finally {
+        micBtn.disabled = false;
+      }
+    });
+    micBtn.addEventListener('mousedown', (ev) => {
+      if (inputMode !== 'ptt') return;
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      startPttRecording();
+    });
+    micBtn.addEventListener('mouseup', (ev) => {
+      if (inputMode !== 'ptt') return;
+      stopPttRecording();
+    });
+    micBtn.addEventListener('mouseleave', () => {
+      if (inputMode !== 'ptt') return;
+      if (pttRecording) stopPttRecording();
+    });
+    micBtn.addEventListener('touchstart', (ev) => {
+      if (inputMode !== 'ptt') return;
+      ev.preventDefault();
+      startPttRecording();
+    }, { passive: false });
+    micBtn.addEventListener('touchend', (ev) => {
+      if (inputMode !== 'ptt') return;
+      ev.preventDefault();
+      stopPttRecording();
+    });
+    micBtn.addEventListener('touchcancel', () => {
+      if (inputMode !== 'ptt') return;
+      if (pttRecording) stopPttRecording();
+    });
+
+    // Radio-Buttons für Mode-Switch
+    document.querySelectorAll('input[name="inputMode"]').forEach((r) => {
+      r.addEventListener('change', () => {
+        if (r.checked) setInputMode(r.value);
+      });
+    });
+
+    // Modus programmatisch wählen (inkl. Radio-UI) — z.B. Start-Default aus hello.
+    function selectInputMode(mode) {
+      const radio = document.querySelector(`input[name="inputMode"][value="${mode}"]`);
+      if (radio) radio.checked = true;
+      setInputMode(mode);
+    }
+
+    /* ===== Composer (Text + Bilder) ===== */
+    const textInput      = document.getElementById('textInput');
+    const sendBtn        = document.getElementById('sendBtn');
+    const attachBtn      = document.getElementById('attachBtn');
+    const fileInput      = document.getElementById('fileInput');
+    const composerImages = document.getElementById('composerImages');
+
+    // Pending Attachments: {id, name, url|null, status:'uploading'|'ok'|'error', chipEl}
+    const pendingAttachments = new Map();
+
+    function refreshSendButton() {
+      const hasText = textInput.value.trim().length > 0;
+      const hasReadyImg = Array.from(pendingAttachments.values()).some(a => a.status === 'ok');
+      const anyUploading = Array.from(pendingAttachments.values()).some(a => a.status === 'uploading');
+      const wsReady = ws && ws.readyState === 1;
+      sendBtn.disabled = !wsReady || anyUploading || (!hasText && !hasReadyImg);
+    }
+
+    function autoGrowTextarea() {
+      textInput.style.height = 'auto';
+      textInput.style.height = Math.min(200, textInput.scrollHeight) + 'px';
+    }
+
+    function addImageChip(file) {
+      const id = 'att-' + Math.random().toString(36).slice(2,10);
+      const chip = document.createElement('div');
+      chip.className = 'img-chip uploading';
+      const img = document.createElement('img');
+      img.alt = file.name;
+      img.src = URL.createObjectURL(file);
+      chip.appendChild(img);
+      const x = document.createElement('button');
+      x.className = 'x'; x.type = 'button'; x.textContent = '×';
+      x.title = 'Entfernen';
+      x.addEventListener('click', () => removeAttachment(id));
+      chip.appendChild(x);
+      composerImages.appendChild(chip);
+      const att = { id, name: file.name, url: null, status: 'uploading', chipEl: chip };
+      pendingAttachments.set(id, att);
+      refreshSendButton();
+      uploadFile(file, att);
+      return att;
+    }
+
+    function removeAttachment(id) {
+      const att = pendingAttachments.get(id);
+      if (!att) return;
+      try { att.chipEl.remove(); } catch(_) {}
+      pendingAttachments.delete(id);
+      refreshSendButton();
+    }
+
+    async function uploadFile(file, att) {
+      try {
+        const fd = new FormData();
+        fd.append('file', file, file.name);
+        const resp = await fetch('/upload', { method: 'POST', body: fd });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        att.url = data.url;
+        att.status = 'ok';
+        att.chipEl.classList.remove('uploading');
+      } catch (err) {
+        att.status = 'error';
+        att.chipEl.classList.remove('uploading');
+        att.chipEl.classList.add('error');
+        att.chipEl.title = `Upload fehlgeschlagen: ${err.message || err}`;
+        addBubble('err', `Upload "${att.name}": ${err.message || err}`);
+      } finally {
+        refreshSendButton();
+      }
+    }
+
+    function sendTextMessage() {
+      const text = textInput.value.trim();
+      const readyAtts = Array.from(pendingAttachments.values()).filter(a => a.status === 'ok');
+      if (!text && readyAtts.length === 0) return;
+      if (!ws || ws.readyState !== 1) {
+        addBubble('err', 'Nicht verbunden — Nachricht nicht gesendet.');
+        return;
+      }
+
+      // Lokale User-Bubble bauen, server-turn-id matchen wir per next turn.commit (source=text).
+      // Wir nutzen einen Pre-Turn-Id; sobald turn.commit mit source=text kommt, mappen wir um.
+      const localTurnId = 'pretxt-' + Math.random().toString(36).slice(2,8);
+      const el = document.createElement('div');
+      el.className = 'bubble user';
+      if (readyAtts.length > 0) {
+        const imgsWrap = document.createElement('div');
+        imgsWrap.className = 'images';
+        for (const a of readyAtts) {
+          const im = document.createElement('img');
+          im.src = a.url; im.alt = a.name; im.title = a.name;
+          imgsWrap.appendChild(im);
+        }
+        el.appendChild(imgsWrap);
+      }
+      const textNode = document.createTextNode(text || '📎');
+      el.appendChild(textNode);
+      setMeta(el, 'Text · wird gesendet …');
+      chatLog.appendChild(el);
+      chatLog.scrollTop = chatLog.scrollHeight;
+      turnUserBubble.set(localTurnId, el);
+      pendingTextLocalTurnIds.push(localTurnId);
+
+      ws.send(JSON.stringify({
+        type: 'text.message',
+        text,
+        imageUrls: readyAtts.map(a => a.url),
+      }));
+
+      // UI cleanen
+      textInput.value = '';
+      autoGrowTextarea();
+      for (const a of [...pendingAttachments.values()]) removeAttachment(a.id);
+      refreshSendButton();
+    }
+
+    // Server schickt turn.commit mit einem neuen turnId (Voice-Turn-ID); wir
+    // mappen beim nächsten Text- oder Mixed-Turn die lokale Pre-Bubble um.
+    // Bei "mixed" prüfen wir vorher, ob bereits eine Voice-Bubble existiert
+    // — wenn ja, verwerfen wir die lokale Pre-Bubble statt zu mappen.
+    const pendingTextLocalTurnIds = [];
+    const _origHandle = handleMessage;
+    // Migriert Inhalte (Bilder!) der Pre-Bubble in die Ziel-Bubble, falls die
+    // Ziel-Bubble noch kein .images hat. Sonst gehen Bilder verloren, wenn
+    // wir die Pre-Bubble einfach wegwerfen.
+    function mergePreBubbleInto(targetEl, preEl) {
+      if (!targetEl || !preEl || targetEl === preEl) return;
+      const preImages = preEl.querySelector(':scope > .images');
+      const targetImages = targetEl.querySelector(':scope > .images');
+      if (preImages && !targetImages) {
+        // Bilder nach vorne in die Ziel-Bubble setzen
+        targetEl.insertBefore(preImages, targetEl.firstChild);
+      }
+    }
+
+    // Mappt eine Pre-Bubble (lokal angelegt beim Send) auf die Server-Turn-Id.
+    // Wird sowohl früh in turn.pending als auch in turn.commit aufgerufen.
+    // Idempotent: zweiter Aufruf macht nichts mehr.
+    function consumePreBubblesFor(serverTurnId) {
+      if (!pendingTextLocalTurnIds.length) return;
+      const pre = pendingTextLocalTurnIds.splice(0, pendingTextLocalTurnIds.length);
+      let mapped = turnUserBubble.has(serverTurnId);
+      let targetEl = mapped ? turnUserBubble.get(serverTurnId) : null;
+      for (const localId of pre) {
+        if (!turnUserBubble.has(localId)) continue;
+        const el = turnUserBubble.get(localId);
+        if (!mapped) {
+          // Erste Pre-Bubble übernimmt die Server-Turn-Id
+          turnUserBubble.delete(localId);
+          turnUserBubble.set(serverTurnId, el);
+          targetEl = el;
+          mapped = true;
+        } else {
+          // Ziel-Bubble existiert schon (Voice-Bubble vorab via turn.pending
+          // angelegt ODER frühere Pre-Bubble desselben Turns). Inhalte
+          // (Bilder!) in die Ziel-Bubble migrieren, dann Pre-Bubble entfernen.
+          mergePreBubbleInto(targetEl, el);
+          if (el.parentNode) el.parentNode.removeChild(el);
+          turnUserBubble.delete(localId);
+        }
+      }
+    }
+
+    handleMessage = function(m) {
+      // Pre-Bubbles früh mappen — sobald der Server eine Server-Turn-Id für
+      // den Text-Send vergibt (kommt im turn.pending), übernehmen wir die
+      // Pre-Bubble. Sonst legt der turn.pending-Handler eine LEERE Bubble
+      // unter der Server-Turn-Id an, und turn.commit denkt dann fälschlich
+      // „Voice-Bubble schon da“ → verwirft die Pre-Bubble mit Bild.
+      if (m && (m.type === 'turn.pending' || m.type === 'turn.commit')
+          && m.turnId && pendingTextLocalTurnIds.length) {
+        // turn.pending hat hasText/hasVoice; turn.commit hat source.
+        // Wir mappen für jeden Fall, in dem der Server-Turn von einem Text-
+        // Send getrieben sein KANN — also wenn turn.pending hasText=true ODER
+        // turn.commit source in {text, mixed}.
+        const isTextDriven =
+          (m.type === 'turn.pending' && (m.hasText || (m.imageCount && m.imageCount > 0))) ||
+          (m.type === 'turn.commit' && (m.source === 'text' || m.source === 'mixed'));
+        if (isTextDriven) consumePreBubblesFor(m.turnId);
+      }
+      return _origHandle(m);
+    };
+
+    attachBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const files = Array.from(fileInput.files || []);
+      for (const f of files) {
+        if (!f.type.startsWith('image/')) {
+          addBubble('err', `„${f.name}“ ist kein Bild — übersprungen.`);
+          continue;
+        }
+        addImageChip(f);
+      }
+      fileInput.value = '';
+    });
+
+    textInput.addEventListener('input', () => {
+      autoGrowTextarea();
+      refreshSendButton();
+    });
+    textInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+        ev.preventDefault();
+        if (!sendBtn.disabled) sendTextMessage();
+      }
+    });
+    sendBtn.addEventListener('click', sendTextMessage);
+
+    // Strg+V / Cmd+V: Bilder aus der Zwischenablage einfügen.
+    // Funktioniert in modernen Browsern über clipboardData.items oder .files.
+    // Pasted images haben oft generische Namen ("image.png") – die nehmen wir wie
+    // sie kommen; der Server bekommt sie als Multipart-Upload mit Content-Type.
+    textInput.addEventListener('paste', (ev) => {
+      const cd = ev.clipboardData || window.clipboardData;
+      if (!cd) return;
+      // 1) Files-Liste (sauberster Pfad: echte Datei mit MIME)
+      const fromFiles = cd.files && cd.files.length ? Array.from(cd.files) : [];
+      // 2) items: kann auch Bild-Blobs liefern, wenn .files leer ist
+      const fromItems = [];
+      if (cd.items && cd.items.length) {
+        for (const it of cd.items) {
+          if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+            const f = it.getAsFile();
+            if (f) fromItems.push(f);
+          }
+        }
+      }
+      // Dedup: wenn beide Quellen dasselbe liefern, .files priorisieren
+      const files = (fromFiles.length ? fromFiles : fromItems)
+        .filter((f) => f && f.type && f.type.startsWith('image/'));
+      if (!files.length) return;   // kein Bild im Clipboard -> normales Text-Paste
+      ev.preventDefault();
+      for (const f of files) addImageChip(f);
+    });
+
+    // Drag & Drop für Bilder direkt auf Chat-Bereich
+    chatLog.addEventListener('dragover', (e) => { e.preventDefault(); });
+    chatLog.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer?.files || []);
+      for (const f of files) {
+        if (f.type.startsWith('image/')) addImageChip(f);
+      }
+    });
+
+    /* ===== Boot ===== */
+    if (window.vad && window.vad.MicVAD) {
+      setVad('warn', 'bereit');
+      micBtn.disabled = false;
+    } else {
+      setVad('err', 'bundle fehlt');
+      addBubble('err', 'vad-web konnte nicht geladen werden (static/vendor/bundle.min.js fehlt oder fehlerhaft).');
+    }
+    speedLabel.textContent = parseFloat(speed.value).toFixed(2) + 'x';
+    debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
+    restoreTranscript();   // vorherige Sitzung anzeigen (Kontext lebt serverseitig weiter)
+    connect();
+  </script>
+</body>
+</html>

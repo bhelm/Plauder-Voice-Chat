@@ -1,0 +1,21 @@
+# Secrets — niemals committen
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Laufzeit-Artefakte
+uploads/
+house_data/
+*.log
+
+# Backups / Editor / OS
+*_orig.py
+*.bak
+.DS_Store
+*.swp
+# Optionales House-Mode-Artefakt (nicht im Repo)
+speakers.json

@@ -1,0 +1,21 @@
+# Voice-Chat — Laufzeit-Abhängigkeiten (Cloud-Default).
+# Der Cloud-Pfad (STT/TTS über OpenAI, LLM über Fireworks) braucht KEINE
+# GPU-/ML-Deps.
+
+aiohttp>=3.9
+openai>=1.0
+numpy>=1.24
+
+# .env wird vom Package selbst geladen (eigener Mini-Parser); python-dotenv ist
+# optional/Bequemlichkeit.
+python-dotenv>=1.0
+
+# Tests
+pytest>=7.0
+
+# --- Optionale lokale GPU-Backends (nur bei Bedarf installieren) -------------
+# STT_BACKEND=whisper_local:
+#   pip install faster-whisper
+# TTS_BACKEND=omnivoice_local:
+#   pip install omnivoice torch   (siehe k2-fsa/OmniVoice Setup)
+# Diese Pakete werden NUR importiert, wenn das jeweilige Backend aktiv ist.
