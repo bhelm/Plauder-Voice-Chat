@@ -16,13 +16,8 @@ import re
 # --------------------------------------------------------------------------- #
 _EMOJI_RE = re.compile(
     "["
-    "\U0001F300-\U0001FAFF"
-    "\U0001F600-\U0001F64F"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F700-\U0001F77F"
+    "\U0001F300-\U0001FAFF"   # already covers 1F6xx/1F7xx/1F9xx/1FAxx
     "\U00002600-\U000027BF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001FA70-\U0001FAFF"
     "‍"   # ZWJ
     "️"   # VS16
     "]+",
@@ -245,9 +240,7 @@ def merge_transcripts(parts: list[str]) -> str:
         return ""
     out = pieces[0]
     for nxt in pieces[1:]:
-        if out and out[-1] in ".?!…":
-            out = out + " " + nxt
-        elif out and out[-1] in ",:;":
+        if out and out[-1] in ".?!…,:;":
             out = out + " " + nxt
         else:
             out = out + ". " + (nxt[0].upper() + nxt[1:] if nxt else nxt)

@@ -43,7 +43,8 @@ class TurnState:
     audio_ids: set = field(default_factory=set)
     speed: float = 1.0
     debounce_ms: int = 1200
-    # Legacy: parallel text tasks; now unused, kept for _cancel_in_flight.
+    # Legacy: parallel text tasks. Nothing appends to this anymore, but the
+    # server still iterates it in `_cancel_in_flight` — so it is kept on purpose.
     text_tasks: list = field(default_factory=list)
     # User suffix that determines the LLM session key per connection.
     session_user: str | None = None
@@ -74,7 +75,12 @@ class TurnState:
         return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)
 
     def reset(self) -> None:
-        """Begin a new turn (after a successful agent call)."""
+        """Begin a new turn (after a successful agent call).
+
+        Not a full reset: only turn_id, the pending lists and speech_end_ts are
+        RESET. Deliberately PRESERVED are audio_ids, all wake_* fields, speed,
+        debounce_ms and session_user (they apply across turns).
+        """
         self.turn_id = uuid.uuid4().hex[:8]
         self.pending_texts.clear()
         self.pending_segment_ids.clear()

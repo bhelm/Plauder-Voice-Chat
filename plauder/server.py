@@ -50,8 +50,17 @@ ALLOWED_IMAGE_MIME = {
     "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp", "image/bmp",
 }
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+WS_MAX_MSG_BYTES = 16 * 1024 * 1024   # max size of a single WebSocket frame (image data URLs)
+WS_HEARTBEAT_S = 20.0                 # WebSocket ping interval
+AGENT_RETRY_DELAY_S = 0.5             # pause before the single silent retry on an idle timeout
+SEGMENT_ID_LEN = 8                    # length of the short hex ids used for segments/turns
 
 STAGE = 6  # protocol version (client-compatible)
+
+
+def _short_id() -> str:
+    """Short random hex id for segments / turns / ephemeral users."""
+    return uuid.uuid4().hex[:SEGMENT_ID_LEN]
 
 # --------------------------------------------------------------------------- #
 # Runtime state (filled by configure() / main()). Module globals, so the
@@ -290,7 +299,7 @@ async def _agent_chat_with_retry(combined: str, *, image_urls, allow_retry: bool
         if not allow_retry:
             raise
         LOG.warning("agent upstream timeout, retry once: %s", exc)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(AGENT_RETRY_DELAY_S)
         reply, meta = await CONV.chat(combined, user_key=user_key, image_urls=image_urls)
         return reply, meta, True
 
@@ -616,7 +625,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             if parts or not allow_retry:
                 raise
             LOG.warning("turn=%s agent upstream timeout, retry once (stream)", turn_id)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(AGENT_RETRY_DELAY_S)
             pending = ""
             await _consume_stream()
     except asyncio.CancelledError:
@@ -684,6 +693,16 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             "type": "audio.end", "turnId": turn_id, "audioId": audio_id,
             "chunks": total_chunks, "sampleRate": sr_box["sr"], "ttsMs": tts_ms,
             "speed": state.speed, "ts": time.time()})
+
+
+def _resume_debounce(ws, state: TurnState) -> None:
+    """(Re)arm the debounce timer when coalesced input is still pending.
+
+    Used by the segment paths that drop the current segment (ghost-filtered,
+    wake-gated, empty transcript) but must not strand earlier pending input.
+    """
+    if state.has_pending():
+        state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
 
 
 async def _debounce_then_run(ws, state: TurnState):
@@ -850,8 +869,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             "text": "", "filtered": "hallucination", "filteredText": text,
             "sttMs": stt_ms, "totalMs": int((time.time() - t0) * 1000), "ts": time.time(),
         })
-        if state.has_pending():
-            state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+        _resume_debounce(ws, state)
         return
 
     # --- Wake-word gate (prefix). Voice only; typed input is always intended.
@@ -866,8 +884,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                 "type": "transcript.ignored", "segmentId": segment_id,
                 "turnId": state.turn_id, "text": text,
                 "reason": "wake_closed", "ts": time.time()})
-            if state.has_pending():
-                state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+            _resume_debounce(ws, state)
             return
         # Measure "window open?" at SPEECH START, not at commit time:
         # if someone starts speaking within the window, their (possibly long)
@@ -889,8 +906,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                     "type": "transcript.ignored", "segmentId": segment_id,
                     "turnId": state.turn_id, "text": text,
                     "reason": "no_wake_word", "ts": time.time()})
-                if state.has_pending():
-                    state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+                _resume_debounce(ws, state)
                 return
             # Wake detected → emit the early cue if needed (in case no partial
             # already sent it), strip the wake word.
@@ -950,8 +966,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     await ws.send_json(transcript_evt)
 
     if not text:
-        if state.has_pending():
-            state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+        _resume_debounce(ws, state)
         return
 
     state.pending_texts.append(_speaker_tag(text, speaker_info))
@@ -1024,7 +1039,7 @@ def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
 # WebSocket handler
 # ============================================================================ #
 async def ws_handler(request):
-    ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=16 * 1024 * 1024)
+    ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_MSG_BYTES)
     await ws.prepare(request)
     peer = request.remote
     LOG.info("ws connect: %s", peer)
@@ -1163,7 +1178,7 @@ async def ws_handler(request):
                     if isinstance(_sst, (int, float)) and isinstance(_cnow, (int, float)):
                         speech_start_ts = time.time() - (float(_cnow) - float(_sst)) / 1000.0
                     pending_segment_meta.append({
-                        "id": data.get("segmentId") or uuid.uuid4().hex[:8],
+                        "id": data.get("segmentId") or _short_id(),
                         "speech_start_ts": speech_start_ts,
                         "barge_in": bool(data.get("bargeIn")),
                     })
@@ -1176,7 +1191,7 @@ async def ws_handler(request):
                     if isinstance(_sst, (int, float)) and isinstance(_cnow, (int, float)):
                         speech_start_ts = time.time() - (float(_cnow) - float(_sst)) / 1000.0
                     active_stream = {
-                        "id": data.get("segmentId") or uuid.uuid4().hex[:8],
+                        "id": data.get("segmentId") or _short_id(),
                         "buf": bytearray(),
                         "speech_start_ts": speech_start_ts,
                         "barge_in": bool(data.get("bargeIn")),
@@ -1225,14 +1240,14 @@ async def ws_handler(request):
                     if active_stream is not None:
                         active_stream["done"] = True
                     active_stream = None
-                    state.turn_id = uuid.uuid4().hex[:8]
+                    state.turn_id = _short_id()
                     _ident = get_speaker_identifier()
                     if _ident is not None:
                         try:
                             _ident.reset()
                         except Exception:
                             LOG.exception("speaker identifier reset failed (ignored)")
-                    new_user = f"{_default_user()}-{uuid.uuid4().hex[:8]}"
+                    new_user = f"{_default_user()}-{_short_id()}"
                     state.session_user = new_user
                     if CONV is not None:
                         CONV.reset(new_user)
@@ -1282,7 +1297,7 @@ async def ws_handler(request):
                 if pending_segment_meta:
                     _meta = pending_segment_meta.popleft()
                 else:
-                    _meta = {"id": uuid.uuid4().hex[:8], "speech_start_ts": None, "barge_in": False}
+                    _meta = {"id": _short_id(), "speech_start_ts": None, "barge_in": False}
                 asyncio.create_task(_handle_audio_segment(
                     ws, state, msg.data, _meta["id"], peer,
                     speech_start_ts=_meta.get("speech_start_ts"),
@@ -1317,7 +1332,7 @@ async def _security_headers_mw(request, handler):
 
 
 def build_app() -> web.Application:
-    app = web.Application(client_max_size=16 * 1024 * 1024,
+    app = web.Application(client_max_size=WS_MAX_MSG_BYTES,
                           middlewares=[_security_headers_mw])
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)

@@ -35,7 +35,10 @@ class TelegramBridge:
         self.sessions_dir = Path(sessions_dir)
         self._recent_self_sent: deque[str] = deque(maxlen=128)
         self._local_call_depth: int = 0
+        # Membership set for O(1) lookups + a deque for eviction order (FIFO), so
+        # that trimming actually drops the oldest ids.
         self._recent_seen_in_jsonl: set[str] = set()
+        self._recent_seen_order: deque[str] = deque(maxlen=512)
         self._recent_broadcast_keys: deque[str] = deque(maxlen=64)
         self._recent_broadcast_set: set[str] = set()
         self._broadcast_channels: list = []
@@ -226,10 +229,16 @@ class TelegramBridge:
                     if msg_id and msg_id in self._recent_seen_in_jsonl:
                         continue
                     if msg_id:
+                        if self._recent_seen_order.maxlen and len(
+                            self._recent_seen_order
+                        ) >= self._recent_seen_order.maxlen:
+                            # deque is full → also drop the oldest id (about to be
+                            # evicted) from the membership set.
+                            self._recent_seen_in_jsonl.discard(
+                                self._recent_seen_order[0]
+                            )
+                        self._recent_seen_order.append(msg_id)
                         self._recent_seen_in_jsonl.add(msg_id)
-                        if len(self._recent_seen_in_jsonl) > 512:
-                            keep = list(self._recent_seen_in_jsonl)[-256:]
-                            self._recent_seen_in_jsonl = set(keep)
                     role, text = self._extract_message_text(d)
                     if not role or not text:
                         continue

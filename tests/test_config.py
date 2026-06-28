@@ -210,8 +210,22 @@ def test_voice_mode_system_full_override():
     assert cfg.resolved_voice_system() == "NUR DAS HIER."
 
 
-def test_real_env_file_loads():
-    """The real .env can be loaded and yields a valid cloud config."""
+def test_real_env_file_loads(tmp_path, monkeypatch):
+    """``load_config`` reads a .env file and yields a valid cloud config.
+
+    Hermetic: we point the loader at a temp .env (via VOICE_ENV_FILE) instead of
+    the developer's real on-disk .env, so the test doesn't depend on the repo.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "STT_BACKEND=openai\n"
+        "TTS_BACKEND=openai\n"
+        "LLM_BACKEND=openai_compat\n"
+        "OPENAI_API_KEY=sk-test-dummy\n"
+        "FIREWORKS_API_KEY=fw-test-dummy\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VOICE_ENV_FILE", str(env_file))
     cfg = config.load_config()
     assert cfg.stt_backend in ("openai", "whisper_local")
     assert cfg.llm_backend in ("openai_compat", "openclaw")

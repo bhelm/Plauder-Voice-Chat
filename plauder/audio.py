@@ -30,10 +30,15 @@ def pcm_bytes_to_float32_array(pcm_bytes: bytes) -> np.ndarray:
     return np.frombuffer(pcm_bytes, dtype=np.float32)
 
 
+def float32_to_pcm16_bytes(samples):
+    """Clip float32 samples to [-1, 1] and pack them as little-endian int16 PCM bytes."""
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
 def float32_to_pcm16_wav_bytes(samples_f32, sample_rate: int) -> bytes:
     """float32 [-1,1] → 16-bit mono WAV bytes."""
-    clipped = np.clip(samples_f32, -1.0, 1.0)
-    pcm16 = (clipped * 32767.0).astype(np.int16).tobytes()
+    pcm16 = float32_to_pcm16_bytes(samples_f32)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -60,7 +65,7 @@ def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
     ignore the `speed` parameter.
     """
     x = np.asarray(samples_f32, dtype=np.float32)
-    if abs(rate - 1.0) < 1e-3 or x.size < 4:
+    if rate <= 0 or abs(rate - 1.0) < 1e-3 or x.size < 4:
         return x
     N = max(256, int(sample_rate * 0.046))   # window length (~46 ms)
     Hs = N // 2                              # synthesis hop (output)

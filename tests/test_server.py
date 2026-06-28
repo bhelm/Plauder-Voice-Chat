@@ -9,43 +9,11 @@ from plauder.config import Config
 from plauder.sanitizer import HallucinationFilter
 from plauder.session import ConversationManager
 
+# Shared duck-typed backends + WS drain helper live in conftest.
+from tests.conftest import FakeSTT, FakeTTS, FakeLLM, _drain_until
+
 
 # --- Mock-Backends ----------------------------------------------------------
-class FakeSTT:
-    last_no_speech_prob = None
-
-    async def transcribe(self, audio_pcm, sample_rate):
-        return "hallo welt"
-
-    def describe(self):
-        return {"engine": "fake-stt", "loaded": True}
-
-
-class FakeTTS:
-    sample_rate = 24000
-
-    async def synth(self, text, *, speed=1.0):
-        # 4 int16-Samples
-        return b"\x00\x00\x01\x00\x02\x00\x03\x00", 24000
-
-    def describe(self):
-        return {"engine": "fake-tts", "sample_rate": 24000, "loaded": True}
-
-
-class FakeLLM:
-    loaded = True
-    last_meta = {"finish_reason": "stop", "usage": {"total_tokens": 5}}
-
-    def __init__(self, reply="Hallo, ich bin Antonia."):
-        self.reply = reply
-
-    async def chat(self, messages, system_hint=None):
-        return self.reply
-
-    def describe(self):
-        return {"engine": "fake-llm", "model": "fake", "ready": True}
-
-
 class StreamingFakeLLM:
     """Fake with a real chat_stream (multiple deltas)."""
     loaded = True
@@ -119,31 +87,6 @@ def _configure(reply="Hallo, ich bin Antonia."):
     srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
                   ghost=HallucinationFilter(enabled=False))
     return cfg
-
-
-async def _drain_until(ws, want_type, *, timeout=3.0):
-    """Reads WS frames until a JSON frame with type==want_type arrives.
-    Collects all seen types + the first binary, if any."""
-    seen = []
-    binary = None
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        try:
-            msg = await asyncio.wait_for(ws.receive(), timeout=max(0.05, deadline - loop.time()))
-        except asyncio.TimeoutError:
-            break
-        if msg.type.name == "BINARY":
-            binary = msg.data
-            seen.append("__binary__")
-            continue
-        if msg.type.name in ("CLOSE", "CLOSING", "CLOSED", "ERROR"):
-            break
-        data = msg.json()
-        seen.append(data.get("type"))
-        if data.get("type") == want_type:
-            return data, seen, binary
-    return None, seen, binary
 
 
 def test_healthz_reports_active_backends():
@@ -299,5 +242,68 @@ def test_upload_rejects_non_image():
         async with TestClient(TestServer(srv.build_app())) as client:
             resp = await client.post("/upload", data={"file": ("x.txt", b"hi", "text/plain")})
             assert resp.status == 400
+
+    asyncio.run(run())
+
+
+# --- APP_LANGUAGE / locale surfaced to the client ---------------------------
+def _configure_lang(lang):
+    cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, app_language=lang)
+    conv = ConversationManager(FakeLLM(), system_prompt="sys")
+    srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
+                  ghost=HallucinationFilter(enabled=False))
+    return cfg
+
+
+def test_ws_hello_advertises_lang_en():
+    _configure_lang("en")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            hello, _, _ = await _drain_until(ws, "hello")
+            assert hello["lang"] == "en"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_ws_hello_advertises_lang_de():
+    _configure_lang("de")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            hello, _, _ = await _drain_until(ws, "hello")
+            assert hello["lang"] == "de"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_index_injects_lang_en():
+    _configure_lang("en")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            resp = await client.get("/")
+            assert resp.status == 200
+            html = await resp.text()
+            assert '<html lang="en">' in html
+            assert "__APP_LANG__" not in html
+
+    asyncio.run(run())
+
+
+def test_index_injects_lang_de():
+    _configure_lang("de")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            resp = await client.get("/")
+            assert resp.status == 200
+            html = await resp.text()
+            assert '<html lang="de">' in html
+            assert "__APP_LANG__" not in html
 
     asyncio.run(run())

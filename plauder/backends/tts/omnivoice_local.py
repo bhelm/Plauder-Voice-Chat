@@ -111,8 +111,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
                     if gap.size and i < len(pieces) - 1:
                         parts.append(gap)
                 samples = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
-        clipped = np.clip(samples, -1.0, 1.0)
-        return (clipped * 32767.0).astype(np.int16).tobytes()
+        return audio_utils.float32_to_pcm16_bytes(samples)
 
     async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
         if self._tts is None:

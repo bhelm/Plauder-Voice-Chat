@@ -120,8 +120,7 @@ class OpenAITTSBackend(TTSBackend):
             if abs(rate - 1.0) > 1e-3:
                 samples = audio_utils.time_stretch(samples, rate, self.sample_rate)
         # float32 [-1,1] → int16 PCM bytes
-        clipped = np.clip(samples, -1.0, 1.0)
-        return (clipped * 32767.0).astype(np.int16).tobytes()
+        return audio_utils.float32_to_pcm16_bytes(samples)
 
     async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
         if self._client is None:

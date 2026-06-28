@@ -1194,9 +1194,9 @@
     }
     function isTableSeparator(line) {
       // "|---|---|" or "---|---"
-      const t = line.trim().replace(/^\|/, '').replace(/\|$/, '');
-      if (!t.includes('|') && !t.includes('-')) return false;
-      return t.split('|').every(seg => /^\s*:?-{3,}:?\s*$/.test(seg));
+      const row = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+      if (!row.includes('|') && !row.includes('-')) return false;
+      return row.split('|').every(seg => /^\s*:?-{3,}:?\s*$/.test(seg));
     }
     function renderMarkdown(src) {
       if (!src) return '';
@@ -1343,9 +1343,9 @@
       try { return JSON.parse(localStorage.getItem('transcript') || '[]'); } catch (_) { return []; }
     })();
     function persistMsg(role, text, meta) {
-      const t = (text || '').trim();
-      if (!t) return;
-      savedTranscript.push({ role, text: t, meta: meta || '' });
+      const txt = (text || '').trim();
+      if (!txt) return;
+      savedTranscript.push({ role, text: txt, meta: meta || '' });
       if (savedTranscript.length > TRANSCRIPT_MAX) savedTranscript = savedTranscript.slice(-TRANSCRIPT_MAX);
       try { localStorage.setItem('transcript', JSON.stringify(savedTranscript)); } catch (_) {}
     }
@@ -2391,7 +2391,6 @@
           addExternalBubble(m.role, m.text);
           break;
         default:
-          // console.debug('unhandled', m);
       }
     }
 

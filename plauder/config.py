@@ -184,7 +184,6 @@ class Config:
     tts_openai_api_key: str = ""
     tts_openai_model: str = "tts-1"
     tts_openai_voice: str = "nova"
-    tts_openai_format: str = "pcm"
     tts_openai_base_url: str | None = None
     tts_openai_sample_rate: int = OPENAI_TTS_SAMPLE_RATE
     # local_speed=True: apply TTS_SPEED / UI slider locally via time-stretch
@@ -307,6 +306,7 @@ class Config:
         app_language = _norm_lang(_first(_env("APP_LANGUAGE"), _env("APP_LANG"), default="en"))
 
         house_mode = env_flag("HOUSE_MODE", False)
+        stt_backend = _first(_env("STT_BACKEND"), default="openai").lower()
         house_data_dir = _first(
             _env("HOUSE_DATA_DIR"),
             default=str(Path(__file__).resolve().parent.parent / "house_data"),
@@ -321,7 +321,7 @@ class Config:
             log_level=_first(_env("LOG_LEVEL"), default="INFO").upper(),
             app_language=app_language,
 
-            stt_backend=_first(_env("STT_BACKEND"), default="openai").lower(),
+            stt_backend=stt_backend,
             tts_backend=_first(_env("TTS_BACKEND"), default="openai").lower(),
             llm_backend=_first(_env("LLM_BACKEND"), default="openai_compat").lower(),
 
@@ -341,7 +341,7 @@ class Config:
             # Partials by default only with local Whisper (the API backend would
             # otherwise be called multiple times per second at a cost).
             stt_partial=env_flag("STT_PARTIAL",
-                                 _first(_env("STT_BACKEND"), default="openai").lower() == "whisper_local"),
+                                 stt_backend == "whisper_local"),
             stt_partial_min_interval_ms=_env_int("STT_PARTIAL_MIN_INTERVAL_MS", 700),
             stt_partial_min_new_ms=_env_int("STT_PARTIAL_MIN_NEW_MS", 500),
 
@@ -355,9 +355,8 @@ class Config:
             tts_openai_api_key=_first(_env("TTS_OPENAI_API_KEY"), _env("OPENAI_API_KEY")),
             tts_openai_model=_first(_env("TTS_OPENAI_MODEL"), _env("OPENAI_TTS_MODEL"), default="tts-1"),
             tts_openai_voice=_first(_env("TTS_OPENAI_VOICE"), _env("OPENAI_TTS_VOICE"), default="nova"),
-            tts_openai_format=_first(_env("TTS_OPENAI_FORMAT"), default="pcm").lower(),
             tts_openai_base_url=(_first(_env("TTS_OPENAI_BASE_URL"), _env("OPENAI_BASE_URL")) or None),
-            tts_openai_sample_rate=int(_first(_env("TTS_OPENAI_SAMPLE_RATE"), default=str(OPENAI_TTS_SAMPLE_RATE))),
+            tts_openai_sample_rate=_env_int("TTS_OPENAI_SAMPLE_RATE", OPENAI_TTS_SAMPLE_RATE),
             tts_openai_local_speed=env_flag("TTS_OPENAI_LOCAL_SPEED", False),
             tts_speed=_env_float("TTS_SPEED", 1.0),
 

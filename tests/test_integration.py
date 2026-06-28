@@ -10,7 +10,7 @@ from plauder.config import SAMPLE_RATE, Config
 from plauder.sanitizer import HallucinationFilter
 from plauder.session import ConversationManager
 from plauder.turn_state import TurnState
-from tests.test_server import FakeSTT, FakeTTS, FakeLLM, _drain_until
+from tests.conftest import FakeSTT, FakeTTS, FakeLLM, _drain_until
 
 
 class _CollectWS:
