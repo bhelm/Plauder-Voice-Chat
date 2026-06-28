@@ -57,6 +57,14 @@ class TurnState:
     # Segment-ID, für die bereits ein `wake.detected` (akustisches Früh-Feedback)
     # gesendet wurde — verhindert Doppel-Pling aus Partial + finalem Segment.
     wake_detected_seg: str | None = None
+    # Hat der User das Gesprächsfenster während einer laufenden Antwort manuell
+    # geschlossen ('wake.close')? Dann das sonst folgende playback.done NICHT zum
+    # Wieder-Öffnen des Fensters nutzen.
+    wake_suppress_reopen: bool = False
+    # Nach manuellem Schließen kurzer Guard (time.time()-Schwelle): bis dahin KEIN
+    # automatisches Wieder-Öffnen und kein wake.detected — sonst macht ein
+    # nachlaufendes Partial / Echo / Störgeräusch das Fenster sofort wieder auf.
+    wake_closed_until: float = 0.0
     # End-to-End-Latenz-Anker: time.time(), an dem das letzte zum Turn
     # beitragende Segment beim Server ankam ("User ist fertig mit Sprechen").
     # Gegen diesen Zeitpunkt wird die Zeit bis zur ersten Wiedergabe gemessen.

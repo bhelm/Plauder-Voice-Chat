@@ -700,6 +700,9 @@ async def _debounce_then_run(ws, state: TurnState):
 
 
 async def _cancel_in_flight(state: TurnState, ws):
+    # Ein Abbruch beendet die laufende Antwort → ein evtl. gesetztes
+    # "Fenster-nicht-wieder-öffnen"-Flag ist damit gegenstandslos.
+    state.wake_suppress_reopen = False
     cancelled = False
     tasks_to_await: list = []
     if state.debounce_task and not state.debounce_task.done():
@@ -740,6 +743,33 @@ def _speaker_tag(text: str, speaker_info: dict | None) -> str:
     return f"[Sprecher: {nm}, unbekannt] {text}"
 
 
+# Nach manuellem Schließen des Gesprächsfensters für so viele Sekunden KEIN
+# automatisches Wieder-Öffnen (schluckt nachlaufende Partials / Echo / Störer).
+WAKE_CLOSE_GUARD_S = 2.0
+
+
+def _wake_mode() -> str:
+    """Normalisierter Wake-Modus: 'alexa' (One-Shot) oder 'conversation'."""
+    m = (getattr(CFG, "wake_mode", "conversation") or "conversation").lower() if CFG else "conversation"
+    return "alexa" if m in ("alexa", "oneshot", "one-shot", "single") else "conversation"
+
+
+def _wake_oneshot() -> bool:
+    """Alexa-Modus: nach jeder Antwort schließt das Konversationsfenster sofort
+    (kein Folgefragen-Fenster — jeder Befehl braucht wieder das Weckwort)."""
+    return _wake_mode() == "alexa"
+
+
+def _wake_closed_active(state: TurnState, now: float | None = None) -> bool:
+    """True, solange ein manuell geschlossenes Fenster bewusst zu bleiben soll:
+    während der noch laufenden Antwort (``wake_suppress_reopen``) ODER im kurzen
+    Nachlauf-Guard (``wake_closed_until``). In dieser Zeit ignoriert die Pipeline
+    die Wake-Erkennung KOMPLETT — sonst reißen Echo der eigenen TTS, B2-Partials
+    oder Folgegerede (inkl. Fuzzy-Fehltreffer) das Fenster sofort wieder auf."""
+    now = time.time() if now is None else now
+    return bool(state.wake_suppress_reopen) or now < state.wake_closed_until
+
+
 async def _open_wake_window(ws, state: TurnState, now: float | None = None,
                             reason: str = "command"):
     """Konversationsfenster (neu) öffnen/auffrischen und den Client informieren.
@@ -750,6 +780,9 @@ async def _open_wake_window(ws, state: TurnState, now: float | None = None,
     eine Antwort folgt → Timer NICHT laufen lassen. So schließt das Fenster erst,
     nachdem die Antwort komplett ausgesprochen wurde, nicht währenddessen."""
     now = time.time() if now is None else now
+    # Guard nach manuellem Schließen: nicht automatisch wieder aufmachen.
+    if _wake_closed_active(state, now):
+        return
     state.wake_until = now + CFG.wake_word_window_s
     await ws.send_json({
         "type": "wake.window", "turnId": state.turn_id, "reason": reason,
@@ -760,6 +793,9 @@ async def _emit_wake_detected(ws, state: TurnState, segment_id):
     """Akustisches Früh-Feedback: einmal pro Segment ein `wake.detected` senden,
     sobald das Weckwort erkannt wurde (Partial ODER finales Segment)."""
     if state.wake_detected_seg == segment_id:
+        return
+    # Guard nach manuellem Schließen: kein Früh-Feedback / Öffnen durch Nachläufer.
+    if _wake_closed_active(state):
         return
     state.wake_detected_seg = segment_id
     await ws.send_json({
@@ -817,6 +853,18 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     # --- Wake-Word-Gate (Prefix). Nur Voice; Tipp-Eingaben sind immer gemeint.
     if wake_gating and text:
         now = time.time()
+        # Manuell geschlossen + läuft noch / Guard → Segment komplett ignorieren.
+        # KEIN Wake-Match (auch keine Fuzzy-Treffer), KEIN Cancel der laufenden
+        # Antwort. So kann während der Verarbeitung nichts das Fenster aufreißen.
+        if _wake_closed_active(state, now):
+            LOG.info("wake: geschlossen → ignoriert seg=%s text=%r", segment_id, text)
+            await ws.send_json({
+                "type": "transcript.ignored", "segmentId": segment_id,
+                "turnId": state.turn_id, "text": text,
+                "reason": "wake_closed", "ts": time.time()})
+            if state.has_pending():
+                state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+            return
         # „Fenster offen?" am SPRECH-BEGINN messen, nicht am Commit-Zeitpunkt:
         # Wer innerhalb des Fensters zu sprechen beginnt, dessen (evtl. langer)
         # Satz darf auch dann noch durch, wenn das Fenster während des Sprechens
@@ -933,7 +981,8 @@ async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
     # nötig). So weiß der Nutzer SOFORT, dass es getriggert hat, statt erst nach
     # dem Aussprechen.
     if (CFG and state.wake_word_enabled and time.time() >= state.wake_until
-            and state.wake_detected_seg != seg.get("id")):
+            and state.wake_detected_seg != seg.get("id")
+            and not _wake_closed_active(state)):
         matched, _ = wake.match_wake(
             text, CFG.wake_word, fuzzy=CFG.wake_word_fuzzy,
             anywhere=CFG.wake_word_anywhere, ratio=CFG.wake_word_ratio)
@@ -1015,6 +1064,7 @@ async def ws_handler(request):
             "enabled": bool(CFG.wake_word_enabled) if CFG else False,  # Start-Default
             "word": CFG.wake_word if CFG else "",
             "windowS": CFG.wake_word_window_s if CFG else 0,
+            "mode": _wake_mode(),          # "conversation" | "alexa" (One-Shot)
         },
         "turn": {
             "debounce_ms": state.debounce_ms,
@@ -1038,8 +1088,26 @@ async def ws_handler(request):
                 elif t == "playback.done":
                     # Wake-Word: Antwort fertig ausgesprochen → Konversations-
                     # fenster (neu) öffnen; jetzt erst läuft der Idle-Timer.
+                    # Ausnahme: Der User hat den Kanal währenddessen selbst
+                    # geschlossen → nicht wieder aufmachen (Flag einmalig zurück).
                     if CFG and state.wake_word_enabled:
-                        await _open_wake_window(ws, state, reason="done")
+                        if state.wake_suppress_reopen:
+                            # Manuell geschlossen während der Antwort: nicht wieder
+                            # öffnen. Kurzer Nachlauf-Guard, damit das Echo direkt
+                            # nach der Antwort das Fenster nicht doch aufreißt.
+                            state.wake_suppress_reopen = False
+                            state.wake_closed_until = max(
+                                state.wake_closed_until, time.time() + WAKE_CLOSE_GUARD_S)
+                        elif _wake_oneshot():
+                            # Alexa-Modus: nach der Antwort Fenster sofort schließen,
+                            # neuer Befehl braucht wieder das Weckwort.
+                            state.wake_until = 0.0
+                            state.wake_detected_seg = None
+                            await ws.send_json({
+                                "type": "wake.closed", "turnId": state.turn_id,
+                                "reason": "oneshot", "ts": time.time()})
+                        else:
+                            await _open_wake_window(ws, state, reason="done")
                     ident = get_speaker_identifier()
                     if ident is not None:
                         try:
@@ -1048,17 +1116,42 @@ async def ws_handler(request):
                             LOG.exception("mark_playback_finished failed (ignoriert)")
                 elif t == "barge_in":
                     reason = (data.get("reason") or "speech")
-                    in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
-                    if in_flight:
-                        LOG.info("barge-in from %s (reason=%s)", peer, reason)
-                        await _cancel_in_flight(state, ws)
-                    # Wer eine LAUFENDE Antwort unterbricht (serverseitig in-flight
-                    # ODER clientseitig noch am Abspielen), führt das Gespräch fort
-                    # → Fenster offen halten, damit die folgende (unterbrechende)
-                    # Eingabe nicht als „kein Weckwort" verworfen wird. NICHT bei
-                    # bloßem Geräusch ohne laufende Antwort (sonst nie wieder Gate).
-                    if CFG and state.wake_word_enabled and (in_flight or bool(data.get("playing"))):
-                        await _open_wake_window(ws, state, reason="command")
+                    # Wake-Modus + manuell geschlossen/Guard: die Sprache ist NICHT
+                    # an Antonia gerichtet → laufende Antwort NICHT abbrechen.
+                    if CFG and state.wake_word_enabled and _wake_closed_active(state):
+                        LOG.info("barge-in ignoriert (wake zu) von %s (reason=%s)", peer, reason)
+                    else:
+                        in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
+                        if in_flight:
+                            LOG.info("barge-in from %s (reason=%s)", peer, reason)
+                            await _cancel_in_flight(state, ws)
+                        # Wer eine LAUFENDE Antwort unterbricht (serverseitig in-flight
+                        # ODER clientseitig noch am Abspielen), führt das Gespräch fort
+                        # → Fenster offen halten, damit die folgende (unterbrechende)
+                        # Eingabe nicht als „kein Weckwort" verworfen wird. NICHT bei
+                        # bloßem Geräusch ohne laufende Antwort (sonst nie wieder Gate).
+                        if CFG and state.wake_word_enabled and (in_flight or bool(data.get("playing"))):
+                            await _open_wake_window(ws, state, reason="command")
+                elif t == "wake.close":
+                    # Voice-Kanal (Konversationsfenster) manuell schließen, OHNE
+                    # laufende Verarbeitung abzubrechen (das macht 'barge_in').
+                    # Danach ist wieder das Weckwort nötig.
+                    if CFG and state.wake_word_enabled:
+                        in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
+                        state.wake_until = 0.0
+                        state.wake_detected_seg = None
+                        # Kurzer Guard: nachlaufende Partials/Echo dürfen das Fenster
+                        # jetzt nicht sofort wieder aufmachen.
+                        state.wake_closed_until = time.time() + WAKE_CLOSE_GUARD_S
+                        # Läuft noch eine Antwort (server-seitig in_flight ODER
+                        # der Client spielt noch Nachklang), folgt danach ein
+                        # playback.done, das das Fenster sonst wieder öffnet →
+                        # unterdrücken.
+                        state.wake_suppress_reopen = bool(in_flight or data.get("playing"))
+                        LOG.info("wake: manuell geschlossen (%s, in_flight=%s)", peer, in_flight)
+                        await ws.send_json({
+                            "type": "wake.closed", "turnId": state.turn_id,
+                            "reason": "manual", "ts": time.time()})
                 elif t == "segment.start":
                     _sst = data.get("speechStartTs")
                     _cnow = data.get("clientNow")
@@ -1148,7 +1241,7 @@ async def ws_handler(request):
                 elif t == "settings":
                     if "speed" in data:
                         try:
-                            state.speed = max(0.5, min(1.5, float(data["speed"])))
+                            state.speed = max(0.5, min(3.0, float(data["speed"])))
                         except (TypeError, ValueError):
                             pass
                     if "debounceMs" in data:

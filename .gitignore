@@ -19,3 +19,6 @@ house_data/
 *.swp
 # Optionales House-Mode-Artefakt (nicht im Repo)
 speakers.json
+
+# .env-Backups (enthalten Secrets)
+.env.bak-*

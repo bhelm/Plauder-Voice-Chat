@@ -19,7 +19,9 @@ from .base import TTSBackend
 class OpenAITTSBackend(TTSBackend):
     def __init__(self, *, api_key: str, model: str = "tts-1", voice: str = "nova",
                  base_url: str | None = None, sentence_split: bool = False,
-                 max_chars: int = 220, gap_ms: int = 120):
+                 max_chars: int = 220, gap_ms: int = 120,
+                 sample_rate: int = OPENAI_TTS_SAMPLE_RATE,
+                 local_speed: bool = False):
         self.api_key = api_key
         self.model = model
         self.voice = voice
@@ -27,7 +29,11 @@ class OpenAITTSBackend(TTSBackend):
         self.sentence_split = sentence_split
         self.max_chars = max_chars
         self.gap_ms = gap_ms
-        self.sample_rate = OPENAI_TTS_SAMPLE_RATE
+        self.sample_rate = sample_rate
+        # local_speed=True: `speed` wird NICHT an den Server geschickt, sondern
+        # lokal per tonhöhen-erhaltender Zeitdehnung umgesetzt — für Server, die
+        # den OpenAI-`speed`-Parameter ignorieren (z.B. lokales XTTS).
+        self.local_speed = local_speed
         self._client = None
         self._lock = asyncio.Lock()
 
@@ -41,6 +47,8 @@ class OpenAITTSBackend(TTSBackend):
             sentence_split=cfg.tts_sentence_split,
             max_chars=cfg.tts_max_chars_per_chunk,
             gap_ms=cfg.tts_sentence_gap_ms,
+            sample_rate=getattr(cfg, "tts_openai_sample_rate", OPENAI_TTS_SAMPLE_RATE),
+            local_speed=getattr(cfg, "tts_openai_local_speed", False),
         )
 
     async def load(self) -> None:
@@ -77,12 +85,15 @@ class OpenAITTSBackend(TTSBackend):
         return max(0.25, min(4.0, s))
 
     def _synth_one(self, text: str, speed: float) -> np.ndarray:
+        # Bei local_speed das Tempo lokal (in _synth_sync) anwenden → Server mit
+        # speed=1.0 ansprechen, sonst würde es doppelt wirken (bzw. ignoriert).
+        api_speed = 1.0 if self.local_speed else self._clamp_speed(speed)
         resp = self._client.audio.speech.create(
             model=self.model,
             voice=self.voice,
             input=text,
             response_format="pcm",
-            speed=self._clamp_speed(speed),
+            speed=api_speed,
         )
         pcm_bytes = resp.read() if hasattr(resp, "read") else bytes(resp.content)
         return audio_utils.pcm16_bytes_to_float32(pcm_bytes)
@@ -103,6 +114,11 @@ class OpenAITTSBackend(TTSBackend):
                     if gap.size and i < len(pieces) - 1:
                         parts.append(gap)
                 samples = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
+        # local_speed: Tempo tonhöhen-erhaltend lokal umsetzen (Server ignoriert speed).
+        if self.local_speed:
+            rate = self._clamp_speed(speed)
+            if abs(rate - 1.0) > 1e-3:
+                samples = audio_utils.time_stretch(samples, rate, self.sample_rate)
         # float32 [-1,1] → int16-PCM-Bytes
         clipped = np.clip(samples, -1.0, 1.0)
         return (clipped * 32767.0).astype(np.int16).tobytes()

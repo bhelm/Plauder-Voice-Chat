@@ -35,7 +35,7 @@
       display: flex; align-items: center; gap: 14px;
     }
     /* Mic lebt jetzt im Header (kompakter als der frühere 96px-Hero). */
-    header .mic-btn { width: 48px; height: 48px; font-size: 22px; border-width: 2px; flex: 0 0 auto; }
+    header .mic-btn, header .stop-btn { width: 48px; height: 48px; font-size: 22px; border-width: 2px; flex: 0 0 auto; }
     .header-meter { width: 90px; flex: 0 0 auto; }
 
     /* Body: Chat + (optional rechts angedockter) Einstellungen-Drawer */
@@ -115,6 +115,34 @@
       100% { transform: scale(1.25); opacity: 0; }
     }
     .mic-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+    /* Separater Stop-Button: bricht Verarbeitung ab (nur sichtbar wenn was läuft). */
+    .stop-btn {
+      width: 96px; height: 96px;
+      border-radius: 50%;
+      background: var(--mic-active);
+      border: 2px solid var(--mic-active);
+      color: #fff;
+      font-size: 34px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; position: relative; flex: 0 0 auto;
+      transition: transform .15s, filter .15s;
+    }
+    .stop-btn:hover { filter: brightness(1.1); }
+    .stop-btn:active { transform: scale(0.94); }
+    .stop-btn[hidden] { display: none; }
+    /* Pro-Nachricht Lautsprecher-Button (Pause/Resume/Replay des TTS). */
+    .bubble.agent { position: relative; padding-right: 36px; }
+    .spk-btn {
+      position: absolute; top: 5px; right: 5px;
+      width: 26px; height: 26px; border-radius: 50%;
+      border: 1px solid var(--border); background: var(--panel-2);
+      color: var(--text); font-size: 13px; line-height: 1; padding: 0;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; opacity: 0.6; touch-action: none;
+      transition: opacity .15s, background .15s;
+    }
+    .spk-btn:hover { opacity: 1; }
+    .spk-btn.disabled { opacity: 0.25; cursor: default; }
     .mic-status { font-size: 13px; color: var(--muted); text-align: center; min-height: 1.4em; }
     .mic-status.speaking { color: var(--ok); font-weight: 600; }
     .mic-status.thinking { color: var(--accent-2); font-weight: 600; }
@@ -534,7 +562,8 @@
 </head>
 <body>
   <header>
-    <button id="micBtn" class="mic-btn" disabled title="Mikrofon — Klick stoppt eine laufende Antwort">🎤</button>
+    <button id="micBtn" class="mic-btn" disabled title="Mikrofon — Kanal an/aus">🎤</button>
+    <button id="stopBtn" class="stop-btn" hidden title="Verarbeitung stoppen (Transkription / Antwort / Sprachausgabe)">⏹</button>
     <div class="meter header-meter"><div id="meterBar" class="meter-bar"></div></div>
     <div class="header-status">
       <span class="status-pill" title="WebSocket-Verbindung zum Server">
@@ -613,7 +642,7 @@
     <div class="card">
       <div class="label">Sprechgeschwindigkeit</div>
       <div class="slider-row">
-        <input id="speed" type="range" min="0.7" max="1.2" step="0.05" value="0.95" />
+        <input id="speed" type="range" min="0.7" max="3" step="0.05" value="0.95" />
         <span id="speedLabel" class="num">0.95x</span>
       </div>
     </div>
@@ -674,10 +703,11 @@
         <span class="qs-sub" id="e2eBreakdown">bis Wiedergabe</span>
       </span>
       <span class="fs-sep">·</span>
-      <span class="fs-item">STT <strong id="lastLatency">–</strong></span>
-      <span class="fs-item"><span id="statsAgentLabel">Agent</span> <strong id="lastLlm">–</strong></span>
-      <span class="fs-item">TTS <strong id="lastTts">–</strong></span>
-      <span class="fs-item">Seg <strong id="segCount">0</strong></span>
+      <span class="fs-item" title="STT (Spracherkennung): Dauer, deine Aufnahme in Text umzuwandeln (Whisper).">STT <strong id="lastLatency">–</strong></span>
+      <span class="fs-item" title="Sprachmodell (LLM): Zeit bis zum ersten Wort / Gesamtdauer der Textantwort. Nur eine Zahl = Gesamtdauer.">
+        <span id="statsAgentLabel">Agent</span> <strong id="lastLlm">–</strong></span>
+      <span class="fs-item" title="TTS (Sprachausgabe): Zeit bis zum ersten Audio-Stück / Gesamtdauer der Sprachsynthese. Nur eine Zahl = Gesamtdauer.">TTS <strong id="lastTts">–</strong></span>
+      <span class="fs-item" title="Seg: Anzahl erkannter Sprach-Segmente in dieser Sitzung.">Seg <strong id="segCount">0</strong></span>
     </div>
   </footer>
 
@@ -753,6 +783,7 @@
     const reconnectBtn  = document.getElementById('reconnectBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const micBtn        = document.getElementById('micBtn');
+    const stopBtn       = document.getElementById('stopBtn');
     const micStatus     = document.getElementById('micStatus');
     const meterBar      = document.getElementById('meterBar');
     const volume        = document.getElementById('volume');
@@ -763,6 +794,25 @@
     const speedLabel    = document.getElementById('speedLabel');
     const debounce      = document.getElementById('debounce');
     const debounceLabel = document.getElementById('debounceLabel');
+
+    /* ===== Persistente UI-Einstellungen (überleben einen Reload) =====
+       Modus, VAD-Schwelle, Wake-Ton-Lautstärke und Panel-Zustand werden bereits
+       an anderer Stelle gemerkt. Hier zusätzlich Sprechgeschwindigkeit,
+       Denkpausen-Toleranz und (Wiedergabe-)Lautstärke. */
+    function loadSavedSetting(key) { try { return localStorage.getItem(key); } catch (_) { return null; } }
+    function saveSetting(key, val) { try { localStorage.setItem(key, String(val)); } catch (_) {} }
+    (function restoreUiSettings() {
+      const sv = loadSavedSetting('speed');
+      if (sv !== null && sv !== '') speed.value = sv;
+      const dv = loadSavedSetting('debounce');
+      if (dv !== null && dv !== '') debounce.value = dv;
+      const vv = loadSavedSetting('volume');
+      if (vv !== null && vv !== '') volume.value = vv;
+      // Labels an die wiederhergestellten Werte angleichen.
+      speedLabel.textContent = parseFloat(speed.value).toFixed(2) + 'x';
+      debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
+      volumeLabel.textContent = volume.value + '%';
+    })();
     const vadThreshold      = document.getElementById('vadThreshold');
     const vadThresholdLabel = document.getElementById('vadThresholdLabel');
     const vadProbBar        = document.getElementById('vadProbBar');
@@ -1014,6 +1064,11 @@
           md.innerHTML = renderMarkdown(msg.text || '');
           el.appendChild(md);
           if (msg.meta) { const mm = document.createElement('div'); mm.className = 'meta'; mm.textContent = msg.meta; el.appendChild(mm); }
+          // Nach Reload ist kein Audio mehr da → deaktivierter Lautsprecher-Button.
+          const spk = makeSpeakerButton(null);
+          spk.classList.add('disabled');
+          spk.title = 'Kein Audio (vorherige Sitzung)';
+          el.appendChild(spk);
           chatLog.appendChild(el);
         } else {
           const el = addBubble('user', msg.text);
@@ -1062,8 +1117,8 @@
       updateMicVisual();
     }
     function isBusy() { return agentBusy || anyAudioPlaying(); }
-    // Mic-Button-Optik = Modus + Zustand:
-    //   läuft gerade was   → ⏹ rot (Klick stoppt; im Wake-Modus mit Aura)
+    // Mic-Button-Optik = NUR Kanal/Mikro-Zustand (das Stoppen macht der separate
+    // Stop-Button, der bei laufender Verarbeitung auftaucht):
     //   VAD hört zu        → 🎤 rot (active)
     //   Wake, wartet       → 🎤 grün (wake-idle)
     //   Wake, Fenster offen→ 🎤 rot + lebhafte Aura (active + wake-open)
@@ -1071,21 +1126,25 @@
     function updateMicVisual() {
       const b = micBtn;
       b.classList.remove('active', 'wake-idle', 'wake-open', 'busy');
-      if (b.classList.contains('recording')) { b.textContent = '🎤'; return; }
-      const busy = isBusy();
-      b.textContent = busy ? '⏹' : '🎤';
-      let red = false, wakeOpen = false, green = false;
-      if (busy) {
-        red = true;
-        if (inputMode === 'wake') wakeOpen = true;
-      } else if (micActive) {
-        if (inputMode === 'wake') { if (wakeWindowActive) { red = true; wakeOpen = true; } else green = true; }
-        else if (inputMode === 'vad') red = true;
+      b.textContent = '🎤';
+      if (!b.classList.contains('recording')) {
+        let red = false, wakeOpen = false, green = false;
+        if (micActive) {
+          if (inputMode === 'wake') {
+            if (wakeWindowActive) { red = true; wakeOpen = true; } else green = true;
+          } else if (inputMode === 'vad') {
+            red = true;
+          }
+        }
+        if (red) b.classList.add('active');
+        if (wakeOpen) b.classList.add('wake-open');
+        if (green) b.classList.add('wake-idle');
       }
-      if (red) b.classList.add('active');
-      if (wakeOpen) b.classList.add('wake-open');
-      if (green) b.classList.add('wake-idle');
-      if (busy) b.classList.add('busy');
+      updateStopVisual();
+    }
+    // Stop-Button erscheint nur, wenn gerade etwas läuft (Agent denkt / Audio spielt).
+    function updateStopVisual() {
+      if (stopBtn) stopBtn.hidden = !isBusy();
     }
     function setMicUi(state) {
       updateMicVisual();
@@ -1172,6 +1231,7 @@
       // (addBubble setzt firstChild=textNode — das würden wir hier nur ersetzen.)
       const el = document.createElement('div');
       el.className = 'bubble agent pending';
+      el.dataset.turn = turnId;
       const md = document.createElement('div');
       md.className = 'md';
       md.textContent = `🧠 ${AGENT_NAME} denkt nach`;
@@ -1180,9 +1240,11 @@
       meta.className = 'meta';
       meta.textContent = `Turn ${turnId.substr(0, 4)}`;
       el.appendChild(meta);
+      el.appendChild(makeSpeakerButton(turnId));   // Lautsprecher: Pause/Replay des TTS
       chatLog.appendChild(el);
       chatLog.scrollTop = chatLog.scrollHeight;
       turnAgentBubble.set(turnId, el);
+      refreshSpeakerButtons();
       return el;
     }
     function setAgentBubbleMd(el, text) {
@@ -1214,6 +1276,7 @@
       const label = reason === 'no_reply' ? `🤍 ${AGENT_NAME} schweigt` : '🤍 (still)';
       setAgentBubbleMd(el, label);
       setMeta(el, `LLM ${llmMs}ms · keine Antwort`);
+      const spk = el.querySelector('.spk-btn'); if (spk) spk.remove();   // kein TTS → kein Button
     }
     function appendTtsToAgentBubble(turnId, ttsMs) {
       const el = turnAgentBubble.get(turnId);
@@ -1293,6 +1356,23 @@
     function cancelWakeWindowTimer() {
       if (wakeWindowTimer) { clearTimeout(wakeWindowTimer); wakeWindowTimer = null; }
     }
+    // Gesprächsfenster manuell schließen, OHNE laufende Verarbeitung abzubrechen.
+    // Der Server bestätigt mit `wake.closed` (Ton + Bubble laufen darüber); lokal
+    // setzen wir den Zustand sofort für direktes Feedback.
+    let wakeCloseGuardUntil = 0;   // kurzer Client-Guard gegen Race-Reopen-Messages
+    function closeWakeWindow() {
+      wakeCloseGuardUntil = Date.now() + 2000;
+      try {
+        if (ws && ws.readyState === 1) {
+          // playing mitschicken: spielt der Client noch (Nachklang), hat der Server
+          // u.U. schon nichts mehr "in flight" — er würde das Fenster sonst beim
+          // folgenden playback.done wieder öffnen. So unterdrückt er das.
+          ws.send(JSON.stringify({ type: 'wake.close', playing: isBusy(), ts: Date.now() }));
+        }
+      } catch (_) {}
+      cancelWakeWindowTimer();
+      setWakeWindowActive(false);
+    }
 
     /* ===== Audio-Playback ===== */
     let currentAudioEl = null;
@@ -1315,7 +1395,10 @@
         playbackGain = playbackCtx.createGain();
         playbackGain.connect(playbackCtx.destination);
       }
-      if (playbackCtx.state === 'suspended') { try { playbackCtx.resume(); } catch (_) {} }
+      // NICHT automatisch fortsetzen, wenn der User die Live-Wiedergabe per
+      // Lautsprecher-Button pausiert hat (sonst würden ankommende Chunks sie
+      // ungewollt wieder starten).
+      if (playbackCtx.state === 'suspended' && !playbackUserPaused) { try { playbackCtx.resume(); } catch (_) {} }
       if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
       return playbackCtx;
     }
@@ -1324,19 +1407,23 @@
       // Evtl. laufende Wiedergabe (anderer Turn) hart stoppen.
       stopStreamPlayback();
       stopCurrentAudio();
+      playbackUserPaused = false;   // neue Wiedergabe → ggf. pausierten Ctx freigeben
       ensurePlaybackCtx();
       streamPlayer = {
         turnId, audioId, sampleRate: sampleRate || 24000,
         nextTime: 0, sources: new Set(), ended: false, donePending: true,
+        chunks: [],   // PCM für den Replay-Cache sammeln
       };
       currentTurnId = turnId;
       currentAudioId = audioId;
       if (micActive) setMicUi('playing');
+      refreshSpeakerButtons();
     }
 
     function pushStreamChunk(turnId, int16) {
       if (!streamPlayer || streamPlayer.turnId !== turnId) return;
       if (!int16 || !int16.length) return;
+      if (streamPlayer.chunks) streamPlayer.chunks.push(int16);   // für Replay-Cache
       const ctx = ensurePlaybackCtx();
       const f32 = new Float32Array(int16.length);
       for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
@@ -1364,10 +1451,17 @@
       if (streamPlayer.sources.size > 0) return;
       const turnId = streamPlayer.turnId, audioId = streamPlayer.audioId;
       const fireDone = streamPlayer.donePending;
+      const chunks = streamPlayer.chunks || [];
+      const sr = streamPlayer.sampleRate;
       streamPlayer = null;
       if (currentTurnId === turnId) { currentTurnId = null; currentAudioId = null; }
+      // Regulär zu Ende gespielt → komplettes Audio dieses Turns cachen (Replay).
+      if (chunks.length) {
+        try { cacheTts(turnId, URL.createObjectURL(pcmChunksToWavBlob(chunks, sr))); } catch (_) {}
+      }
       setAgentBusy(false);   // Antwort fertig ausgespielt → Mic zurück auf 🎤
       if (micActive && !currentAudioEl) setMicUi('listening');
+      refreshSpeakerButtons();
       // House-Mode Speaker-ID: regulär zu Ende → Konversationsfenster öffnen.
       if (fireDone) {
         try {
@@ -1390,6 +1484,9 @@
       streamPlayer = null;            // erst lösen, damit onended nichts mehr tut
       for (const n of sp.sources) { try { n.stop(); } catch (_) {} try { n.disconnect(); } catch (_) {} }
       if (currentTurnId === sp.turnId) { currentTurnId = null; currentAudioId = null; }
+      // Abgebrochen (Barge-In/Stop) → nicht cachen; evtl. Pause-Flag lösen.
+      if (playbackUserPaused) { playbackUserPaused = false; if (playbackCtx) { try { playbackCtx.resume(); } catch (_) {} } }
+      refreshSpeakerButtons();
     }
 
     function anyAudioPlaying() {
@@ -1440,21 +1537,24 @@
         const url = URL.createObjectURL(blob);
         if (currentAudioEl) {
           try { currentAudioEl.pause(); } catch(_) {}
-          try { URL.revokeObjectURL(currentAudioEl.src); } catch(_) {}
+          // URL NICHT freigeben: gehört jetzt dem Replay-Cache (s.u.).
         }
         const a = new Audio(url);
         a.volume = parseInt(volume.value, 10) / 100;
         currentAudioEl = a;
         currentAudioId = audioId;
         currentTurnId = turnId;
+        cacheTts(turnId, url);   // für den Lautsprecher-Button (Replay)
         if (micActive) setMicUi('playing');
+        refreshSpeakerButtons();
         a.addEventListener('ended', () => {
-          URL.revokeObjectURL(url);
+          // URL bleibt im Cache erhalten (für Replay) → hier NICHT revoken.
           if (currentAudioEl === a) {
             currentAudioEl = null; currentAudioId = null; currentTurnId = null;
             setAgentBusy(false);
             if (micActive) setMicUi('listening');
           }
+          refreshSpeakerButtons();
           // House-Mode Speaker-ID: TTS regulaer zu Ende gespielt -> Server
           // startet das 3-s-Konversationsfenster. NUR hier senden, NICHT in
           // stopCurrentAudio() (Barge-In/Stop) -> dort kein Fenster-Start.
@@ -1468,7 +1568,9 @@
         });
         a.addEventListener('error', () => {
           addBubble('err', 'Audio-Playback fehlgeschlagen.');
-          URL.revokeObjectURL(url);
+          ttsCache.delete(turnId);
+          try { URL.revokeObjectURL(url); } catch (_) {}
+          refreshSpeakerButtons();
         });
         a.play().catch(err => {
           addBubble('err', `Auto-Play blockiert: ${err.message || err}. Klick irgendwo auf die Seite.`);
@@ -1481,8 +1583,9 @@
     function stopCurrentAudio() {
       if (currentAudioEl) {
         try { currentAudioEl.pause(); } catch(_) {}
-        try { URL.revokeObjectURL(currentAudioEl.src); } catch(_) {}
+        // URL NICHT freigeben: gehört dem Replay-Cache.
         currentAudioEl = null; currentAudioId = null; currentTurnId = null;
+        refreshSpeakerButtons();
       }
     }
 
@@ -1491,6 +1594,141 @@
       if (currentTurnId === turnId) stopCurrentAudio();
       if (streamPlayer && streamPlayer.turnId === turnId) stopStreamPlayback();
       turnAudioIds.delete(turnId);
+    }
+
+    /* ===== Pro-Nachricht Lautsprecher-Button: Pause / Resume / Replay des TTS ==
+       - Kurz tippen: läuft das TTS dieser Nachricht → pausieren; nochmal → weiter;
+         ist es fertig → erneut abspielen.
+       - Gedrückt halten: von vorn neu starten (egal ob es gerade läuft).
+       Jeder Agent-Turn wird als WAV gecacht (Streaming-Chunks bzw. fertige WAV),
+       damit Replay sofort & ohne Server geht. Die LIVE-Streaming-Wiedergabe wird
+       per AudioContext.suspend()/resume() pausiert. */
+    const ttsCache = new Map();        // turnId -> { url }
+    const TTS_CACHE_MAX = 40;
+    let playbackUserPaused = false;    // LIVE-Streaming via suspend() pausiert?
+    const replayAudio = new Audio();   // ein wiederverwendetes Element für Replays
+    let replayTurnId = null;
+
+    function cacheTts(turnId, url) {
+      if (!turnId || !url) return;
+      const old = ttsCache.get(turnId);
+      if (old && old.url && old.url !== url) { try { URL.revokeObjectURL(old.url); } catch (_) {} }
+      ttsCache.set(turnId, { url });
+      while (ttsCache.size > TTS_CACHE_MAX) {
+        const k = ttsCache.keys().next().value;
+        const v = ttsCache.get(k); ttsCache.delete(k);
+        if (v && v.url && k !== replayTurnId && k !== currentTurnId) {
+          try { URL.revokeObjectURL(v.url); } catch (_) {}
+        }
+      }
+      refreshSpeakerButtons();
+    }
+
+    function pcmChunksToWavBlob(chunks, sampleRate) {
+      let total = 0; for (const c of chunks) total += c.length;
+      const dataLen = total * 2;
+      const buf = new ArrayBuffer(44 + dataLen);
+      const dv = new DataView(buf);
+      const wstr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+      wstr(0, 'RIFF'); dv.setUint32(4, 36 + dataLen, true); wstr(8, 'WAVE');
+      wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+      dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+      dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+      wstr(36, 'data'); dv.setUint32(40, dataLen, true);
+      let off = 44;
+      for (const c of chunks) { for (let i = 0; i < c.length; i++) { dv.setInt16(off, c[i], true); off += 2; } }
+      return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    function pauseLiveStream() {
+      if (playbackCtx) { try { playbackCtx.suspend(); } catch (_) {} }
+      playbackUserPaused = true; refreshSpeakerButtons();
+    }
+    function resumeLiveStream() {
+      playbackUserPaused = false;
+      if (playbackCtx) { try { playbackCtx.resume(); } catch (_) {} }
+      refreshSpeakerButtons();
+    }
+
+    function startReplay(turnId, fromStart) {
+      const c = ttsCache.get(turnId);
+      if (!c) return;
+      // Andere Wiedergabe stummschalten, damit nichts doppelt klingt.
+      if (streamPlayer && !playbackUserPaused) pauseLiveStream();
+      if (currentAudioEl && !currentAudioEl.paused) { try { currentAudioEl.pause(); } catch (_) {} }
+      if (replayTurnId !== turnId) { replayAudio.src = c.url; replayTurnId = turnId; }
+      if (fromStart) { try { replayAudio.currentTime = 0; } catch (_) {} }
+      replayAudio.volume = parseInt(volume.value, 10) / 100;
+      replayAudio.play().catch(() => {});
+      refreshSpeakerButtons();
+    }
+
+    function onSpeakerTap(turnId) {
+      if (streamPlayer && streamPlayer.turnId === turnId) {        // LIVE (Streaming)
+        if (playbackUserPaused) resumeLiveStream(); else pauseLiveStream();
+        return;
+      }
+      if (currentAudioEl && currentTurnId === turnId) {            // LIVE (klassische WAV)
+        if (currentAudioEl.paused) currentAudioEl.play().catch(() => {}); else currentAudioEl.pause();
+        refreshSpeakerButtons(); return;
+      }
+      if (replayTurnId === turnId) {                               // Replay läuft / pausiert
+        if (!replayAudio.paused) { replayAudio.pause(); refreshSpeakerButtons(); return; }
+        if (replayAudio.currentTime > 0 && !replayAudio.ended) { replayAudio.play().catch(() => {}); return; }
+      }
+      startReplay(turnId, false);                                  // sonst: erneut abspielen
+    }
+    function onSpeakerHold(turnId) {
+      if (ttsCache.has(turnId)) startReplay(turnId, true);         // von vorn neu starten
+    }
+
+    function refreshSpeakerButtons() {
+      document.querySelectorAll('.spk-btn[data-turn]').forEach((btn) => {
+        const T = btn.dataset.turn;
+        const liveStream = !!(streamPlayer && streamPlayer.turnId === T);
+        const liveWav = !!(currentAudioEl && currentTurnId === T);
+        const hasAudio = ttsCache.has(T) || liveStream || liveWav;
+        let playing = false, paused = false;
+        if (liveStream) { playing = !playbackUserPaused; paused = playbackUserPaused; }
+        else if (liveWav) { playing = !currentAudioEl.paused; paused = currentAudioEl.paused; }
+        else if (replayTurnId === T) {
+          playing = !replayAudio.paused;
+          paused = replayAudio.paused && replayAudio.currentTime > 0 && !replayAudio.ended;
+        }
+        btn.classList.toggle('disabled', !hasAudio);
+        btn.textContent = playing ? '⏸' : (paused ? '▶️' : '🔊');
+        btn.title = hasAudio
+          ? 'Klick: Abspielen / Pause · Gedrückt halten: von vorn'
+          : 'Kein Audio (z.B. nach Neuladen der Seite)';
+      });
+    }
+
+    replayAudio.addEventListener('play', refreshSpeakerButtons);
+    replayAudio.addEventListener('pause', refreshSpeakerButtons);
+    replayAudio.addEventListener('ended', refreshSpeakerButtons);
+
+    function makeSpeakerButton(turnId) {
+      const btn = document.createElement('button');
+      btn.className = 'spk-btn';
+      if (turnId) btn.dataset.turn = turnId;
+      btn.textContent = '🔊';
+      btn.title = 'Klick: Abspielen / Pause · Gedrückt halten: von vorn';
+      let holdTimer = null, didHold = false;
+      const clear = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (btn.classList.contains('disabled')) return;
+        didHold = false;
+        holdTimer = setTimeout(() => { didHold = true; if (turnId) onSpeakerHold(turnId); }, 450);
+      });
+      btn.addEventListener('pointerup', (e) => {
+        e.preventDefault(); clear();
+        if (btn.classList.contains('disabled')) return;
+        if (!didHold && turnId) onSpeakerTap(turnId);
+      });
+      btn.addEventListener('pointerleave', clear);
+      btn.addEventListener('pointercancel', clear);
+      return btn;
     }
 
     /* ===== Barge-In =========================================================
@@ -1510,6 +1748,13 @@
        den Server, damit er noch laufende Agent-/TTS-Generierung abbricht
        (sonst kommt gleich das naechste Audio-Stueck hinterher).
     */
+    // Im Wake-Modus mit GESCHLOSSENEM Fenster ist die Sprache nicht an Antonia
+    // gerichtet → KEIN Barge-In (sie darf zu Ende denken/sprechen). In VAD/PTT
+    // sowie bei offenem Wake-Fenster ist Barge-In erlaubt.
+    function bargeInAllowed() { return !(inputMode === 'wake' && !wakeWindowActive); }
+    // Alexa-/One-Shot-Modus (vom Server via hello.wakeWord.mode): nach jeder
+    // Antwort schließt das Fenster, jeder Befehl braucht wieder das Weckwort.
+    function wakeOneshot() { return !!(serverWake && serverWake.mode === 'alexa'); }
     function bargeInStop(reason) {
       const wasPlaying = anyAudioPlaying();
       // 1) Lokal sofort stoppen (das ist der entscheidende, latenzfreie Teil).
@@ -1626,7 +1871,11 @@
             // Slider auf Server-Range justieren, falls nötig
             if (Number.isFinite(m.turn.debounce_ms_min)) debounce.min = String(m.turn.debounce_ms_min);
             if (Number.isFinite(m.turn.debounce_ms_max)) debounce.max = String(m.turn.debounce_ms_max);
-            if (Number.isFinite(m.turn.debounce_ms)) {
+            // Server-Default nur übernehmen, wenn der User keinen eigenen Wert
+            // gespeichert hat (sonst würde der Reload die gemerkte Einstellung
+            // überschreiben). Unsere Einstellung wird via sendSettings() gesendet.
+            const savedDebounce = loadSavedSetting('debounce');
+            if (Number.isFinite(m.turn.debounce_ms) && (savedDebounce === null || savedDebounce === '')) {
               debounce.value = String(m.turn.debounce_ms);
               debounceLabel.textContent = (m.turn.debounce_ms / 1000).toFixed(1) + 's';
             }
@@ -1657,6 +1906,8 @@
           break;
         case 'wake.detected':
           // Weckwort erkannt (ggf. schon im Partial) → Pling + Mic wird rot/aktiv.
+          // Direkt nach manuellem Schließen ignorieren (Race mit Nachläufern).
+          if (Date.now() < wakeCloseGuardUntil) break;
           setWakeWindowActive(true);
           playCue('on');
           break;
@@ -1665,16 +1916,19 @@
           // Antonia wartet/fertig ist ('armed'/'done'); bei eingehendem Befehl
           // ('command') folgt eine Antwort → Timer stoppen, damit das Fenster
           // nicht WÄHREND der Antwort ausläuft, sondern erst danach.
+          if (Date.now() < wakeCloseGuardUntil) break;
           setWakeWindowActive(true);
           if (m.reason === 'armed' || m.reason === 'done') armWakeWindowTimer(m.windowS);
           else cancelWakeWindowTimer();
           break;
         case 'wake.closed':
-          // Fenster manuell beendet (Stop-Kommando) → Timer aus + Abschluss-Ton.
+          // Fenster beendet (Stop-Kommando / manuell / Alexa-One-Shot) → Timer
+          // aus + Abschluss-Ton. Im One-Shot-Modus passiert das nach JEDER
+          // Antwort → keine Bubble (sonst Spam), nur der dezente Ton.
           cancelWakeWindowTimer();
           setWakeWindowActive(false);
           playCue('off');
-          addBubble('sys', '🔇 Wake-Fenster beendet');
+          if (m.reason !== 'oneshot') addBubble('sys', '🔇 Wake-Fenster beendet');
           break;
         case 'wake.armed':
           // Nur das Wake-Word gesagt → KI hört jetzt zu (Konversationsfenster).
@@ -1768,14 +2022,21 @@
           finalizeSilentAgentBubble(m.turnId, m.reason || 'no_reply', m.llmMs || 0);
           if (m.llmMs) { statLlmTotal = m.llmMs; renderLlmStat(); }
           setAgentBusy(false);
-          // Keine Sprachausgabe → kein playback.done. Idle-Timer jetzt starten.
-          if (inputMode === 'wake') armWakeWindowTimer(serverWake.windowS);
+          // Keine Sprachausgabe → kein playback.done. One-Shot: Fenster sofort zu
+          // (Weckwort wieder nötig); sonst Idle-Timer fürs Konversationsfenster.
+          if (inputMode === 'wake') {
+            if (wakeOneshot()) closeWakeWindow();
+            else armWakeWindowTimer(serverWake.windowS);
+          }
           break;
         case 'reply.error':
           turnReplyText.delete(m.turnId);
           finalizeAgentBubble(m.turnId, `⚠ ${m.error}`, 0);
           setAgentBusy(false);
-          if (inputMode === 'wake') armWakeWindowTimer(serverWake.windowS);
+          if (inputMode === 'wake') {
+            if (wakeOneshot()) closeWakeWindow();
+            else armWakeWindowTimer(serverWake.windowS);
+          }
           break;
         case 'audio.start':
           // A2: progressive PCM-Wiedergabe starten (Chunks folgen als VCT2-Binary).
@@ -1902,6 +2163,7 @@
       if (currentAudioEl) currentAudioEl.volume = parseInt(volume.value, 10) / 100;
       if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
     });
+    volume.addEventListener('change', () => { saveSetting('volume', volume.value); });
 
     /* ===== Einstellungen-Drawer (☰) ===== */
     const settingsBtn      = document.getElementById('settingsBtn');
@@ -1952,12 +2214,12 @@
     speed.addEventListener('input', () => {
       speedLabel.textContent = parseFloat(speed.value).toFixed(2) + 'x';
     });
-    speed.addEventListener('change', sendSettings);
+    speed.addEventListener('change', () => { saveSetting('speed', speed.value); sendSettings(); });
 
     debounce.addEventListener('input', () => {
       debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
     });
-    debounce.addEventListener('change', sendSettings);
+    debounce.addEventListener('change', () => { saveSetting('debounce', debounce.value); sendSettings(); });
 
     // Vom User gewaehlte VAD-Aktivierungsschwelle (0..1). Hoeher = unempfindlicher
     // (lauter sprechen noetig). Persistiert im localStorage. MUSS vor dem
@@ -2193,7 +2455,8 @@
             // Live-Sprach-Pegel im UI anzeigen (zum Einstellen der Schwelle).
             if (vadProbBar) vadProbBar.style.width = Math.round(p * 100) + '%';
             // Barge-In: spielt gerade Audio UND Pegel ueber Schwelle -> sofort stoppen.
-            if (anyAudioPlaying() && p >= vadActivationThreshold) bargeInStop('vad-frame');
+            // (Im Wake-Modus nur bei offenem Fenster — sonst nicht an Antonia gerichtet.)
+            if (anyAudioPlaying() && p >= vadActivationThreshold && bargeInAllowed()) bargeInStop('vad-frame');
           },
           onSpeechStart: () => {
             // Sprech-Start fuer Sprecher-ID-Hold festhalten (vor bargeInStop,
@@ -2202,8 +2465,9 @@
             // Wake-Modus: solange gesprochen wird, darf das Fenster NICHT ablaufen
             // (der Plong-Timer wird pausiert) — sonst schließt es mitten im Satz.
             if (inputMode === 'wake' && wakeWindowActive) cancelWakeWindowTimer();
-            // Sicherheitsnetz: falls der Frame-Pfad mal nicht greift.
-            bargeInStop('vad-speech');
+            // Sicherheitsnetz: falls der Frame-Pfad mal nicht greift. Im Wake-Modus
+            // mit geschlossenem Fenster NICHT abbrechen (Sprache nicht an Antonia).
+            if (bargeInAllowed()) bargeInStop('vad-speech');
             // B1: Eingangs-Streaming starten (Frames laufen ab jetzt live mit).
             if (streamInputActive()) {
               segmentCounter += 1;
@@ -2573,14 +2837,17 @@
     // VAD: Click = Toggle Listen.
     // PTT: mousedown/touchstart = Aufnahme, mouseup/leave/touchend = Senden.
     micBtn.addEventListener('click', async (ev) => {
-      // Läuft gerade eine Antwort/Verarbeitung? → ein Klick stoppt sie (lokal
-      // sofort + Server-Abbruch via barge_in). Gilt in allen Modi.
-      if (isBusy()) {
-        bargeInStop('manual');
-        setMicUi(micActive ? 'listening' : 'idle');
+      // Der Mic-Button steuert NUR den Kanal/das Mikro. Eine laufende
+      // Verarbeitung stoppt der separate Stop-Button — Kanal-Steuerung und
+      // Abbruch sind bewusst entkoppelt.
+      if (!vadLike()) return;   // PTT nutzt mousedown/up, Click ignoriert
+      // Wake-Modus mit offenem Gesprächsfenster: 1. Klick schließt das Fenster
+      // (Mic bleibt an, wartet wieder auf das Weckwort) — die Verarbeitung läuft
+      // dabei weiter. Erst der 2. Klick (Fenster zu) schaltet das Mikro aus.
+      if (inputMode === 'wake' && micActive && wakeWindowActive) {
+        closeWakeWindow();
         return;
       }
-      if (!vadLike()) return;   // im PTT-Modus: Click sonst ignoriert
       micBtn.disabled = true;
       try {
         if (!micActive) await startMic();
@@ -2588,6 +2855,14 @@
       } finally {
         micBtn.disabled = false;
       }
+    });
+    // Separater Stop-Button: bricht Transkription / LLM-Antwort / TTS ab (lokal
+    // sofort + Server-Abbruch via barge_in). Schließt das Wake-Fenster NICHT —
+    // der Server hält es bei einer echten Unterbrechung offen, das Gespräch geht
+    // also weiter, nur die aktuelle Antwort ist gestoppt.
+    stopBtn.addEventListener('click', () => {
+      bargeInStop('manual');
+      setMicUi(micActive ? 'listening' : 'idle');
     });
     micBtn.addEventListener('mousedown', (ev) => {
       if (inputMode !== 'ptt') return;

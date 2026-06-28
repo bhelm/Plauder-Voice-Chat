@@ -17,7 +17,9 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# OpenAI-TTS liefert raw-PCM bei fester Sample-Rate.
+# OpenAI-TTS liefert raw-PCM bei fester Sample-Rate. Default 24 kHz (OpenAI Cloud,
+# Kokoro); per TTS_OPENAI_SAMPLE_RATE überschreibbar (z.B. 16000 für Piper-kerstin,
+# 22050 für Piper-thorsten) — sonst klingt die Wiedergabe zu schnell/langsam.
 OPENAI_TTS_SAMPLE_RATE = 24000
 # Browser liefert/erwartet 16 kHz Mono.
 SAMPLE_RATE = 16000
@@ -154,6 +156,11 @@ class Config:
     tts_openai_voice: str = "nova"
     tts_openai_format: str = "pcm"
     tts_openai_base_url: str | None = None
+    tts_openai_sample_rate: int = OPENAI_TTS_SAMPLE_RATE
+    # local_speed=True: TTS_SPEED / UI-Slider lokal per Zeitdehnung (tonhöhen-
+    # erhaltend) umsetzen, statt `speed` an den Server zu schicken — nötig für
+    # Server, die den OpenAI-`speed`-Parameter ignorieren (z.B. lokales XTTS).
+    tts_openai_local_speed: bool = False
     tts_speed: float = 1.0
 
     # --- TTS: OmniVoice (lokal) ---
@@ -197,6 +204,12 @@ class Config:
     # lässt die UI im Wake-Modus starten. Default AUS → Start im VAD-Modus.
     wake_word_enabled: bool = False
     wake_word: str = "antonia"          # leer in der ENV → folgt AGENT_NAME
+    # Verhalten NACH einer Antwort:
+    #   "conversation" = Konversationsfenster bleibt wake_word_window_s offen,
+    #                    Folgefragen ohne Weckwort möglich (Standard).
+    #   "alexa"        = One-Shot: nach der Antwort schließt das Fenster sofort,
+    #                    jeder neue Befehl braucht wieder das Weckwort.
+    wake_mode: str = "conversation"
     wake_word_window_s: float = 8.0     # Konversationsfenster nach einer Antwort
     wake_word_fuzzy: bool = True        # Whisper-Verhörer tolerieren
     wake_word_anywhere: bool = False    # True = Wake-Word irgendwo im Satz statt am Anfang
@@ -310,6 +323,8 @@ class Config:
             tts_openai_voice=_first(_env("TTS_OPENAI_VOICE"), _env("OPENAI_TTS_VOICE"), default="nova"),
             tts_openai_format=_first(_env("TTS_OPENAI_FORMAT"), default="pcm").lower(),
             tts_openai_base_url=(_first(_env("TTS_OPENAI_BASE_URL"), _env("OPENAI_BASE_URL")) or None),
+            tts_openai_sample_rate=int(_first(_env("TTS_OPENAI_SAMPLE_RATE"), default=str(OPENAI_TTS_SAMPLE_RATE))),
+            tts_openai_local_speed=env_flag("TTS_OPENAI_LOCAL_SPEED", False),
             tts_speed=_env_float("TTS_SPEED", 1.0),
 
             # TTS omnivoice
@@ -351,6 +366,7 @@ class Config:
             # Default = AGENT_NAME (kleingeschrieben), per WAKE_WORD übersteuerbar.
             wake_word=_first(_env("WAKE_WORD"),
                              default=_first(_env("AGENT_NAME"), default="Antonia").lower()),
+            wake_mode=_first(_env("WAKE_MODE"), default="conversation").strip().lower(),
             wake_word_window_s=_env_float("WAKE_WORD_WINDOW_S", 8.0),
             wake_word_fuzzy=env_flag("WAKE_WORD_FUZZY", True),
             wake_word_anywhere=env_flag("WAKE_WORD_ANYWHERE", False),

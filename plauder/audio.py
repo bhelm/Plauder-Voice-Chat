@@ -48,6 +48,63 @@ def pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return pcm16.astype(np.float32) / 32768.0
 
 
+def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
+    """Ändert das Sprech-Tempo um den Faktor `rate` (rate>1 = schneller,
+    rate<1 = langsamer), OHNE die Tonhöhe zu verschieben (kein Mickey-Maus).
+
+    Verfahren: WSOLA (Waveform Similarity Overlap-Add). Analyse-Frames werden
+    im Eingang per Kreuzkorrelation phasen-stetig ausgerichtet und mit festem
+    Synthese-Hop überlappend addiert. Genug für TTS-Beschleunigung bis ~3×.
+    Wird gebraucht, weil manche OpenAI-kompatiblen TTS-Server (z.B. lokales
+    XTTS) den `speed`-Parameter ignorieren.
+    """
+    x = np.asarray(samples_f32, dtype=np.float32)
+    if abs(rate - 1.0) < 1e-3 or x.size < 4:
+        return x
+    N = max(256, int(sample_rate * 0.046))   # Fensterlänge (~46 ms)
+    Hs = N // 2                              # Synthese-Hop (Ausgabe)
+    Ha = Hs * rate                          # Analyse-Hop (Eingabe, Faktor rate)
+    seek = max(1, N // 16)                   # WSOLA-Suchbereich (±)
+    win = np.hanning(N).astype(np.float32)
+    max_off = x.size - N
+    if max_off <= 0:
+        return x
+    out = np.zeros(int(x.size / rate) + 2 * N, dtype=np.float32)
+    wsum = np.zeros_like(out)
+    natural = None      # die natürliche Fortsetzung des vorigen Frames
+    a = 0.0
+    out_pos = 0
+    while True:
+        ana = int(round(a))
+        if ana > max_off:
+            break
+        if natural is None:
+            off = min(ana, max_off)
+        else:
+            lo = max(0, ana - seek)
+            hi = min(max_off, ana + seek)
+            if hi <= lo:
+                off = min(ana, max_off)
+            else:
+                region = x[lo:hi + N]
+                corr = np.correlate(region, natural, "valid")
+                off = lo + int(np.argmax(corr))
+        end = out_pos + N
+        if end > out.size:
+            break
+        out[out_pos:end] += x[off:off + N] * win
+        wsum[out_pos:end] += win
+        nf = off + Hs                       # was nach diesem Frame natürlich folgt
+        natural = x[nf:nf + N]
+        if natural.size < N:
+            break
+        out_pos += Hs
+        a += Ha
+    nz = wsum > 1e-6
+    out[nz] /= wsum[nz]
+    return out[:out_pos + N]
+
+
 def pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
     """Roh-16-bit-Mono-PCM-Bytes → WAV-Container-Bytes (ohne Re-Quantisierung)."""
     buf = io.BytesIO()
