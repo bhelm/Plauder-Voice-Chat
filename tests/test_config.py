@@ -1,4 +1,4 @@
-"""Config: .env-Loading, Defaults, Legacy-Fallbacks, Validierung, Backend-Kombos."""
+"""Config: .env loading, defaults, legacy fallbacks, validation, backend combos."""
 import os
 import tempfile
 from pathlib import Path
@@ -10,10 +10,10 @@ from plauder.config import Config, ConfigError, load_dotenv
 
 
 def _cfg(**env):
-    """Baut eine Config aus einem expliziten ENV-Dict (isoliert von os.environ)."""
+    """Builds a Config from an explicit ENV dict (isolated from os.environ)."""
     saved = dict(os.environ)
     try:
-        # Nur die übergebenen Keys + die Pflicht-Defaults setzen.
+        # Set only the passed keys + the mandatory defaults.
         for k in list(os.environ):
             if k.startswith(("STT_", "TTS_", "LLM_", "WHISPER_", "OMNIVOICE_",
                              "OPENAI_", "FIREWORKS_", "OPENCLAW_", "HOUSE_",
@@ -50,7 +50,7 @@ def test_defaults_when_minimal_env():
 
 
 def test_legacy_fallback_keys():
-    """Alte .env (OPENAI_API_KEY + FIREWORKS_*) füllt die neuen Felder."""
+    """Old .env (OPENAI_API_KEY + FIREWORKS_*) fills the new fields."""
     cfg = _cfg(
         OPENAI_API_KEY="sk-legacy",
         FIREWORKS_API_KEY="fw-legacy",
@@ -89,10 +89,10 @@ def test_streaming_defaults_on():
 
 
 def test_wake_word_defaults_off_and_follows_agent_name():
-    # Wake-Word ist ein wählbarer Eingabe-Modus; Start-Default ist AUS.
+    # Wake word is a selectable input mode; start default is OFF.
     cfg = _cfg(OPENAI_API_KEY="x", FIREWORKS_API_KEY="y")
     assert cfg.wake_word_enabled is False
-    assert cfg.wake_word == "antonia"            # = AGENT_NAME (Default) klein
+    assert cfg.wake_word == "antonia"            # = AGENT_NAME (default) lowercased
 
 
 def test_wake_word_start_default_via_env():
@@ -129,7 +129,7 @@ def test_new_keys_win_over_legacy():
 
 def test_validate_ok_for_cloud():
     cfg = _cfg(OPENAI_API_KEY="x", FIREWORKS_API_KEY="y")
-    cfg.validate()  # darf nicht werfen
+    cfg.validate()  # must not raise
 
 
 def test_validate_missing_openai_key():
@@ -151,13 +151,13 @@ def test_validate_unknown_backend():
 
 
 def test_validate_local_backends_combo():
-    """Lokale Backends brauchen KEINE Cloud-Keys, um zu validieren."""
+    """Local backends need NO cloud keys to validate."""
     cfg = _cfg(
         STT_BACKEND="whisper_local",
         TTS_BACKEND="omnivoice_local", OMNIVOICE_MODE="instruct",
         LLM_BACKEND="openclaw", OPENCLAW_GATEWAY_TOKEN="tok",
     )
-    cfg.validate()  # darf nicht werfen
+    cfg.validate()  # must not raise
 
 
 def test_validate_omnivoice_clone_requires_ref_audio():
@@ -175,11 +175,11 @@ def test_house_mode_subflags_follow_master():
 
 
 def test_resolved_voice_system_default_is_voice_hint_only():
-    # Default: KEINE Persona, nur der knappe Voice-Hinweis.
+    # Default: NO persona, only the terse voice hint.
     cfg = _cfg(OPENAI_API_KEY="x", FIREWORKS_API_KEY="y")
     sys_prompt = cfg.resolved_voice_system()
-    assert "VOICE-MODE" in sys_prompt
-    assert "Du bist" not in sys_prompt          # keine eingebaute Identität
+    assert "VOICE MODE" in sys_prompt          # English default (APP_LANGUAGE=en)
+    assert "Du bist" not in sys_prompt          # no built-in identity
 
 
 def test_resolved_voice_system_prepends_configured_persona():
@@ -187,7 +187,21 @@ def test_resolved_voice_system_prepends_configured_persona():
                SYSTEM_PROMPT="Du bist Klaus, ein knurriger Butler.")
     sys_prompt = cfg.resolved_voice_system()
     assert sys_prompt.startswith("Du bist Klaus, ein knurriger Butler.")
-    assert "VOICE-MODE" in sys_prompt
+    assert "VOICE MODE" in sys_prompt          # English default (APP_LANGUAGE=en)
+
+
+def test_app_language_de_switches_voice_hint_and_stt():
+    """APP_LANGUAGE=de uses the German voice hint and makes STT default to 'de'."""
+    cfg = _cfg(OPENAI_API_KEY="x", FIREWORKS_API_KEY="y", APP_LANGUAGE="de")
+    assert cfg.app_language == "de"
+    assert cfg.stt_language == "de"
+    assert "VOICE-MODE" in cfg.resolved_voice_system()
+
+
+def test_app_language_defaults_to_en():
+    cfg = _cfg(OPENAI_API_KEY="x", FIREWORKS_API_KEY="y")
+    assert cfg.app_language == "en"
+    assert "VOICE MODE" in cfg.resolved_voice_system()
 
 
 def test_voice_mode_system_full_override():
@@ -197,7 +211,7 @@ def test_voice_mode_system_full_override():
 
 
 def test_real_env_file_loads():
-    """Die echte .env lässt sich laden und ergibt eine valide Cloud-Config."""
+    """The real .env can be loaded and yields a valid cloud config."""
     cfg = config.load_config()
     assert cfg.stt_backend in ("openai", "whisper_local")
     assert cfg.llm_backend in ("openai_compat", "openclaw")

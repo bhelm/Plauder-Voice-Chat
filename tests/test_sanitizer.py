@@ -1,4 +1,4 @@
-"""Sanitizer: Emoji/Markdown raus, nonverbale Tags, NO_REPLY, Ghost-Filter, Merge."""
+"""Sanitizer: strip emoji/Markdown, nonverbal tags, NO_REPLY, ghost filter, merge."""
 from plauder import sanitizer
 
 
@@ -13,7 +13,7 @@ def test_strips_markdown_bold_italic():
 def test_strips_code_fence():
     out = sanitizer.sanitize_for_tts("Text ```python\nprint(1)\n``` Ende")
     assert "print(1)" not in out
-    assert "Code-Block" in out
+    assert "code block omitted" in out
 
 
 def test_link_becomes_label():
@@ -56,9 +56,9 @@ def test_merge_transcripts_empty():
 def test_hallucination_filter_denylist_with_high_no_speech():
     hf = sanitizer.HallucinationFilter(enabled=True, no_speech_prob_threshold=0.6)
     assert hf.is_hallucination("Thank you.", no_speech_prob=0.9)
-    # Denylist-Treffer aber niedrige no_speech_prob -> NICHT filtern (konservativ).
+    # Denylist hit but low no_speech_prob -> do NOT filter (conservative).
     assert not hf.is_hallucination("Thank you.", no_speech_prob=0.1)
-    # Nicht auf Denylist -> nie filtern.
+    # Not on denylist -> never filter.
     assert not hf.is_hallucination("Das ist echt wichtig", no_speech_prob=0.99)
 
 

@@ -1,4 +1,4 @@
-"""TTS-Backend-Abstraktion."""
+"""TTS backend abstraction."""
 
 from __future__ import annotations
 
@@ -6,28 +6,28 @@ import abc
 
 
 class TTSBackend(abc.ABC):
-    """Sprachsynthese. Implementierungen importieren schwere Deps (omnivoice,
-    torch) NUR lazy in load()/__init__, niemals auf Modul-Ebene.
+    """Speech synthesis. Implementations import heavy deps (omnivoice,
+    torch) ONLY lazily in load()/__init__, never at module level.
     """
 
-    #: Default-Sample-Rate des Backends (vor load() bestmögliche Schätzung).
+    #: Default sample rate of the backend (best-effort estimate before load()).
     sample_rate: int = 24000
 
     @abc.abstractmethod
     async def load(self) -> None:
-        """Initialisiert das Backend (Client/Modell laden)."""
+        """Initializes the backend (load client/model)."""
 
     @abc.abstractmethod
     async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
-        """Synthetisiert Text → (16-bit-Mono-PCM-Bytes, sample_rate)."""
+        """Synthesizes text → (16-bit mono PCM bytes, sample_rate)."""
 
     async def synth_stream(self, text: str, *, speed: float = 1.0):
-        """Async-Generator: liefert ``(pcm_bytes, sample_rate)``-Häppchen, sobald
-        sie bereitstehen. Der Server schickt jedes Häppchen progressiv an den
-        Client (lückenlose Wiedergabe).
+        """Async generator: yields ``(pcm_bytes, sample_rate)`` chunks as soon
+        as they are ready. The server sends each chunk progressively to the
+        client (gapless playback).
 
-        Default-Fallback: ein einzelnes Häppchen mit dem kompletten ``synth``-
-        Ergebnis. Backends mit nativem Audio-Streaming überschreiben das.
+        Default fallback: a single chunk with the complete ``synth`` result.
+        Backends with native audio streaming override this.
         """
         pcm, sr = await self.synth(text, speed=speed)
         if pcm:
@@ -50,4 +50,4 @@ class TTSBackend(abc.ABC):
             from .omnivoice_local import OmniVoiceLocalTTSBackend
             return OmniVoiceLocalTTSBackend.from_config(cfg)
         from ..base import BackendError
-        raise BackendError(f"Unbekanntes TTS_BACKEND: {name!r}")
+        raise BackendError(f"Unknown TTS_BACKEND: {name!r}")

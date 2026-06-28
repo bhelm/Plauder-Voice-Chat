@@ -1,4 +1,4 @@
-"""Wake-Word-Matching (Prefix-Gate, fuzzy)."""
+"""Wake-word matching (prefix gate, fuzzy)."""
 import pytest
 
 from plauder.wake import match_wake, is_stop_command
@@ -41,7 +41,7 @@ def test_split_wake_word_two_tokens():
 
 
 def test_word_only_in_middle_rejected_by_default():
-    # Standard: nur am Anfang (nach Füllwörtern). „ist" ist kein Füllwort.
+    # Default: only at the start (after filler words). "ist" is not a filler word.
     ok, _ = match_wake("Sag mal Antonia etwas", "antonia")
     assert ok is False
 
@@ -70,7 +70,7 @@ def test_only_wake_word_yields_empty_remainder():
     assert rest == ""
 
 
-# --- Stop-Kommando (beendet das Konversationsfenster) ---
+# --- Stop command (ends the conversation window) ---
 
 @pytest.mark.parametrize("text", [
     "stop", "Stopp", "stopp.", "Halt", "Ende", "Schluss",
@@ -86,7 +86,7 @@ def test_stop_command_positive(text):
     "soll ich den Bus stoppen?",
     "stopp den Timer bitte",
     "ende der durchsage kommt gleich",
-    "raus",          # darf NICHT fuzzy auf „aus/ende" matchen
+    "raus",          # must NOT fuzzy-match "aus/ende"
     "wende",
     "",
 ])
@@ -95,7 +95,7 @@ def test_stop_command_negative(text):
 
 
 def test_stop_command_fuzzy_mishearing():
-    # knapper Whisper-Verhörer, gleicher Anfang → noch als Stop erkannt
+    # slight Whisper mishearing, same start → still recognized as stop
     assert is_stop_command("stoppp") is True
-    # ohne fuzzy nicht
+    # not without fuzzy
     assert is_stop_command("stoppp", fuzzy=False) is False

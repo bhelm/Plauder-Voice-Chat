@@ -1,7 +1,8 @@
-"""Audio-Utilities: PCM/WAV/numpy-Konvertierung + TTS-Text-Chunking.
+"""Audio utilities: PCM/WAV/numpy conversion + TTS text chunking.
 
-Reine, zustandslose Helfer. Browser ↔ Server tauschen 16 kHz Mono aus; TTS
-liefert je nach Backend 24 kHz. Diese Funktionen kapseln die Formatwandlung.
+Pure, stateless helpers. Browser ↔ server exchange 16 kHz mono; TTS delivers
+24 kHz depending on the backend. These functions encapsulate the format
+conversion.
 """
 
 from __future__ import annotations
@@ -12,25 +13,25 @@ import wave
 
 import numpy as np
 
-# Magic-Header für WAV-Frames mit eingebetteter Turn-ID.
-# Format: 4 Bytes "VCT1" + 1 Byte ID-Länge + N Bytes ID (ASCII) + WAV-Bytes.
+# Magic header for WAV frames with an embedded turn ID.
+# Format: 4 bytes "VCT1" + 1 byte ID length + N bytes ID (ASCII) + WAV bytes.
 WAV_FRAME_MAGIC = b"VCT1"
 
-# Magic-Header für gestreamte PCM-Chunks (progressive Wiedergabe).
-# Format: 4 Bytes "VCT2" + 1 Byte ID-Länge + N Bytes Turn-ID (ASCII)
-#         + 2 Bytes Sequenz (big-endian uint16) + roh-16-bit-LE-Mono-PCM.
-# Die Sample-Rate kommt separat im audio.start-Event; der Client baut daraus
-# AudioBuffers und reiht sie lückenlos aneinander.
+# Magic header for streamed PCM chunks (progressive playback).
+# Format: 4 bytes "VCT2" + 1 byte ID length + N bytes turn ID (ASCII)
+#         + 2 bytes sequence (big-endian uint16) + raw 16-bit LE mono PCM.
+# The sample rate comes separately in the audio.start event; the client builds
+# AudioBuffers from it and stitches them together gaplessly.
 PCM_CHUNK_MAGIC = b"VCT2"
 
 
 def pcm_bytes_to_float32_array(pcm_bytes: bytes) -> np.ndarray:
-    """Roh-float32-PCM-Bytes (wie vom Browser) → numpy-Array."""
+    """Raw float32 PCM bytes (as from the browser) → numpy array."""
     return np.frombuffer(pcm_bytes, dtype=np.float32)
 
 
 def float32_to_pcm16_wav_bytes(samples_f32, sample_rate: int) -> bytes:
-    """float32 [-1,1] → 16-bit Mono-WAV-Bytes."""
+    """float32 [-1,1] → 16-bit mono WAV bytes."""
     clipped = np.clip(samples_f32, -1.0, 1.0)
     pcm16 = (clipped * 32767.0).astype(np.int16).tobytes()
     buf = io.BytesIO()
@@ -43,35 +44,35 @@ def float32_to_pcm16_wav_bytes(samples_f32, sample_rate: int) -> bytes:
 
 
 def pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
-    """16-bit signed LE PCM (z.B. OpenAI-TTS) → float32 [-1,1]."""
+    """16-bit signed LE PCM (e.g. OpenAI TTS) → float32 [-1,1]."""
     pcm16 = np.frombuffer(pcm_bytes, dtype=np.int16)
     return pcm16.astype(np.float32) / 32768.0
 
 
 def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
-    """Ändert das Sprech-Tempo um den Faktor `rate` (rate>1 = schneller,
-    rate<1 = langsamer), OHNE die Tonhöhe zu verschieben (kein Mickey-Maus).
+    """Changes the speaking tempo by the factor `rate` (rate>1 = faster,
+    rate<1 = slower), WITHOUT shifting the pitch (no chipmunk effect).
 
-    Verfahren: WSOLA (Waveform Similarity Overlap-Add). Analyse-Frames werden
-    im Eingang per Kreuzkorrelation phasen-stetig ausgerichtet und mit festem
-    Synthese-Hop überlappend addiert. Genug für TTS-Beschleunigung bis ~3×.
-    Wird gebraucht, weil manche OpenAI-kompatiblen TTS-Server (z.B. lokales
-    XTTS) den `speed`-Parameter ignorieren.
+    Method: WSOLA (Waveform Similarity Overlap-Add). Analysis frames are
+    aligned phase-continuously in the input via cross-correlation and added
+    overlapping with a fixed synthesis hop. Good enough for TTS speed-up up to
+    ~3×. Needed because some OpenAI-compatible TTS servers (e.g. local XTTS)
+    ignore the `speed` parameter.
     """
     x = np.asarray(samples_f32, dtype=np.float32)
     if abs(rate - 1.0) < 1e-3 or x.size < 4:
         return x
-    N = max(256, int(sample_rate * 0.046))   # Fensterlänge (~46 ms)
-    Hs = N // 2                              # Synthese-Hop (Ausgabe)
-    Ha = Hs * rate                          # Analyse-Hop (Eingabe, Faktor rate)
-    seek = max(1, N // 16)                   # WSOLA-Suchbereich (±)
+    N = max(256, int(sample_rate * 0.046))   # window length (~46 ms)
+    Hs = N // 2                              # synthesis hop (output)
+    Ha = Hs * rate                          # analysis hop (input, factor rate)
+    seek = max(1, N // 16)                   # WSOLA search range (±)
     win = np.hanning(N).astype(np.float32)
     max_off = x.size - N
     if max_off <= 0:
         return x
     out = np.zeros(int(x.size / rate) + 2 * N, dtype=np.float32)
     wsum = np.zeros_like(out)
-    natural = None      # die natürliche Fortsetzung des vorigen Frames
+    natural = None      # the natural continuation of the previous frame
     a = 0.0
     out_pos = 0
     while True:
@@ -94,7 +95,7 @@ def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
             break
         out[out_pos:end] += x[off:off + N] * win
         wsum[out_pos:end] += win
-        nf = off + Hs                       # was nach diesem Frame natürlich folgt
+        nf = off + Hs                       # what naturally follows this frame
         natural = x[nf:nf + N]
         if natural.size < N:
             break
@@ -106,7 +107,7 @@ def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
 
 
 def pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
-    """Roh-16-bit-Mono-PCM-Bytes → WAV-Container-Bytes (ohne Re-Quantisierung)."""
+    """Raw 16-bit mono PCM bytes → WAV container bytes (without re-quantization)."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -117,16 +118,16 @@ def pcm16_to_wav_bytes(pcm_bytes: bytes, sample_rate: int) -> bytes:
 
 
 def wrap_wav_with_turn_id(wav_bytes: bytes, turn_id: str) -> bytes:
-    """Stellt der WAV-Payload einen Frame-Header mit der Turn-ID voran, damit
-    der Client das Audio sicher dem richtigen Turn zuordnen kann.
+    """Prepends a frame header with the turn ID to the WAV payload so the
+    client can reliably assign the audio to the correct turn.
     """
     tid = turn_id.encode("ascii", errors="replace")[:255]
     return WAV_FRAME_MAGIC + bytes([len(tid)]) + tid + wav_bytes
 
 
 def wrap_pcm_chunk(turn_id: str, seq: int, pcm_bytes: bytes) -> bytes:
-    """Verpackt einen 16-bit-PCM-Chunk in das VCT2-Streaming-Frame (siehe
-    PCM_CHUNK_MAGIC). ``seq`` ist die fortlaufende Chunk-Nummer (ab 1).
+    """Packs a 16-bit PCM chunk into the VCT2 streaming frame (see
+    PCM_CHUNK_MAGIC). ``seq`` is the consecutive chunk number (from 1).
     """
     tid = turn_id.encode("ascii", errors="replace")[:255]
     seq16 = max(0, min(0xFFFF, int(seq)))
@@ -135,8 +136,8 @@ def wrap_pcm_chunk(turn_id: str, seq: int, pcm_bytes: bytes) -> bytes:
 
 
 def iter_pcm_frames(pcm_bytes: bytes, frame_bytes: int):
-    """Zerlegt einen PCM-Buffer in Frames fester Byte-Größe. Stellt sicher, dass
-    jeder Frame eine gerade Byte-Anzahl hat (16-bit-Sample-Ausrichtung).
+    """Splits a PCM buffer into frames of a fixed byte size. Ensures that every
+    frame has an even byte count (16-bit sample alignment).
     """
     if frame_bytes <= 0:
         frame_bytes = len(pcm_bytes)
@@ -151,19 +152,19 @@ def iter_pcm_frames(pcm_bytes: bytes, frame_bytes: int):
 
 
 # --------------------------------------------------------------------------- #
-# TTS-Text-Chunking
+# TTS text chunking
 # --------------------------------------------------------------------------- #
-# Satzgrenzen: nach . ! ? … (auch mehrfach) + Whitespace.
+# Sentence boundaries: after . ! ? … (also repeated) + whitespace.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
 def split_text_for_tts(text: str, max_chars: int) -> list[str]:
-    """Zerlegt Text in TTS-taugliche Stücke (≤ max_chars).
+    """Splits text into TTS-suitable pieces (≤ max_chars).
 
-    1. An Satzzeichen splitten (. ! ? …).
-    2. Zu lange Sätze an Komma/Semikolon/Doppelpunkt weiter zerlegen.
-    3. Bleibt ein Stück zu lang, hart an Wortgrenzen schneiden.
-    4. Aufeinanderfolgende kurze Stücke wieder zusammenfassen (≤ max_chars).
+    1. Split at punctuation (. ! ? …).
+    2. Split overly long sentences further at comma/semicolon/colon.
+    3. If a piece is still too long, hard-cut at word boundaries.
+    4. Merge consecutive short pieces back together (≤ max_chars).
     """
     text = (text or "").strip()
     if not text:
@@ -218,21 +219,22 @@ def split_text_for_tts(text: str, max_chars: int) -> list[str]:
     return merged
 
 
-# Vollständige Satzgrenze im (noch wachsenden) Stream: bis zum ersten
-# Satzzeichen, optional gefolgt von schließendem Anführungszeichen/Klammer,
-# dann Whitespace. Der nachgestellte Whitespace ist Pflicht, damit ein Satz
-# nicht vorzeitig flusht, solange evtl. noch Zeichen nachkommen (z.B. "z.B.").
+# Complete sentence boundary in the (still growing) stream: up to the first
+# punctuation mark, optionally followed by a closing quote/bracket, then
+# whitespace. The trailing whitespace is mandatory so that a sentence does not
+# flush prematurely while more characters may still follow (e.g. "z.B.").
 _STREAM_BOUNDARY_RE = re.compile(r"(.*?[.!?…]['\"\)\]»]?)\s", re.S)
 
 
 def split_stream_sentences(buffer: str, max_chars: int) -> tuple[list[str], str]:
-    """Schneidet aus einem fortlaufend wachsenden LLM-Stream-Puffer alle bereits
-    vollständigen Sätze heraus.
+    """Cuts all already-complete sentences out of a continuously growing LLM
+    stream buffer.
 
-    Gibt ``(fertige_sätze, rest)`` zurück. ``rest`` bleibt im Aufrufer-Puffer,
-    bis weitere Token kommen. Ein Satz ohne Satzzeichen wird zwangs-geflusht,
-    sobald der Puffer ``max_chars`` überschreitet (Schnitt an Wortgrenze), damit
-    sehr lange Sätze die Erst-Latenz nicht in die Höhe treiben.
+    Returns ``(finished_sentences, rest)``. ``rest`` stays in the caller's
+    buffer until more tokens arrive. A sentence without punctuation is
+    force-flushed as soon as the buffer exceeds ``max_chars`` (cut at a word
+    boundary), so that very long sentences do not drive up the first-audio
+    latency.
     """
     sentences: list[str] = []
     buf = buffer

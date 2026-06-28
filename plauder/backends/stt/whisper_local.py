@@ -1,8 +1,8 @@
-"""STT-Backend: faster_whisper (lokal, GPU).
+"""STT backend: faster_whisper (local, GPU).
 
-KRITISCH: ``faster_whisper`` (zieht ctranslate2/torch nach sich) wird NUR in
-load() importiert — niemals auf Modul-Ebene. Wenn STT_BACKEND≠whisper_local,
-wird dieses Modul gar nicht erst importiert (siehe STTBackend.from_config).
+CRITICAL: ``faster_whisper`` (which pulls in ctranslate2/torch) is imported ONLY
+in load() — never at module level. If STT_BACKEND≠whisper_local, this module is
+not even imported in the first place (see STTBackend.from_config).
 """
 
 from __future__ import annotations
@@ -42,13 +42,13 @@ class WhisperLocalSTTBackend(STTBackend):
 
     async def load(self) -> None:
         try:
-            from faster_whisper import WhisperModel  # lazy! GPU-Dep
+            from faster_whisper import WhisperModel  # lazy! GPU dep
         except ImportError as exc:
             from ..base import BackendError
             raise BackendError(
-                "STT_BACKEND=whisper_local, aber faster_whisper ist nicht "
-                "installiert. `pip install faster-whisper` (GPU-Setup) oder "
-                "STT_BACKEND=openai verwenden."
+                "STT_BACKEND=whisper_local, but faster_whisper is not "
+                "installed. `pip install faster-whisper` (GPU setup) or "
+                "use STT_BACKEND=openai."
             ) from exc
 
         def _build():
@@ -77,7 +77,7 @@ class WhisperLocalSTTBackend(STTBackend):
 
     def _transcribe_sync(self, audio_pcm: bytes, sample_rate: int) -> str:
         samples = audio_utils.pcm_bytes_to_float32_array(audio_pcm)
-        # faster_whisper erwartet float32-Mono @16kHz numpy-Array direkt.
+        # faster_whisper expects a float32 mono @16kHz numpy array directly.
         segments, info = self._model.transcribe(
             np.asarray(samples, dtype=np.float32),
             language=self.language,
@@ -95,6 +95,6 @@ class WhisperLocalSTTBackend(STTBackend):
 
     async def transcribe(self, audio_pcm: bytes, sample_rate: int) -> str:
         if self._model is None:
-            raise RuntimeError("STT nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("STT not initialized (load() did not run)")
         async with self._lock:
             return await asyncio.to_thread(self._transcribe_sync, audio_pcm, sample_rate)

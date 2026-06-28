@@ -1,8 +1,8 @@
-"""Per-Connection-Turn-State + VAD-Parameter.
+"""Per-connection turn state + VAD parameters.
 
-Debounce + Coalescing: Voice-Segmente und Text-Sends teilen sich ein
-Debounce-Fenster. Neue Eingaben während des Fensters werden gesammelt und
-nach Ablauf in EINEM LLM-Call abgeschickt.
+Debounce + coalescing: voice segments and text sends share a single debounce
+window. New inputs during the window are collected and, after it expires, sent
+off in ONE LLM call.
 """
 
 from __future__ import annotations
@@ -10,15 +10,15 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-# VAD-Frames ≈ 32 ms pro Frame bei 16 kHz/512 samples (silero-vad-web).
+# VAD frames ≈ 32 ms per frame at 16 kHz/512 samples (silero-vad-web).
 VAD_FRAME_MS = 32
 VAD_REDEMPTION_MIN = 8       # ~256 ms
 VAD_REDEMPTION_MAX = 160     # ~5.1 s
 
 
 def vad_params_for_debounce(debounce_ms: int) -> dict:
-    """VAD-Parameter abhängig vom gewünschten Debounce. Für lange Denkpausen
-    muss das VAD die Stille länger durchhalten, bevor es "speech end" feuert.
+    """VAD parameters depending on the desired debounce. For long thinking
+    pauses the VAD must hold the silence longer before it fires "speech end".
     """
     frames = int(round((debounce_ms * 0.8) / VAD_FRAME_MS))
     frames = max(VAD_REDEMPTION_MIN, min(VAD_REDEMPTION_MAX, frames))
@@ -32,7 +32,7 @@ def vad_params_for_debounce(debounce_ms: int) -> dict:
 
 @dataclass
 class TurnState:
-    """Hält den aktuellen Turn einer Connection (Voice + Text + Bilder)."""
+    """Holds the current turn of a connection (voice + text + images)."""
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     pending_texts: list = field(default_factory=list)
     pending_segment_ids: list = field(default_factory=list)
@@ -43,38 +43,38 @@ class TurnState:
     audio_ids: set = field(default_factory=set)
     speed: float = 1.0
     debounce_ms: int = 1200
-    # Legacy: parallele Text-Tasks; jetzt unbenutzt, bleibt für _cancel_in_flight.
+    # Legacy: parallel text tasks; now unused, kept for _cancel_in_flight.
     text_tasks: list = field(default_factory=list)
-    # User-Suffix, der pro Connection den LLM-Session-Key bestimmt.
+    # User suffix that determines the LLM session key per connection.
     session_user: str | None = None
-    # Wake-Word ist ein per-Connection-Eingabemodus (vom Client gesetzt). Ist es
-    # aus, läuft die Connection wie reines VAD/PTT ohne Gate. Startwert =
-    # CFG.wake_word_enabled (Start-Default), danach via 'settings' umschaltbar.
+    # Wake word is a per-connection input mode (set by the client). When it is
+    # off, the connection runs like pure VAD/PTT without a gate. Initial value =
+    # CFG.wake_word_enabled (start default), then toggleable via 'settings'.
     wake_word_enabled: bool = False
-    # Wake-Word: bis zu diesem Zeitpunkt (time.time()) ist das Konversations-
-    # fenster offen → Segmente ohne Wake-Word werden durchgelassen (Folgefragen).
+    # Wake word: up to this point in time (time.time()) the conversation window
+    # is open → segments without a wake word are let through (follow-up questions).
     wake_until: float = 0.0
-    # Segment-ID, für die bereits ein `wake.detected` (akustisches Früh-Feedback)
-    # gesendet wurde — verhindert Doppel-Pling aus Partial + finalem Segment.
+    # Segment ID for which a `wake.detected` (acoustic early feedback) was already
+    # sent — prevents a double chime from partial + final segment.
     wake_detected_seg: str | None = None
-    # Hat der User das Gesprächsfenster während einer laufenden Antwort manuell
-    # geschlossen ('wake.close')? Dann das sonst folgende playback.done NICHT zum
-    # Wieder-Öffnen des Fensters nutzen.
+    # Did the user manually close the conversation window during an in-flight
+    # reply ('wake.close')? Then do NOT use the otherwise following playback.done
+    # to re-open the window.
     wake_suppress_reopen: bool = False
-    # Nach manuellem Schließen kurzer Guard (time.time()-Schwelle): bis dahin KEIN
-    # automatisches Wieder-Öffnen und kein wake.detected — sonst macht ein
-    # nachlaufendes Partial / Echo / Störgeräusch das Fenster sofort wieder auf.
+    # After a manual close, a brief guard (time.time() threshold): until then NO
+    # automatic re-opening and no wake.detected — otherwise a trailing partial /
+    # echo / background noise would re-open the window immediately.
     wake_closed_until: float = 0.0
-    # End-to-End-Latenz-Anker: time.time(), an dem das letzte zum Turn
-    # beitragende Segment beim Server ankam ("User ist fertig mit Sprechen").
-    # Gegen diesen Zeitpunkt wird die Zeit bis zur ersten Wiedergabe gemessen.
+    # End-to-end latency anchor: time.time() at which the last segment
+    # contributing to the turn arrived at the server ("user is done speaking").
+    # The time until the first playback is measured against this point.
     speech_end_ts: float = 0.0
 
     def has_pending(self) -> bool:
         return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)
 
     def reset(self) -> None:
-        """Beginne neuen Turn (nach erfolgreichem Agent-Call)."""
+        """Begin a new turn (after a successful agent call)."""
         self.turn_id = uuid.uuid4().hex[:8]
         self.pending_texts.clear()
         self.pending_segment_ids.clear()

@@ -1,4 +1,4 @@
-"""start.sh existiert, ist ausführbar und syntaktisch valide."""
+"""start.sh exists, is executable and syntactically valid."""
 import os
 import shutil
 import subprocess
@@ -25,7 +25,7 @@ def test_script_has_shebang():
 def test_script_bash_syntax_valid():
     bash = shutil.which("bash")
     if not bash:
-        return  # ohne bash nicht prüfbar
+        return  # not checkable without bash
     res = subprocess.run([bash, "-n", str(SCRIPT)], capture_output=True, text=True)
     assert res.returncode == 0, f"Syntaxfehler: {res.stderr}"
 

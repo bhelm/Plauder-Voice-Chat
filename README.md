@@ -1,75 +1,89 @@
 # 🎙️ Plauder
 
-Sprach-zu-Sprach-Chat im Browser: **Mikrofon → STT → LLM → TTS → Lautsprecher** —
-mit Turn-Taking (Debounce/Coalescing), Barge-In, niedriger Latenz durch
-End-to-End-Streaming, Wake-Word, Text-Eingabe und Bild-Uploads.
+Speech-to-speech chat in the browser: **microphone → STT → LLM → TTS → speaker** —
+with turn-taking (debounce/coalescing), barge-in, low latency through
+end-to-end streaming, wake word, text input and image uploads.
 
-Der Server ist ein sauberes Python-Package (`plauder/`) mit **pluggable
-Backends** für STT, TTS und LLM. Per `.env` lässt sich zwischen Cloud-APIs
-(OpenAI, Fireworks) und lokalen Modellen (faster-whisper, OmniVoice, OpenClaw)
-umschalten — ohne Codeänderung.
+The server is a clean Python package (`plauder/`) with **pluggable
+backends** for STT, TTS and LLM. Via `.env` you can switch between cloud APIs
+(OpenAI, Fireworks) and local models (faster-whisper, OmniVoice, OpenClaw)
+— without changing any code.
 
 ---
 
 ## Features
 
-- 🎙️ **Voice-to-Voice** im Browser, keine App nötig (nur `static/index.html`).
-- ⚡ **Streaming für niedrige Latenz** — LLM-Token werden satzweise sofort
-  synthetisiert und als Audio-Chunks progressiv abgespielt; das Mikrofon streamt
-  live mit und liefert Zwischen-Transkripte (siehe [Streaming](#streaming--latenz)).
-- 🔔 **Wake-Word** — wählbarer Eingabe-Modus (neben VAD & Push-to-Talk): die KI
-  reagiert nur auf „Antonia …", der Rest wird verworfen; mit Konversationsfenster
-  für Folgefragen. Start-Default aus, in der UI umschaltbar.
-- 🔀 **Pluggable Backends** — STT/TTS/LLM je unabhängig per `.env` wählbar,
-  Cloud oder lokal/GPU, jede Kombination erlaubt.
-- 🗣️ **Turn-Taking & Barge-In** — Debounce/Coalescing, Ins-Wort-Fallen stoppt
-  die Wiedergabe sofort.
-- 💬 Text-Eingabe und 🖼️ Bild-Uploads (multimodal) parallel zur Stimme.
+- 🎙️ **Voice-to-Voice** in the browser, no app needed (just `static/index.html`).
+- ⚡ **Streaming for low latency** — LLM tokens are synthesized sentence by
+  sentence immediately and played back progressively as audio chunks; the microphone
+  streams along live and delivers interim transcripts (see [Streaming](#streaming--latency)).
+- 🔔 **Wake word** — selectable input mode (alongside VAD & push-to-talk): the AI
+  only reacts to "Antonia …", everything else is discarded; with a conversation window
+  for follow-up questions. Off by default at startup, toggleable in the UI.
+- 🔀 **Pluggable backends** — STT/TTS/LLM each selectable independently via `.env`,
+  cloud or local/GPU, any combination allowed.
+- 🗣️ **Turn-taking & barge-in** — debounce/coalescing, interrupting stops
+  playback immediately.
+- 💬 Text input and 🖼️ image uploads (multimodal) in parallel with the voice.
 
 ---
 
 ## Getting Started
 
-### Voraussetzungen
+### Requirements
 
-- **Python 3.11** und ein Mikrofon-fähiger Browser (Chrome/Edge/Firefox).
-- Ein **OpenAI-API-Key** (STT/TTS im Cloud-Default) und ein **OpenAI-kompatibler
-  LLM-Endpoint** (z. B. Fireworks, oder ein lokaler Server). Für den voll-lokalen
-  Betrieb siehe [Lokal / GPU](#lokal--gpu).
+- **Python 3.11** and a microphone-capable browser (Chrome/Edge/Firefox).
+- An **OpenAI API key** (STT/TTS in the cloud default) and an **OpenAI-compatible
+  LLM endpoint** (e.g. Fireworks, or a local server). For fully local
+  operation see [Local / GPU](#local--gpu).
 
-### Schnellstart (Cloud-Default, keine GPU)
+### Quick start (cloud default, no GPU)
 
 ```bash
 cp .env.example .env          # 1) Keys eintragen (mind. OPENAI_API_KEY + LLM_*)
 ./start.sh            # 2) legt venv an, installiert Deps, startet Server
 ```
 
-Dann im Browser öffnen: **http://localhost:8319**, Mikrofon erlauben und sprechen.
+Then open in the browser: **http://localhost:8319**, allow the microphone and speak.
 
-Standardmäßig startest du im **VAD-Modus** (alles, was du sagst, wird gesendet).
-Im Kasten **Eingabe-Modus** kannst du auf **Wake-Word** umschalten — dann beginnst
-du mit **„Antonia, …"** (z. B. „Antonia, wie spät ist es?") und darfst direkt danach
-~8 s ohne erneutes „Antonia" weiterreden. Soll die UI gleich im Wake-Modus starten:
-`WAKE_WORD_ENABLED=1` in der `.env`.
+By default you start in **VAD mode** (everything you say is sent).
+In the **Input mode** box you can switch to **wake word** — then you begin
+with **"Antonia, …"** (e.g. "Antonia, what time is it?") and may keep talking for
+~8 s right afterwards without saying "Antonia" again. If you want the UI to start
+in wake mode straight away: `WAKE_WORD_ENABLED=1` in the `.env`.
 
-`start.sh` ist idempotent (beliebig oft aufrufbar) und lauscht auf
-`${HOST}:${PORT}` (Default `0.0.0.0:8319`).
+`start.sh` is idempotent (callable any number of times) and listens on
+`${HOST}:${PORT}` (default `0.0.0.0:8319`).
 
-### Minimal-`.env` (Cloud)
+### Minimal `.env` (cloud)
 
 ```bash
-# STT + TTS über OpenAI
+# STT + TTS via OpenAI
 OPENAI_API_KEY=sk-...
-# LLM über einen OpenAI-kompatiblen Endpoint (Fireworks, lokaler Server, …)
+# LLM via an OpenAI-compatible endpoint (Fireworks, a local server, …)
 LLM_BACKEND=openai_compat
 LLM_BASE_URL=https://api.fireworks.ai/inference/v1
 LLM_API_KEY=fw_...
 LLM_MODEL=accounts/fireworks/models/glm-5p2
 ```
 
-Alle Optionen sind in [`.env.example`](.env.example) dokumentiert.
+All options are documented in [`.env.example`](.env.example).
 
-### Gesundheitscheck
+### Language (`APP_LANGUAGE`)
+
+`APP_LANGUAGE` sets **both** the UI language of the browser client (which is now
+fully internationalized, English + German) **and** the assistant's default spoken
+language as well as the STT default language.
+
+| Variable | Values | Default | Meaning |
+|---|---|---|---|
+| `APP_LANGUAGE` | `en` · `de` | `en` | UI language + assistant/STT default language |
+
+The browser client auto-renders in the selected language, so no extra setup is
+needed. `APP_LANGUAGE=de` restores the previous German experience (German UI and
+a German-speaking assistant).
+
+### Health check
 
 ```bash
 curl http://localhost:8319/healthz   # 200 + aktive Backends
@@ -77,7 +91,7 @@ curl http://localhost:8319/healthz   # 200 + aktive Backends
 
 ---
 
-## Architektur
+## Architecture
 
 ```
                          Browser (static/index.html)
@@ -110,77 +124,77 @@ curl http://localhost:8319/healthz   # 200 + aktive Backends
         STT_BACKEND          LLM_BACKEND          TTS_BACKEND
 ```
 
-**Lazy Imports:** Schwere GPU-Deps (`faster_whisper`, `torch`, `omnivoice`) werden
-ausschließlich in `load()` des jeweiligen Backends importiert — und nur, wenn es
-aktiv ist. Im Cloud-Default wird nie GPU-Code geladen.
+**Lazy imports:** Heavy GPU deps (`faster_whisper`, `torch`, `omnivoice`) are
+imported exclusively in `load()` of the respective backend — and only when it is
+active. In the cloud default no GPU code is ever loaded.
 
-### Pipeline pro Turn
+### Pipeline per turn
 
-1. Browser sendet Sprach-Frames (VAD live / PTT) und/oder Text über den WebSocket.
-2. `TurnState` sammelt Eingaben im Debounce-Fenster (`DEBOUNCE_MS`); neue Eingabe
-   bricht laufende LLM-/TTS-Calls ab (Barge-In).
-3. STT → Text; Whisper-Halluzinationen werden gefiltert.
-4. **Wake-Word-Gate** (nur im Wake-Modus, per Connection): nur an die KI
-   gerichtete Segmente lösen einen Turn aus.
-5. `ConversationManager` hängt den Verlauf an und ruft das LLM
-   (`chat_stream` im Streaming-Modus, sonst `chat`).
-6. `sanitizer` entfernt Emojis/Markdown/Links; TTS synthetisiert satzweise.
-7. Audio geht als turn-id-getaggte Frames an den Browser.
+1. The browser sends speech frames (VAD live / PTT) and/or text over the WebSocket.
+2. `TurnState` collects inputs within the debounce window (`DEBOUNCE_MS`); new input
+   aborts in-flight LLM/TTS calls (barge-in).
+3. STT → text; Whisper hallucinations are filtered out.
+4. **Wake-word gate** (only in wake mode, per connection): only segments
+   addressed to the AI trigger a turn.
+5. `ConversationManager` appends the history and calls the LLM
+   (`chat_stream` in streaming mode, otherwise `chat`).
+6. `sanitizer` removes emojis/Markdown/links; TTS synthesizes sentence by sentence.
+7. Audio goes to the browser as turn-id-tagged frames.
 
 ---
 
-## Streaming & Latenz
+## Streaming & Latency
 
-Standardmäßig (`STREAMING=1`) ist der latenzkritische Pfad end-to-end gestreamt:
+By default (`STREAMING=1`) the latency-critical path is streamed end-to-end:
 
-| Stufe | Was |
+| Stage | What |
 |------|-----|
-| **A1** | LLM-Token werden gestreamt (SSE), Text erscheint live (`reply.delta`). |
-| **A2** | Sobald ein Satz fertig ist, wird er sofort synthetisiert und als PCM-Chunks (`VCT2`) progressiv abgespielt — Satz 1 spielt, während Satz 2 generiert wird. |
-| **B1** | Der Browser streamt Mikrofon-Frames live mit (`segment.stream.*`), statt am Ende einen Blob zu schicken. |
-| **B2** | Der Server transkribiert den anwachsenden Puffer gedrosselt → Live-Zwischen-Transkripte (`transcript.partial`). |
+| **A1** | LLM tokens are streamed (SSE), text appears live (`reply.delta`). |
+| **A2** | As soon as a sentence is finished, it is synthesized immediately and played back progressively as PCM chunks (`VCT2`) — sentence 1 plays while sentence 2 is being generated. |
+| **B1** | The browser streams microphone frames along live (`segment.stream.*`) instead of sending a blob at the end. |
+| **B2** | The server transcribes the growing buffer in a throttled way → live interim transcripts (`transcript.partial`). |
 
-`STREAMING=0` schaltet auf den klassischen Pfad zurück (erst komplett generieren,
-dann ein WAV) — nützlich, falls ein LLM-Endpoint kein SSE-Streaming kann.
-Stellschrauben: `TTS_CHUNK_MS`, sowie für B2 `STT_PARTIAL*` (Default an bei
+`STREAMING=0` falls back to the classic path (generate completely first,
+then one WAV) — useful if an LLM endpoint can't do SSE streaming.
+Tuning knobs: `TTS_CHUNK_MS`, and for B2 `STT_PARTIAL*` (on by default with
 `whisper_local`).
 
-Die **Statistik-Karte** zeigt die gefühlte Antwortzeit: `audio.start` liefert
-`e2eMs` (fertig gesprochen → erste Wiedergabe, inkl. der eingestellten
-Debounce-Pause — getrennt ausgewiesen) sowie die „erste / gesamt"-Zeiten für
-Agent und TTS, sodass sichtbar wird, dass die Wiedergabe lange vor Ende der
-vollständigen Synthese startet.
+The **statistics card** shows the perceived response time: `audio.start` delivers
+`e2eMs` (finished speaking → first playback, incl. the configured
+debounce pause — reported separately) as well as the "first / total" times for
+the agent and TTS, making it visible that playback starts long before the
+complete synthesis finishes.
 
 ---
 
-## Wake-Word
+## Wake Word
 
-Wake-Word ist ein **Eingabe-Modus** neben VAD und Push-to-Talk, wählbar im
-Kasten **Eingabe-Modus** der UI (pro Browser-Verbindung). Im Wake-Modus lösen nur
-Segmente, deren Transkript mit dem Wake-Word **beginnt** (Füllwörter wie „Hey/Ok"
-davor erlaubt), einen Turn aus — alles andere wird verworfen. Fuzzy-Matching
-toleriert Whisper-Verhörer („Antonja", „Anthonia", „An Tonia"). Nach einer Antwort
-bleibt ein Konversationsfenster offen, sodass Folgefragen **ohne** erneutes
-Wake-Word durchgehen. Getippte Eingaben umgehen das Gate immer.
+The wake word is an **input mode** alongside VAD and push-to-talk, selectable in
+the **Input mode** box of the UI (per browser connection). In wake mode, only
+segments whose transcript **begins** with the wake word (filler words like "Hey/Ok"
+in front are allowed) trigger a turn — everything else is discarded. Fuzzy matching
+tolerates Whisper mishearings ("Antonja", "Anthonia", "An Tonia"). After a reply
+a conversation window stays open, so follow-up questions go through **without** saying
+the wake word again. Typed inputs always bypass the gate.
 
-`WAKE_WORD_ENABLED` ist nur der **Start-Default** (in welchem Modus die UI
-hochfährt); umschalten geht jederzeit live in der UI. Die übrigen Variablen
-konfigurieren das Matching:
+`WAKE_WORD_ENABLED` is only the **startup default** (which mode the UI boots
+up in); switching is possible live in the UI at any time. The other variables
+configure the matching:
 
-| Variable | Default | Bedeutung |
+| Variable | Default | Meaning |
 |---|---|---|
-| `WAKE_WORD_ENABLED` | `0` | Start-Default: `1` = UI startet im Wake-Modus |
-| `WAKE_WORD` | = `AGENT_NAME` | Wake-Wort (leer = Agent-Name klein) |
-| `WAKE_WORD_WINDOW_S` | `8` | Folgefragen-Fenster nach einer Antwort (s) |
-| `WAKE_WORD_FUZZY` | `1` | Verhörer tolerieren |
-| `WAKE_WORD_ANYWHERE` | `0` | `1` = Wake-Wort irgendwo statt nur am Anfang |
-| `WAKE_WORD_RATIO` | `0.78` | Fuzzy-Schwelle (höher = strenger) |
+| `WAKE_WORD_ENABLED` | `0` | Startup default: `1` = UI starts in wake mode |
+| `WAKE_WORD` | = `AGENT_NAME` | Wake word (empty = agent name lowercased) |
+| `WAKE_WORD_WINDOW_S` | `8` | Follow-up question window after a reply (s) |
+| `WAKE_WORD_FUZZY` | `1` | Tolerate mishearings |
+| `WAKE_WORD_ANYWHERE` | `0` | `1` = wake word anywhere instead of only at the start |
+| `WAKE_WORD_RATIO` | `0.78` | Fuzzy threshold (higher = stricter) |
 
 ---
 
-## Backends umschalten
+## Switching Backends
 
-Drei unabhängige Schalter in der `.env`:
+Three independent switches in the `.env`:
 
 | Variable      | Werte                          | Default         |
 |---------------|--------------------------------|-----------------|
@@ -188,18 +202,18 @@ Drei unabhängige Schalter in der `.env`:
 | `TTS_BACKEND` | `openai` · `omnivoice_local`   | `openai`        |
 | `LLM_BACKEND` | `openai_compat` · `openclaw`   | `openai_compat` |
 
-`cfg.validate()` prüft beim Start nur das jeweils *aktive* Backend (Keys/Pflicht-
-felder). Fehlt eine lokale Dependency, liefert `load()` eine klare Fehlermeldung
-statt eines Importfehlers.
+`cfg.validate()` checks only the *active* backend at startup (keys/required
+fields). If a local dependency is missing, `load()` returns a clear error message
+instead of an import error.
 
-### Lokal / GPU
+### Local / GPU
 
 ```bash
 pip install faster-whisper          # STT_BACKEND=whisper_local
 pip install omnivoice torch         # TTS_BACKEND=omnivoice_local (s. k2-fsa/OmniVoice)
 ```
 
-`.env` für lokales Whisper (GPU):
+`.env` for local Whisper (GPU):
 
 ```bash
 STT_BACKEND=whisper_local
@@ -208,8 +222,8 @@ WHISPER_MODEL=large-v3-turbo
 WHISPER_LOCAL_FILES_ONLY=1
 ```
 
-`faster-whisper` läuft auch auf der **CPU** (`WHISPER_DEVICE=cpu`, kleines Modell
-wie `base`, `WHISPER_LOCAL_FILES_ONLY=0` zum Nachladen) — gut zum Testen ohne GPU.
+`faster-whisper` also runs on the **CPU** (`WHISPER_DEVICE=cpu`, small model
+like `base`, `WHISPER_LOCAL_FILES_ONLY=0` to fetch on demand) — good for testing without a GPU.
 
 ---
 
@@ -220,12 +234,12 @@ wie `base`, `WHISPER_LOCAL_FILES_ONLY=0` zum Nachladen) — gut zum Testen ohne 
 .venv/bin/python -m pytest tests/test_wake.py # ein Modul
 ```
 
-Pro Modul eigene Tests; alle Backends werden gemockt — keine echten API-Calls,
-keine GPU. Lazy-Imports und alle Backend-Kombinationen werden abgedeckt.
+Each module has its own tests; all backends are mocked — no real API calls,
+no GPU. Lazy imports and all backend combinations are covered.
 
 ---
 
-## Projektstruktur
+## Project Structure
 
 ```
 plauder/
@@ -245,19 +259,19 @@ server.py                  # Entrypoint-Shim → plauder.server.run()
 static/index.html          # kompletter Browser-Client (Audio, WS, UI)
 ```
 
-> **Secrets & Pfade:** API-Keys und maschinenspezifische Pfade gehören
-> ausschließlich in die `.env` (steht in `.gitignore`), niemals in den Quellcode.
-> Eine bestehende Minimal-`.env` (nur `OPENAI_API_KEY` + `FIREWORKS_API_KEY`)
-> funktioniert dank Legacy-Fallback-Ketten unverändert weiter.
+> **Secrets & paths:** API keys and machine-specific paths belong
+> exclusively in the `.env` (which is in `.gitignore`), never in the source code.
+> An existing minimal `.env` (only `OPENAI_API_KEY` + `FIREWORKS_API_KEY`)
+> continues to work unchanged thanks to legacy fallback chains.
 
 ---
 
-## Lizenz
+## License
 
 Copyright (C) 2026 Robert Sachse / Bernd Helm
 
-Dieses Programm ist freie Software: Du kannst es unter den Bedingungen der
-**GNU General Public License v3** (oder einer späteren Version), wie von der
-Free Software Foundation veröffentlicht, weitergeben und/oder modifizieren.
-Es wird in der Hoffnung verteilt, dass es nützlich ist, jedoch **ohne jede
-Gewährleistung**. Siehe [`LICENSE`](LICENSE) für den vollständigen Text.
+This program is free software: you can redistribute and/or modify it under
+the terms of the **GNU General Public License v3** (or any later version), as
+published by the Free Software Foundation. It is distributed in the hope that
+it will be useful, but **without any warranty**. See [`LICENSE`](LICENSE) for the
+full text.

@@ -1,11 +1,11 @@
-"""Wake-Word-Erkennung über das STT-Transkript (Prefix-Gate).
+"""Wake-word detection via the STT transcript (prefix gate).
 
-Kein eigenes Modell: nutzt das ohnehin vorhandene Transkript. Ein Segment zählt
-nur dann als an die KI gerichtet, wenn der Text mit dem Wake-Word beginnt
-(Füllwörter wie „Hey"/„Ok" davor sind erlaubt). Alles andere wird verworfen.
+No dedicated model: uses the transcript that exists anyway. A segment only
+counts as directed at the AI if the text begins with the wake word (filler words
+like "Hey"/"Ok" before it are allowed). Everything else is discarded.
 
-Robust gegen Whisper-Verhörer: Vergleich erfolgt normalisiert und fuzzy
-(„Antonja", „Anthonia", „an Tonia" …). Reine Textverarbeitung, keine Deps.
+Robust against Whisper mishearings: the comparison is normalized and fuzzy
+("Antonja", "Anthonia", "an Tonia" …). Pure text processing, no deps.
 """
 
 from __future__ import annotations
@@ -13,33 +13,33 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 
-# Alles außer Buchstaben/Ziffern/Whitespace raus (inkl. Satzzeichen).
+# Strip everything except letters/digits/whitespace (incl. punctuation).
 _PUNCT_RE = re.compile(r"[^0-9a-zäöüßáàâéèêíìîóòôúùûñ\s-]", re.IGNORECASE)
 _WS_RE = re.compile(r"\s+")
 
-# Typische Füllwörter vor dem Wake-Word ("Hey Antonia", "Ok Antonia").
+# Typical filler words before the wake word ("Hey Antonia", "Ok Antonia").
 _LEAD_FILLERS = {
     "hey", "hallo", "hi", "ok", "okay", "also", "ja", "und", "äh", "ähm",
     "he", "du", "mal", "so",
 }
 
-# Stop-Kommandos, die das Konversationsfenster beenden ("stop", "ok stopp", …).
+# Stop commands that end the conversation window ("stop", "ok stopp", …).
 _STOP_WORDS = {"stop", "stopp", "stoppe", "stoppen", "stoppt", "halt", "ende",
                "schluss", "fertig"}
-# Füllwörter, die NACH dem Stop-Wort noch erlaubt sind ("stop danke", "stop jetzt").
+# Filler words still allowed AFTER the stop word ("stop danke", "stop jetzt").
 _TRAIL_FILLERS = {"danke", "bitte", "jetzt", "mal", "so", "ok", "okay", "ist", "gut"}
 
 
 def _norm(s: str) -> str:
-    """Kleinschreibung, Satzzeichen → Whitespace, Whitespace normalisiert."""
+    """Lowercase, punctuation → whitespace, whitespace normalized."""
     s = (s or "").lower()
     s = _PUNCT_RE.sub(" ", s)
     return _WS_RE.sub(" ", s).strip()
 
 
 def _norm_tok(t: str) -> str:
-    """Ein einzelnes (Whitespace-getrenntes) Original-Token → reiner Vergleichs-
-    string ohne Satzzeichen/Whitespace."""
+    """A single (whitespace-separated) original token → plain comparison
+    string without punctuation/whitespace."""
     return _norm(t).replace(" ", "")
 
 
@@ -61,12 +61,12 @@ def _token_matches(tok: str, wake: str, fuzzy: bool, ratio: float) -> bool:
 
 def match_wake(text: str, wake: str, *, fuzzy: bool = True, anywhere: bool = False,
                max_lead_words: int = 2, ratio: float = 0.78) -> tuple[bool, str]:
-    """Prüft, ob ``text`` das Wake-Word enthält.
+    """Checks whether ``text`` contains the wake word.
 
-    Standard (``anywhere=False``): das Wake-Word muss am Anfang stehen, optional
-    nach bis zu ``max_lead_words`` Füllwörtern. Gibt ``(matched, remainder)``
-    zurück — ``remainder`` ist der Originaltext OHNE Wake-Word (und führende
-    Füllwörter), zum Weiterreichen an das LLM.
+    Default (``anywhere=False``): the wake word must be at the start, optionally
+    after up to ``max_lead_words`` filler words. Returns ``(matched, remainder)``
+    — ``remainder`` is the original text WITHOUT the wake word (and leading
+    filler words), for passing on to the LLM.
     """
     wake_n = _norm(wake).replace(" ", "")
     if not wake_n:
@@ -88,7 +88,7 @@ def match_wake(text: str, wake: str, *, fuzzy: bool = True, anywhere: bool = Fal
     for i in range(search_end):
         if _token_matches(ntoks[i], wake_n, fuzzy, ratio) and lead_ok(i):
             return True, remainder_from(i + 1)
-        # Zweigeteiltes Wake-Word ("an tonia") zusammenziehen.
+        # Pull together a split wake word ("an tonia").
         if i + 1 < n:
             joined = ntoks[i] + ntoks[i + 1]
             if _token_matches(joined, wake_n, fuzzy, ratio) and lead_ok(i):
@@ -97,14 +97,14 @@ def match_wake(text: str, wake: str, *, fuzzy: bool = True, anywhere: bool = Fal
 
 
 def is_stop_command(text: str, *, fuzzy: bool = True, ratio: float = 0.86) -> bool:
-    """True, wenn ``text`` (nur) ein Stop-Kommando ist — z.B. „stop", „ok stopp",
-    „stop danke".
+    """True if ``text`` is (only) a stop command — e.g. "stop", "ok stopp",
+    "stop danke".
 
-    Führende/abschließende Füllwörter werden abgezogen; danach muss GENAU EIN
-    Stop-Wort übrig bleiben. So lösen längere Sätze, die das Wort nur enthalten
-    („soll ich den Bus stoppen?"), bewusst NICHT aus. Fuzzy fängt knappe
-    Whisper-Verhörer, ohne Kurzwörter wie „raus"/„wende" fälschlich zu treffen
-    (gleicher Anfangsbuchstabe + Mindestlänge gefordert)."""
+    Leading/trailing filler words are stripped off; after that EXACTLY ONE stop
+    word must remain. This way longer sentences that merely contain the word
+    ("soll ich den Bus stoppen?") deliberately do NOT trigger. Fuzzy catches
+    narrow Whisper mishearings without falsely matching short words like
+    "raus"/"wende" (same initial letter + minimum length required)."""
     toks = _norm(text).split()
     while toks and toks[0] in _LEAD_FILLERS:
         toks.pop(0)

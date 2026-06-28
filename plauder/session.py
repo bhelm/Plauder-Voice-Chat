@@ -1,9 +1,9 @@
-"""Voice-Session-State: Gesprächsverlauf pro Session-Key + LLM-Orchestrierung.
+"""Voice session state: conversation history per session key + LLM orchestration.
 
-Die LLM-Backends sind stateless (sie bekommen die fertige Nachrichtenliste).
-Den Verlauf hält diese Klasse — pro ``user_key`` getrennt, damit der „Neue
-Session"-Button (rotiert den Key) frischen Kontext bekommt, ohne andere
-Connections zu stören.
+The LLM backends are stateless (they receive the finished message list).
+This class holds the history — kept separate per ``user_key`` so that the "New
+Session" button (rotates the key) gets fresh context without disturbing other
+connections.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ class ConversationManager:
         self.system_prompt = system_prompt
         self.history_turns = max(1, int(history_turns))
         self._history: dict[str, list[dict]] = {}
-        #: Meta (finish_reason/usage/id) des letzten chat_stream()-Durchlaufs.
+        #: Meta (finish_reason/usage/id) of the last chat_stream() run.
         self.last_stream_meta: dict = {}
 
     def reset(self, user_key: str) -> None:
-        """Verwirft den Verlauf eines Session-Keys ("Neue Session")."""
+        """Discards the history of a session key ("New Session")."""
         self._history.pop(user_key, None)
 
     def history_for(self, user_key: str) -> list[dict]:
@@ -35,8 +35,8 @@ class ConversationManager:
         return {"role": "user", "content": user_text}
 
     async def chat(self, user_text: str, *, user_key: str, image_urls=None):
-        """Hängt die User-Message an den Verlauf, ruft das LLM, schreibt die
-        Antwort fort. Gibt (reply_text, meta) zurück.
+        """Appends the user message to the history, calls the LLM, records the
+        reply. Returns (reply_text, meta).
         """
         history = self.history_for(user_key)
         user_msg = self._build_user_message(user_text, image_urls)
@@ -54,10 +54,10 @@ class ConversationManager:
         return reply, meta
 
     async def chat_stream(self, user_text: str, *, user_key: str, image_urls=None):
-        """Wie ``chat``, aber als Async-Generator: liefert Antwort-Deltas live.
+        """Like ``chat``, but as an async generator: yields reply deltas live.
 
-        Hängt User-Message + vollständige Antwort erst NACH dem letzten Delta an
-        den Verlauf an. ``last_stream_meta`` enthält danach finish_reason/usage.
+        Appends user message + full reply to the history only AFTER the last
+        delta. ``last_stream_meta`` then contains finish_reason/usage.
         """
         history = self.history_for(user_key)
         user_msg = self._build_user_message(user_text, image_urls)
@@ -70,7 +70,7 @@ class ConversationManager:
                 parts.append(delta)
                 yield delta
         else:
-            # Backend ohne Streaming → einmal komplett, als ein Delta.
+            # Backend without streaming → once in full, as a single delta.
             text = await self.llm.chat(messages, system_hint=self.system_prompt)
             if text:
                 parts.append(text)

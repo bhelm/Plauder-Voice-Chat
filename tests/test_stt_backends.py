@@ -1,4 +1,4 @@
-"""STT-Backends (openai + whisper_local), gemockt — keine API-Calls, keine GPU."""
+"""STT backends (openai + whisper_local), mocked — no API calls, no GPU."""
 import asyncio
 import sys
 from unittest.mock import MagicMock
@@ -83,12 +83,12 @@ def test_describe_reports_engine():
 
 # --- whisper_local (lazy import) --------------------------------------------
 def test_whisper_local_not_imported_for_cloud_backend():
-    """Solange whisper_local nicht aktiv ist, bleibt faster_whisper ungeladen."""
+    """As long as whisper_local is not active, faster_whisper stays unloaded."""
     assert "faster_whisper" not in sys.modules
 
 
 def test_whisper_local_load_raises_clear_error_without_dep():
-    """Ohne installiertes faster_whisper liefert load() einen klaren Fehler."""
+    """Without faster_whisper installed, load() yields a clear error."""
     from plauder.backends.stt.whisper_local import WhisperLocalSTTBackend
     from plauder.backends.base import BackendError
 
@@ -102,8 +102,8 @@ def test_whisper_local_load_raises_clear_error_without_dep():
 
     import importlib.util
     eng = WhisperLocalSTTBackend.from_config(_LocalCfg())
-    # Nur sinnvoll, wenn faster_whisper NICHT installierbar ist (sonst greift der
-    # Fehlerpfad gar nicht — dann läuft es bis zum Modell-Download/-Build weiter).
+    # Only meaningful if faster_whisper is NOT installable (otherwise the error
+    # path is not hit — then it continues to the model download/build).
     if importlib.util.find_spec("faster_whisper") is not None:
         pytest.skip("faster_whisper installiert — Fehlerpfad nicht testbar")
     with pytest.raises(BackendError):

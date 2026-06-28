@@ -1,14 +1,14 @@
-"""Telegram-Bridge: bidirektionale Text-Spiegelung Voice <-> Telegram.
+"""Telegram bridge: bidirectional text mirroring voice <-> Telegram.
 
-Legacy-Feature (OpenClaw-CLI-basiert), per ENV (TELEGRAM_MIRROR) standardmäßig
-AUS. Aus dem monolithischen server.py extrahiert; Logik unverändert. Wird nur
-aktiv, wenn ein Telegram-Account/Target aufgelöst werden kann.
+Legacy feature (OpenClaw-CLI based), OFF by default via ENV (TELEGRAM_MIRROR).
+Extracted from the monolithic server.py; logic unchanged. Only becomes active
+when a Telegram account/target can be resolved.
 
-  Outbound: User-Input + Agent-Antwort werden als Bot-Nachricht in den Telegram-
-            Chat gepostet (`openclaw message send`).
-  Inbound:  Die Agent-Session-JSONL wird getailt; neue Messages werden als
-            `external.message`-Frame an alle Browser-WebSockets gebroadcastet.
-  Echo-Filter + Suppression-Window verhindern Doppelungen während Voice-Calls.
+  Outbound: user input + agent reply are posted as a bot message into the
+            Telegram chat (`openclaw message send`).
+  Inbound:  the agent session JSONL is tailed; new messages are broadcast as an
+            `external.message` frame to all browser WebSockets.
+  Echo filter + suppression window prevent duplicates during voice calls.
 """
 
 from __future__ import annotations
@@ -174,9 +174,9 @@ class TelegramBridge:
         text = " ".join(p for p in text_parts if p).strip()
         if not text:
             if has_image:
-                text = "📷 Bild gesendet"
+                text = "📷 Image sent"
             elif has_audio:
-                text = "🎵 Audio gesendet"
+                text = "🎵 Audio sent"
         return role, text
 
     async def _tail_session_file(self) -> None:

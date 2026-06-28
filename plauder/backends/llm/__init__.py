@@ -1,4 +1,4 @@
-"""LLM-Backends. Konkrete Module werden lazy via LLMBackend.from_config geladen."""
+"""LLM backends. Concrete modules are loaded lazily via LLMBackend.from_config."""
 from .base import LLMBackend
 
 __all__ = ["LLMBackend"]

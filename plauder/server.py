@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Voice-Chat Server — HTTP/WebSocket-Layer.
+"""Voice-Chat Server — HTTP/WebSocket layer.
 
-Nur noch Transport + Turn-Orchestrierung. STT/TTS/LLM stecken hinter pluggable
-Backends (siehe plauder.backends), gewählt per .env. Text-Verarbeitung
-(Sanitizer, Halluzinations-Filter, Merging) und Turn-State sind eigene Module.
+Transport + turn orchestration only. STT/TTS/LLM sit behind pluggable
+backends (see plauder.backends), chosen via .env. Text processing
+(sanitizer, hallucination filter, merging) and turn state are separate modules.
 
 Pipeline:
-  Browser (16 kHz float32-PCM via VAD/Push-to-Talk)
-    └─ WebSocket → TurnState (Debounce + Coalescing)
-                 → STT.transcribe → Halluzinations-Filter
-                 → ConversationManager.chat (LLM + Verlauf)
-                 → Sanitizer → TTS.synth → WAV → Browser
+  Browser (16 kHz float32 PCM via VAD/push-to-talk)
+    └─ WebSocket → TurnState (debounce + coalescing)
+                 → STT.transcribe → hallucination filter
+                 → ConversationManager.chat (LLM + history)
+                 → sanitizer → TTS.synth → WAV → browser
 """
 
 from __future__ import annotations
@@ -51,11 +51,11 @@ ALLOWED_IMAGE_MIME = {
 }
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
-STAGE = 6  # Protokoll-Version (Client-kompatibel)
+STAGE = 6  # protocol version (client-compatible)
 
 # --------------------------------------------------------------------------- #
-# Laufzeit-State (per configure() / main() gefüllt). Modul-Globals, damit die
-# Turn-Handler ohne Request-Kontext darauf zugreifen können.
+# Runtime state (filled by configure() / main()). Module globals, so the
+# turn handlers can access them without a request context.
 # --------------------------------------------------------------------------- #
 CFG: Config | None = None
 STT: STTBackend | None = None
@@ -64,14 +64,14 @@ CONV: ConversationManager | None = None
 BRIDGE: TelegramBridge | None = None
 GHOST: sanitizer.HallucinationFilter | None = None
 
-# House-Mode Speaker-ID (lazy, optional — speaker_id-Modul ist nicht Teil dieses
-# Repos; bleibt deaktiviert, wenn es fehlt).
+# House-Mode speaker-ID (lazy, optional — the speaker_id module is not part of
+# this repo; stays disabled when it is missing).
 _SPEAKER_IDENTIFIER = None
 _SPEAKER_INIT_FAILED = False
 
 
 def configure(cfg: Config, *, stt=None, tts=None, conv=None, bridge=None, ghost=None):
-    """Setzt den Laufzeit-State. Tests können hier Mock-Backends injizieren."""
+    """Sets the runtime state. Tests can inject mock backends here."""
     global CFG, STT, TTS, CONV, BRIDGE, GHOST
     CFG = cfg
     STT = stt
@@ -82,27 +82,27 @@ def configure(cfg: Config, *, stt=None, tts=None, conv=None, bridge=None, ghost=
 
 
 def get_speaker_identifier():
-    """Lazy-Load des optionalen House-Mode Speaker-Identifiers."""
+    """Lazy-load of the optional House-Mode speaker identifier."""
     global _SPEAKER_IDENTIFIER, _SPEAKER_INIT_FAILED
     if CFG is None or not CFG.house_speaker_id or _SPEAKER_INIT_FAILED:
         return None
     if _SPEAKER_IDENTIFIER is None:
         try:
-            import speaker_id as _spk  # optional, nicht im Repo
+            import speaker_id as _spk  # optional, not in the repo
             data_dir = Path(CFG.house_data_dir)
             embedder = _spk.SpeakerEmbedder(str(data_dir / "models" / "campplus_multilingual.onnx"))
             store = _spk.SpeakerStore(str(data_dir / "speakers.json"))
             _SPEAKER_IDENTIFIER = _spk.SpeakerIdentifier(embedder, store)
-            LOG.info("🔊 Speaker-ID aktiv (%d Sprecher)", len(store.all()))
+            LOG.info("🔊 Speaker-ID active (%d speakers)", len(store.all()))
         except Exception as exc:
             _SPEAKER_INIT_FAILED = True
-            LOG.warning("Speaker-ID-Init fehlgeschlagen, deaktiviert: %s", exc)
+            LOG.warning("Speaker-ID init failed, disabled: %s", exc)
             return None
     return _SPEAKER_IDENTIFIER
 
 
 # --------------------------------------------------------------------------- #
-# Identitäts-Helfer (für hello/healthz-Frames)
+# Identity helpers (for hello/healthz frames)
 # --------------------------------------------------------------------------- #
 def _agent_id() -> str:
     return CFG.openclaw_agent_id if CFG else "antonia"
@@ -117,12 +117,16 @@ def _session_key_for_user(user_id: str) -> str:
 
 
 # ============================================================================ #
-# HTTP-Routen
+# HTTP routes
 # ============================================================================ #
 async def index(_request):
     if not INDEX_HTML.exists():
-        return web.Response(status=500, text=f"index.html fehlt: {INDEX_HTML}")
-    return web.FileResponse(INDEX_HTML)
+        return web.Response(status=500, text=f"index.html missing: {INDEX_HTML}")
+    # Inject the configured UI language (APP_LANGUAGE) so the page renders in the
+    # right locale immediately, without a flash of the fallback language.
+    lang = (CFG.app_language if CFG else "en")
+    html = INDEX_HTML.read_text(encoding="utf-8").replace("__APP_LANG__", lang)
+    return web.Response(text=html, content_type="text/html")
 
 
 async def healthz(_request):
@@ -157,7 +161,7 @@ async def healthz(_request):
 
 
 async def upload_image(request):
-    """Nimmt ein Bild als multipart/form-data entgegen, gibt eine URL zurück."""
+    """Accepts an image as multipart/form-data, returns a URL."""
     try:
         reader = await request.multipart()
     except Exception as exc:
@@ -174,7 +178,7 @@ async def upload_image(request):
             status=400)
 
     orig_name = field_part.filename or "upload"
-    # Suffix NIE vom User-Filename übernehmen (XSS-Schutz: evil.html als image/jpeg).
+    # NEVER take the suffix from the user filename (XSS protection: evil.html as image/jpeg).
     suffix = {
         "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
         "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
@@ -244,12 +248,12 @@ async def _resolve_image_urls(image_urls: list, log_tag: str) -> list:
         if durl:
             out.append(durl)
         else:
-            LOG.warning("%s image %r konnte nicht aufgelöst werden", log_tag, u)
+            LOG.warning("%s image %r could not be resolved", log_tag, u)
     return out
 
 
 # ============================================================================ #
-# Turn-Orchestrierung
+# Turn orchestration
 # ============================================================================ #
 def _combine_user_input(voice_merged: str, text_parts: list) -> str:
     parts: list = []
@@ -277,8 +281,8 @@ def _queue_has_more_work(state: TurnState, exclude_task=None) -> bool:
 
 async def _agent_chat_with_retry(combined: str, *, image_urls, allow_retry: bool,
                                  user_key: str):
-    """Ruft den ConversationManager; bei 408 einmal lautlos retryen.
-    Gibt (reply, meta, retried) zurück oder wirft beim zweiten Fehler."""
+    """Calls the ConversationManager; on a 408, retries once silently.
+    Returns (reply, meta, retried) or raises on the second failure."""
     try:
         reply, meta = await CONV.chat(combined, user_key=user_key, image_urls=image_urls)
         return reply, meta, False
@@ -347,7 +351,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         "imageCount": len(resolved_imgs), "ts": time.time(),
     })
 
-    # Telegram-Spiegelung des User-Inputs.
+    # Telegram mirroring of the user input.
     if BRIDGE and BRIDGE.enabled:
         prefix = {"voice": "👤 (Voice)", "text": "👤 (Voice-Chat)",
                   "mixed": "👤 (Voice+Text)"}[source]
@@ -355,7 +359,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         if combined:
             mirror_parts.append(combined)
         for _ in range(len(resolved_imgs)):
-            mirror_parts.append("📷 Bild gesendet")
+            mirror_parts.append("📷 Image sent")
         mirror_text = " · ".join(mirror_parts).strip()
         if mirror_text:
             if combined:
@@ -370,14 +374,14 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
     await ws.send_json({"type": "reply.start", "turnId": turn_id,
                         "replyId": reply_id, "ts": time.time()})
 
-    # --- Streaming-Pfad (A1+A2): LLM-Token live → satzweises TTS → PCM-Chunks ---
+    # --- Streaming path (A1+A2): LLM tokens live → sentence-wise TTS → PCM chunks ---
     if CFG and CFG.streaming and hasattr(CONV, "chat_stream"):
         await _stream_reply_and_tts(
             ws, state, turn_id, reply_id,
             combined=combined, resolved_imgs=resolved_imgs)
         return
 
-    # --- Klassischer Pfad (Fallback, STREAMING=0): erst komplett, dann 1 WAV ---
+    # --- Classic path (fallback, STREAMING=0): fully generate first, then 1 WAV ---
     t_llm = time.time()
     try:
         allow_retry = (CFG.llm_retry_timeout_on_idle
@@ -439,7 +443,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
                  "audioId": audio_id, "ts": now}
     if anchor:
         start_evt["e2eMs"] = int((now - anchor) * 1000)
-        start_evt["debounceMs"] = state.debounce_ms  # Anteil Pause an e2e
+        start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
     await ws.send_json(start_evt)
     t_tts = time.time()
     try:
@@ -476,8 +480,8 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
 
 
 async def _tts_synth_stream(text: str, speed: float):
-    """TTS-Streaming mit Fallback: nutzt ``synth_stream`` falls vorhanden, sonst
-    das klassische ``synth`` (ein Häppchen). Hält den Orchestrator backend-agnostisch."""
+    """TTS streaming with fallback: uses ``synth_stream`` if present, otherwise
+    the classic ``synth`` (one chunk). Keeps the orchestrator backend-agnostic."""
     fn = getattr(TTS, "synth_stream", None)
     if fn is not None:
         async for item in fn(text, speed=speed):
@@ -490,28 +494,28 @@ async def _tts_synth_stream(text: str, speed: float):
 
 async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                                 combined, resolved_imgs):
-    """Streaming-Turn (A1+A2).
+    """Streaming turn (A1+A2).
 
-    LLM-Token werden live gelesen; sobald ein Satz vollständig ist, geht er in
-    die TTS-Queue. Ein paralleler TTS-Worker synthetisiert satzweise und schickt
-    das Audio als PCM-Chunks (VCT2) progressiv an den Client — Satz 1 wird
-    abgespielt, während Satz 2 noch generiert/synthetisiert wird.
+    LLM tokens are read live; as soon as a sentence is complete, it goes into
+    the TTS queue. A parallel TTS worker synthesizes sentence by sentence and
+    sends the audio as PCM chunks (VCT2) progressively to the client — sentence 1
+    is played back while sentence 2 is still being generated/synthesized.
     """
     pron = CFG.pronunciations_file if CFG else None
     max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
     audio_id = f"audio-{turn_id}"
     sentence_q: asyncio.Queue = asyncio.Queue()
 
-    parts: list[str] = []          # alle bisher empfangenen LLM-Deltas
-    held: list[str] = []           # fertige Sätze, die noch auf TTS-Freigabe warten
+    parts: list[str] = []          # all LLM deltas received so far
+    held: list[str] = []           # finished sentences still waiting for TTS release
     flushed_any = {"v": False}
-    sent_len = {"v": 0}            # bereits an den Client gesendete Text-Länge
+    sent_len = {"v": 0}            # text length already sent to the client
     started = {"audio": False}
     sr_box = {"sr": None}
     t_tts0 = {"t": None}
-    t_first = {"t": None}          # Zeitpunkt des ersten LLM-Tokens
-    # E2E-Anker ("User fertig mit Sprechen"); jetzt einfrieren, damit ein
-    # nachrückendes Segment den Messpunkt dieses Turns nicht verschiebt.
+    t_first = {"t": None}          # timestamp of the first LLM token
+    # E2E anchor ("user done speaking"); freeze it now so a later incoming
+    # segment doesn't shift this turn's measurement point.
     anchor = getattr(state, "speech_end_ts", 0.0) or 0.0
 
     async def _tts_worker() -> int:
@@ -533,10 +537,10 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                         start_evt = {
                             "type": "audio.start", "turnId": turn_id, "audioId": audio_id,
                             "sampleRate": sr, "ts": now}
-                        # Latenz-Aufschlüsselung bis zur ERSTEN Wiedergabe (≠ Gesamtzeit):
+                        # Latency breakdown up to the FIRST playback (≠ total time):
                         if anchor:
                             start_evt["e2eMs"] = int((now - anchor) * 1000)
-                            start_evt["debounceMs"] = state.debounce_ms  # Anteil Pause an e2e
+                            start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
                         if t_first["t"] is not None:
                             start_evt["llmFirstMs"] = int((t_first["t"] - t_llm) * 1000)
                         if t_tts0["t"] is not None:
@@ -553,8 +557,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
         return seq
 
     async def _emit_text():
-        """Sendet neuen Antworttext an den Client — aber erst, wenn klar ist,
-        dass es kein reines NO_REPLY ist (sonst würde 'NO_REPLY' kurz aufblitzen)."""
+        """Sends new reply text to the client — but only once it's clear that
+        it's not a pure NO_REPLY (otherwise 'NO_REPLY' would briefly flash up)."""
         full = "".join(parts)
         if not flushed_any["v"] and sanitizer.is_no_reply(full.strip()):
             return
@@ -567,7 +571,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
     async def _release(force: bool = False):
         full = "".join(parts).strip()
         if not flushed_any["v"] and not force and sanitizer.is_no_reply(full):
-            return  # sieht (noch) wie NO_REPLY aus → Sätze zurückhalten
+            return  # still looks like NO_REPLY → hold back the sentences
         while held:
             cleaned = sanitizer.sanitize_for_tts(held.pop(0), pronunciations_file=pron)
             if cleaned:
@@ -592,9 +596,9 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                 held.extend(sents)
                 await _release()
 
-    # t_llm VOR dem Worker-Start binden: der Worker liest es in seiner Closure
-    # (für llmFirstMs). Würde später ein `await` zwischen create_task und dieser
-    # Zuweisung stehen, könnte der Worker es sonst ungebunden lesen (NameError).
+    # Bind t_llm BEFORE starting the worker: the worker reads it in its closure
+    # (for llmFirstMs). If an `await` later sat between create_task and this
+    # assignment, the worker could otherwise read it unbound (NameError).
     t_llm = time.time()
     tts_task = asyncio.create_task(_tts_worker())
     state.audio_ids.add(audio_id)
@@ -619,8 +623,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
         LOG.info("turn=%s stream cancelled", turn_id)
         tts_task.cancel()
         await asyncio.gather(tts_task, return_exceptions=True)
-        # audio_id NICHT verwerfen: _cancel_in_flight schickt daraufhin noch ein
-        # audio.stop an den Client (Backup zum lokalen Barge-In-Stopp).
+        # Do NOT discard audio_id: _cancel_in_flight then still sends an
+        # audio.stop to the client (backup for the local barge-in stop).
         raise
     except UpstreamTimeoutError as exc:
         await _drain_tts()
@@ -638,7 +642,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                             "error": str(exc), "ts": time.time()})
         return
 
-    # Restpuffer als letzten Satz übernehmen.
+    # Take the remaining buffer as the last sentence.
     if pending.strip():
         held.append(pending.strip())
     full_reply = "".join(parts).strip()
@@ -655,8 +659,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             "finishReason": meta.get("finish_reason"), "ts": time.time()})
         return
 
-    await _release(force=True)            # zurückgehaltene Sätze freigeben
-    await _emit_text()                    # restlichen Text an den Client
+    await _release(force=True)            # release held-back sentences
+    await _emit_text()                    # remaining text to the client
     cleaned_full = sanitizer.sanitize_for_tts(full_reply, pronunciations_file=pron)
     LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
     await ws.send_json({
@@ -700,8 +704,8 @@ async def _debounce_then_run(ws, state: TurnState):
 
 
 async def _cancel_in_flight(state: TurnState, ws):
-    # Ein Abbruch beendet die laufende Antwort → ein evtl. gesetztes
-    # "Fenster-nicht-wieder-öffnen"-Flag ist damit gegenstandslos.
+    # A cancellation ends the running reply → any "do-not-reopen-window" flag
+    # that may have been set is thereby moot.
     state.wake_suppress_reopen = False
     cancelled = False
     tasks_to_await: list = []
@@ -737,50 +741,50 @@ def _speaker_tag(text: str, speaker_info: dict | None) -> str:
     rel = speaker_info.get("relation") or ""
     if role == "admin":
         q = f"admin, {rel}" if rel else "admin"
-        return f"[Sprecher: {nm} ({q})] {text}"
+        return f"[Speaker: {nm} ({q})] {text}"
     if speaker_info["known"]:
-        return f"[Sprecher: {nm} ({rel})] {text}" if rel else f"[Sprecher: {nm}] {text}"
-    return f"[Sprecher: {nm}, unbekannt] {text}"
+        return f"[Speaker: {nm} ({rel})] {text}" if rel else f"[Speaker: {nm}] {text}"
+    return f"[Speaker: {nm}, unknown] {text}"
 
 
-# Nach manuellem Schließen des Gesprächsfensters für so viele Sekunden KEIN
-# automatisches Wieder-Öffnen (schluckt nachlaufende Partials / Echo / Störer).
+# After manually closing the conversation window, for this many seconds NO
+# automatic reopening (swallows trailing partials / echo / interferers).
 WAKE_CLOSE_GUARD_S = 2.0
 
 
 def _wake_mode() -> str:
-    """Normalisierter Wake-Modus: 'alexa' (One-Shot) oder 'conversation'."""
+    """Normalized wake mode: 'alexa' (one-shot) or 'conversation'."""
     m = (getattr(CFG, "wake_mode", "conversation") or "conversation").lower() if CFG else "conversation"
     return "alexa" if m in ("alexa", "oneshot", "one-shot", "single") else "conversation"
 
 
 def _wake_oneshot() -> bool:
-    """Alexa-Modus: nach jeder Antwort schließt das Konversationsfenster sofort
-    (kein Folgefragen-Fenster — jeder Befehl braucht wieder das Weckwort)."""
+    """Alexa mode: after every reply the conversation window closes immediately
+    (no follow-up window — every command needs the wake word again)."""
     return _wake_mode() == "alexa"
 
 
 def _wake_closed_active(state: TurnState, now: float | None = None) -> bool:
-    """True, solange ein manuell geschlossenes Fenster bewusst zu bleiben soll:
-    während der noch laufenden Antwort (``wake_suppress_reopen``) ODER im kurzen
-    Nachlauf-Guard (``wake_closed_until``). In dieser Zeit ignoriert die Pipeline
-    die Wake-Erkennung KOMPLETT — sonst reißen Echo der eigenen TTS, B2-Partials
-    oder Folgegerede (inkl. Fuzzy-Fehltreffer) das Fenster sofort wieder auf."""
+    """True as long as a manually closed window should deliberately stay closed:
+    during the still-running reply (``wake_suppress_reopen``) OR within the short
+    trailing guard (``wake_closed_until``). During this time the pipeline ignores
+    wake detection COMPLETELY — otherwise echo of its own TTS, B2 partials or
+    follow-up chatter (incl. fuzzy false matches) would reopen the window at once."""
     now = time.time() if now is None else now
     return bool(state.wake_suppress_reopen) or now < state.wake_closed_until
 
 
 async def _open_wake_window(ws, state: TurnState, now: float | None = None,
                             reason: str = "command"):
-    """Konversationsfenster (neu) öffnen/auffrischen und den Client informieren.
+    """(Re)open/refresh the conversation window and notify the client.
 
-    `reason` sagt dem Client, ob Antonia jetzt IDLE ist (`armed` = wartet auf den
-    Befehl, `done` = Antwort fertig gesprochen) → Idle-Timer für das akustische
-    Auslauf-Feedback starten — oder ob gerade ein Befehl reinkam (`command`) und
-    eine Antwort folgt → Timer NICHT laufen lassen. So schließt das Fenster erst,
-    nachdem die Antwort komplett ausgesprochen wurde, nicht währenddessen."""
+    `reason` tells the client whether Antonia is now IDLE (`armed` = waiting for
+    the command, `done` = reply fully spoken) → start the idle timer for the
+    acoustic wind-down feedback — or whether a command just came in (`command`)
+    and a reply is coming → do NOT run the timer. This way the window only closes
+    after the reply has been fully spoken, not during it."""
     now = time.time() if now is None else now
-    # Guard nach manuellem Schließen: nicht automatisch wieder aufmachen.
+    # Guard after manual closing: do not reopen automatically.
     if _wake_closed_active(state, now):
         return
     state.wake_until = now + CFG.wake_word_window_s
@@ -790,11 +794,11 @@ async def _open_wake_window(ws, state: TurnState, now: float | None = None,
 
 
 async def _emit_wake_detected(ws, state: TurnState, segment_id):
-    """Akustisches Früh-Feedback: einmal pro Segment ein `wake.detected` senden,
-    sobald das Weckwort erkannt wurde (Partial ODER finales Segment)."""
+    """Acoustic early feedback: send a `wake.detected` once per segment as soon
+    as the wake word is recognized (partial OR final segment)."""
     if state.wake_detected_seg == segment_id:
         return
-    # Guard nach manuellem Schließen: kein Früh-Feedback / Öffnen durch Nachläufer.
+    # Guard after manual closing: no early feedback / reopening by stragglers.
     if _wake_closed_active(state):
         return
     state.wake_detected_seg = segment_id
@@ -817,9 +821,9 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         "samples": num_samples, "durationS": round(duration_s, 3), "ts": t0,
     })
 
-    # Bei aktivem Wake-Word wird ein laufender Turn NICHT sofort abgebrochen —
-    # erst wenn das Segment das Gate passiert (sonst würde Fremdgerede Antonia
-    # mitten im Satz unterbrechen, obwohl es gar nicht an sie gerichtet ist).
+    # With the wake word active, a running turn is NOT cancelled immediately —
+    # only once the segment passes the gate (otherwise foreign chatter would
+    # interrupt Antonia mid-sentence even though it isn't directed at her).
     wake_gating = bool(CFG and getattr(state, "wake_word_enabled", False))
     if not wake_gating:
         await _cancel_in_flight(state, ws)
@@ -837,10 +841,10 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         return
     LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
 
-    # Halluzinations-Filter
+    # Hallucination filter
     if text and GHOST and GHOST.is_hallucination(
             text, no_speech_prob=no_speech_prob, duration_s=duration_s):
-        LOG.info("ghost gefiltert seg=%s text=%r", segment_id, text)
+        LOG.info("ghost filtered seg=%s text=%r", segment_id, text)
         await ws.send_json({
             "type": "transcript", "segmentId": segment_id, "turnId": state.turn_id,
             "text": "", "filtered": "hallucination", "filteredText": text,
@@ -850,14 +854,14 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
         return
 
-    # --- Wake-Word-Gate (Prefix). Nur Voice; Tipp-Eingaben sind immer gemeint.
+    # --- Wake-word gate (prefix). Voice only; typed input is always intended.
     if wake_gating and text:
         now = time.time()
-        # Manuell geschlossen + läuft noch / Guard → Segment komplett ignorieren.
-        # KEIN Wake-Match (auch keine Fuzzy-Treffer), KEIN Cancel der laufenden
-        # Antwort. So kann während der Verarbeitung nichts das Fenster aufreißen.
+        # Manually closed + still running / guard → ignore the segment entirely.
+        # NO wake match (no fuzzy matches either), NO cancel of the running
+        # reply. This way nothing can reopen the window during processing.
         if _wake_closed_active(state, now):
-            LOG.info("wake: geschlossen → ignoriert seg=%s text=%r", segment_id, text)
+            LOG.info("wake: closed → ignored seg=%s text=%r", segment_id, text)
             await ws.send_json({
                 "type": "transcript.ignored", "segmentId": segment_id,
                 "turnId": state.turn_id, "text": text,
@@ -865,22 +869,22 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             if state.has_pending():
                 state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
             return
-        # „Fenster offen?" am SPRECH-BEGINN messen, nicht am Commit-Zeitpunkt:
-        # Wer innerhalb des Fensters zu sprechen beginnt, dessen (evtl. langer)
-        # Satz darf auch dann noch durch, wenn das Fenster während des Sprechens
-        # bzw. der Transkription abläuft (sonst Race: Eingabe erkannt, aber
-        # verworfen). speech_start_ts ist bereits clock-skew-korrigiert (Server-
-        # zeit); Fallback auf now, falls kein Zeitstempel vorliegt.
+        # Measure "window open?" at SPEECH START, not at commit time:
+        # if someone starts speaking within the window, their (possibly long)
+        # sentence may still pass even if the window lapses during speaking
+        # or transcription (otherwise a race: input recognized but discarded).
+        # speech_start_ts is already clock-skew corrected (server time);
+        # fall back to now if no timestamp is available.
         ref_ts = speech_start_ts if speech_start_ts is not None else now
         if ref_ts < state.wake_until:
-            # Konversationsfenster war beim Sprech-Beginn offen → Folgefrage durch.
+            # Conversation window was open at speech start → follow-up passes.
             command_text = text
         else:
             matched, remainder = wake.match_wake(
                 text, CFG.wake_word, fuzzy=CFG.wake_word_fuzzy,
                 anywhere=CFG.wake_word_anywhere, ratio=CFG.wake_word_ratio)
             if not matched:
-                LOG.info("wake: ignoriert seg=%s text=%r", segment_id, text)
+                LOG.info("wake: ignored seg=%s text=%r", segment_id, text)
                 await ws.send_json({
                     "type": "transcript.ignored", "segmentId": segment_id,
                     "turnId": state.turn_id, "text": text,
@@ -888,33 +892,33 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                 if state.has_pending():
                     state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
                 return
-            # Wake erkannt → ggf. Früh-Pling nachholen (falls kein Partial es
-            # schon gesendet hat), Wake-Word abschneiden.
+            # Wake detected → emit the early cue if needed (in case no partial
+            # already sent it), strip the wake word.
             await _emit_wake_detected(ws, state, segment_id)
             command_text = remainder if CFG.wake_word_strip else text
             if not (command_text or "").strip():
-                # Nur das Wake-Word gesagt → „scharf", Antonia wartet (idle) auf
-                # den Befehl → Idle-Timer beim Client läuft (reason=armed).
+                # Only the wake word was said → "armed", Antonia waits (idle) for
+                # the command → idle timer runs on the client (reason=armed).
                 await _open_wake_window(ws, state, now, reason="armed")
                 await ws.send_json({
                     "type": "wake.armed", "turnId": state.turn_id,
                     "windowS": CFG.wake_word_window_s, "ts": time.time()})
                 return
 
-        # Stop-Kommando („stop", „ok stopp", …) → laufende Antwort stoppen und
-        # Konversationsfenster schließen (Wake-Word wird wieder gebraucht).
+        # Stop command ("stop", "ok stopp", …) → stop the running reply and
+        # close the conversation window (the wake word is needed again).
         if wake.is_stop_command(command_text):
             await _cancel_in_flight(state, ws)
             state.wake_until = 0.0
             state.wake_detected_seg = None
-            LOG.info("wake: stop seg=%s → Fenster geschlossen", segment_id)
+            LOG.info("wake: stop seg=%s → window closed", segment_id)
             await ws.send_json({
                 "type": "wake.closed", "turnId": state.turn_id,
                 "reason": "stop_command", "ts": time.time()})
             return
 
-        # Befehl an die KI → Fenster auffrischen; eine Antwort folgt, also läuft
-        # der Idle-Timer NICHT (reason=command). Dann laufenden Turn abräumen.
+        # Command to the AI → refresh the window; a reply is coming, so the
+        # idle timer does NOT run (reason=command). Then clear the running turn.
         await _open_wake_window(ws, state, now, reason="command")
         text = command_text
         await _cancel_in_flight(state, ws)
@@ -934,7 +938,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                     "score": round(res.score, 4), "known": res.known, "held": res.held,
                 }
             except Exception:
-                LOG.exception("speaker-id failed for segment %s (ignoriert)", segment_id)
+                LOG.exception("speaker-id failed for segment %s (ignored)", segment_id)
 
     transcript_evt = {
         "type": "transcript", "segmentId": segment_id, "turnId": state.turn_id,
@@ -952,19 +956,19 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
 
     state.pending_texts.append(_speaker_tag(text, speaker_info))
     state.pending_segment_ids.append(segment_id)
-    # E2E-Anker: Empfangszeit dieses (letzten) Segments. Bei Coalescing gewinnt
-    # das jeweils letzte Segment → Messung ab "User hat zuletzt gesprochen".
+    # E2E anchor: receive time of this (last) segment. With coalescing the
+    # respective last segment wins → measurement from "user last spoke".
     state.speech_end_ts = t0
     await _send_turn_pending(ws, state)
     state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
 
 
 # ============================================================================ #
-# B2: Streaming-STT (Zwischen-Transkripte während ein Segment eingestreamt wird)
+# B2: Streaming STT (interim transcripts while a segment is being streamed in)
 # ============================================================================ #
 async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
-    """Transkribiert den bisher angesammelten Puffer und schickt ein
-    transcript.partial — nur fürs UI, ändert keinen Turn-State."""
+    """Transcribes the buffer accumulated so far and sends a
+    transcript.partial — UI only, does not change any turn state."""
     try:
         text = await STT.transcribe(pcm, SAMPLE_RATE)
     except Exception:
@@ -972,14 +976,14 @@ async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
         text = ""
     finally:
         seg["partial_running"] = False
-    # Segment inzwischen committed/abgebrochen? Dann Partial verwerfen.
+    # Segment committed/aborted in the meantime? Then discard the partial.
     if seg.get("done") or not text:
         return
     seg["partial_text"] = text
-    # Früh-Pling: Weckwort schon im wachsenden Partial erkennen (nur Wake-Modus
-    # und nur solange das Fenster zu ist — bei offenem Fenster ist kein Weckwort
-    # nötig). So weiß der Nutzer SOFORT, dass es getriggert hat, statt erst nach
-    # dem Aussprechen.
+    # Early cue: detect the wake word already in the growing partial (wake mode
+    # only and only while the window is closed — with an open window no wake word
+    # is needed). This way the user knows IMMEDIATELY that it triggered, instead
+    # of only after finishing the utterance.
     if (CFG and state.wake_word_enabled and time.time() >= state.wake_until
             and state.wake_detected_seg != seg.get("id")
             and not _wake_closed_active(state)):
@@ -995,15 +999,15 @@ async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
 
 
 def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
-    """Throttle-Check + Start einer Partial-Transkription (B2). Sync — startet
-    bei Bedarf einen Task, blockiert die Frame-Schleife nicht."""
+    """Throttle check + start of a partial transcription (B2). Sync — starts a
+    task when needed, does not block the frame loop."""
     if not (CFG and CFG.stt_partial and STT is not None):
         return
     if seg.get("partial_running") or seg.get("done"):
         return
     buf_len = len(seg["buf"])
     now = time.time()
-    # f32 = 4 Bytes/Sample.
+    # f32 = 4 bytes/sample.
     new_bytes = buf_len - seg.get("last_partial_len", 0)
     min_new = int(SAMPLE_RATE * 4 * (CFG.stt_partial_min_new_ms / 1000.0))
     if new_bytes < min_new:
@@ -1017,7 +1021,7 @@ def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
 
 
 # ============================================================================ #
-# WebSocket-Handler
+# WebSocket handler
 # ============================================================================ #
 async def ws_handler(request):
     ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=16 * 1024 * 1024)
@@ -1029,11 +1033,11 @@ async def ws_handler(request):
     state.session_user = _default_user()
     state.speed = CFG.tts_speed if CFG else 1.0
     state.debounce_ms = CFG.debounce_ms if CFG else 1200
-    # Start-Default des Wake-Modus; der Client schaltet ihn via 'settings' um.
+    # Start default of the wake mode; the client toggles it via 'settings'.
     state.wake_word_enabled = bool(CFG.wake_word_enabled) if CFG else False
     pending_segment_meta: deque = deque()
-    # B1: gestreamtes Eingangs-Segment (Frames laufen ein, während gesprochen
-    # wird). None = kein aktives Stream-Segment → Binärframes sind Voll-Segmente.
+    # B1: streamed input segment (frames arrive while speaking). None = no active
+    # stream segment → binary frames are full segments.
     active_stream: dict | None = None
 
     if BRIDGE is not None:
@@ -1041,8 +1045,9 @@ async def ws_handler(request):
 
     await ws.send_json({
         "type": "hello", "stage": STAGE,
-        "msg": f"Server bereit – Agent: {CFG.agent_name}.",
+        "msg": f"Server ready – agent: {CFG.agent_name}.",
         "agent_name": CFG.agent_name,
+        "lang": (CFG.app_language if CFG else "en"),
         "stt": (STT.describe() if STT else {}),
         "agent": {
             "name": CFG.agent_name, "agent_id": _agent_id(),
@@ -1060,11 +1065,11 @@ async def ws_handler(request):
         "streamInput": bool(CFG.streaming) if CFG else False,
         "sttPartial": bool(CFG.stt_partial) if CFG else False,
         "wakeWord": {
-            "available": True,             # Wake-Modus ist immer wählbar (UI)
-            "enabled": bool(CFG.wake_word_enabled) if CFG else False,  # Start-Default
+            "available": True,             # wake mode is always selectable (UI)
+            "enabled": bool(CFG.wake_word_enabled) if CFG else False,  # start default
             "word": CFG.wake_word if CFG else "",
             "windowS": CFG.wake_word_window_s if CFG else 0,
-            "mode": _wake_mode(),          # "conversation" | "alexa" (One-Shot)
+            "mode": _wake_mode(),          # "conversation" | "alexa" (one-shot)
         },
         "turn": {
             "debounce_ms": state.debounce_ms,
@@ -1086,21 +1091,21 @@ async def ws_handler(request):
                 if t == "ping":
                     await ws.send_json({"type": "ack", "received": data, "ts": time.time()})
                 elif t == "playback.done":
-                    # Wake-Word: Antwort fertig ausgesprochen → Konversations-
-                    # fenster (neu) öffnen; jetzt erst läuft der Idle-Timer.
-                    # Ausnahme: Der User hat den Kanal währenddessen selbst
-                    # geschlossen → nicht wieder aufmachen (Flag einmalig zurück).
+                    # Wake word: reply fully spoken → (re)open the conversation
+                    # window; only now does the idle timer run.
+                    # Exception: the user closed the channel themselves in the
+                    # meantime → do not reopen (reset the flag once).
                     if CFG and state.wake_word_enabled:
                         if state.wake_suppress_reopen:
-                            # Manuell geschlossen während der Antwort: nicht wieder
-                            # öffnen. Kurzer Nachlauf-Guard, damit das Echo direkt
-                            # nach der Antwort das Fenster nicht doch aufreißt.
+                            # Manually closed during the reply: do not reopen.
+                            # Short trailing guard, so the echo right after the
+                            # reply doesn't reopen the window after all.
                             state.wake_suppress_reopen = False
                             state.wake_closed_until = max(
                                 state.wake_closed_until, time.time() + WAKE_CLOSE_GUARD_S)
                         elif _wake_oneshot():
-                            # Alexa-Modus: nach der Antwort Fenster sofort schließen,
-                            # neuer Befehl braucht wieder das Weckwort.
+                            # Alexa mode: close the window immediately after the
+                            # reply, a new command needs the wake word again.
                             state.wake_until = 0.0
                             state.wake_detected_seg = None
                             await ws.send_json({
@@ -1113,42 +1118,41 @@ async def ws_handler(request):
                         try:
                             ident.mark_playback_finished()
                         except Exception:
-                            LOG.exception("mark_playback_finished failed (ignoriert)")
+                            LOG.exception("mark_playback_finished failed (ignored)")
                 elif t == "barge_in":
                     reason = (data.get("reason") or "speech")
-                    # Wake-Modus + manuell geschlossen/Guard: die Sprache ist NICHT
-                    # an Antonia gerichtet → laufende Antwort NICHT abbrechen.
+                    # Wake mode + manually closed/guard: the speech is NOT directed
+                    # at Antonia → do NOT cancel the running reply.
                     if CFG and state.wake_word_enabled and _wake_closed_active(state):
-                        LOG.info("barge-in ignoriert (wake zu) von %s (reason=%s)", peer, reason)
+                        LOG.info("barge-in ignored (wake closed) from %s (reason=%s)", peer, reason)
                     else:
                         in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
                         if in_flight:
                             LOG.info("barge-in from %s (reason=%s)", peer, reason)
                             await _cancel_in_flight(state, ws)
-                        # Wer eine LAUFENDE Antwort unterbricht (serverseitig in-flight
-                        # ODER clientseitig noch am Abspielen), führt das Gespräch fort
-                        # → Fenster offen halten, damit die folgende (unterbrechende)
-                        # Eingabe nicht als „kein Weckwort" verworfen wird. NICHT bei
-                        # bloßem Geräusch ohne laufende Antwort (sonst nie wieder Gate).
+                        # Whoever interrupts a RUNNING reply (server-side in-flight
+                        # OR still playing client-side) continues the conversation
+                        # → keep the window open, so the following (interrupting)
+                        # input isn't discarded as "no wake word". NOT for mere
+                        # noise without a running reply (otherwise no gate ever again).
                         if CFG and state.wake_word_enabled and (in_flight or bool(data.get("playing"))):
                             await _open_wake_window(ws, state, reason="command")
                 elif t == "wake.close":
-                    # Voice-Kanal (Konversationsfenster) manuell schließen, OHNE
-                    # laufende Verarbeitung abzubrechen (das macht 'barge_in').
-                    # Danach ist wieder das Weckwort nötig.
+                    # Close the voice channel (conversation window) manually, WITHOUT
+                    # cancelling running processing (that's what 'barge_in' does).
+                    # After this the wake word is needed again.
                     if CFG and state.wake_word_enabled:
                         in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
                         state.wake_until = 0.0
                         state.wake_detected_seg = None
-                        # Kurzer Guard: nachlaufende Partials/Echo dürfen das Fenster
-                        # jetzt nicht sofort wieder aufmachen.
+                        # Short guard: trailing partials/echo must not reopen the
+                        # window right now.
                         state.wake_closed_until = time.time() + WAKE_CLOSE_GUARD_S
-                        # Läuft noch eine Antwort (server-seitig in_flight ODER
-                        # der Client spielt noch Nachklang), folgt danach ein
-                        # playback.done, das das Fenster sonst wieder öffnet →
-                        # unterdrücken.
+                        # If a reply is still running (server-side in_flight OR the
+                        # client is still playing the tail), a playback.done will
+                        # follow that would otherwise reopen the window → suppress it.
                         state.wake_suppress_reopen = bool(in_flight or data.get("playing"))
-                        LOG.info("wake: manuell geschlossen (%s, in_flight=%s)", peer, in_flight)
+                        LOG.info("wake: manually closed (%s, in_flight=%s)", peer, in_flight)
                         await ws.send_json({
                             "type": "wake.closed", "turnId": state.turn_id,
                             "reason": "manual", "ts": time.time()})
@@ -1164,8 +1168,8 @@ async def ws_handler(request):
                         "barge_in": bool(data.get("bargeIn")),
                     })
                 elif t == "segment.stream.start":
-                    # B1: Beginn eines gestreamten Segments. Folgende Binärframes
-                    # (roh-f32le) werden angehängt, bis segment.stream.commit kommt.
+                    # B1: start of a streamed segment. Following binary frames
+                    # (raw f32le) are appended until segment.stream.commit arrives.
                     _sst = data.get("speechStartTs")
                     _cnow = data.get("clientNow")
                     speech_start_ts = None
@@ -1176,14 +1180,14 @@ async def ws_handler(request):
                         "buf": bytearray(),
                         "speech_start_ts": speech_start_ts,
                         "barge_in": bool(data.get("bargeIn")),
-                        # B2: Partial-Throttle-State.
+                        # B2: partial throttle state.
                         "partial_running": False, "last_partial_ts": 0.0,
                         "last_partial_len": 0, "partial_text": "", "done": False,
                     }
                 elif t == "segment.stream.commit":
                     if active_stream is not None:
                         _seg = active_stream
-                        _seg["done"] = True       # späte Partials unterdrücken
+                        _seg["done"] = True       # suppress late partials
                         active_stream = None
                         pcm = bytes(_seg["buf"])
                         if pcm:
@@ -1227,7 +1231,7 @@ async def ws_handler(request):
                         try:
                             _ident.reset()
                         except Exception:
-                            LOG.exception("speaker identifier reset failed (ignoriert)")
+                            LOG.exception("speaker identifier reset failed (ignored)")
                     new_user = f"{_default_user()}-{uuid.uuid4().hex[:8]}"
                     state.session_user = new_user
                     if CONV is not None:
@@ -1253,7 +1257,7 @@ async def ws_handler(request):
                     if "wakeWordEnabled" in data:
                         was_on = state.wake_word_enabled
                         state.wake_word_enabled = bool(data["wakeWordEnabled"])
-                        # Wake-Modus verlassen → offenes Konversationsfenster schließen.
+                        # Leaving wake mode → close an open conversation window.
                         if was_on and not state.wake_word_enabled:
                             state.wake_until = 0.0
                     vad_params = vad_params_for_debounce(state.debounce_ms)
@@ -1269,9 +1273,9 @@ async def ws_handler(request):
                     LOG.debug("ws text: %r", data)
             elif msg.type == WSMsgType.BINARY:
                 if active_stream is not None:
-                    # B1: Frame eines gestreamten Segments — anhängen. Die finale
-                    # Transkription passiert beim commit; B2 schiebt zwischendurch
-                    # Partials (gedrosselt) ein.
+                    # B1: frame of a streamed segment — append. The final
+                    # transcription happens at commit; B2 pushes in partials
+                    # (throttled) in between.
                     active_stream["buf"].extend(msg.data)
                     _maybe_spawn_partial(ws, state, active_stream)
                     continue
@@ -1303,7 +1307,7 @@ async def ws_handler(request):
 
 
 # ============================================================================ #
-# App-Boot
+# App boot
 # ============================================================================ #
 @web.middleware
 async def _security_headers_mw(request, handler):
@@ -1326,7 +1330,7 @@ def build_app() -> web.Application:
 
 
 async def init_backends(cfg: Config):
-    """Baut und lädt die gewählten Backends. Wirft bei Fehler (Caller beendet)."""
+    """Builds and loads the chosen backends. Raises on error (caller exits)."""
     stt = STTBackend.from_config(cfg)
     tts = TTSBackend.from_config(cfg)
     llm = LLMBackend.from_config(cfg)
@@ -1347,7 +1351,7 @@ async def init_backends(cfg: Config):
     if cfg.tts_warmup:
         try:
             t0 = time.time()
-            await tts.synth("Hallo.", speed=cfg.tts_speed)
+            await tts.synth("Hello.", speed=cfg.tts_speed)
             LOG.info("TTS Warm-up: %.2fs", time.time() - t0)
         except Exception as exc:
             LOG.warning("TTS Warm-up: %s", exc)
@@ -1365,20 +1369,20 @@ async def main():
     try:
         cfg.validate()
     except Exception:
-        LOG.exception("Konfiguration ungültig")
+        LOG.exception("Configuration invalid")
         sys.exit(2)
 
     if cfg.house_mode:
-        LOG.info("🏠 HOUSE_MODE aktiv — speaker_id=%d wake_word=%d auth=%d",
+        LOG.info("🏠 HOUSE_MODE active — speaker_id=%d wake_word=%d auth=%d",
                  cfg.house_speaker_id, cfg.house_wake_word, cfg.house_auth)
 
     try:
         stt, tts, conv = await init_backends(cfg)
     except Exception:
-        LOG.exception("Backend-Initialisierung fehlgeschlagen")
+        LOG.exception("Backend initialization failed")
         sys.exit(3)
 
-    bridge = None  # Telegram-Bridge ist Legacy/optional; per Default aus.
+    bridge = None  # Telegram bridge is legacy/optional; off by default.
 
     configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge)
 
@@ -1392,14 +1396,14 @@ async def main():
     site = web.TCPSite(runner, cfg.host, cfg.port)
     await site.start()
 
-    LOG.info("🎙️  Voice-Chat Server läuft auf http://%s:%s (Agent: %s)",
+    LOG.info("🎙️  Voice-Chat server running at http://%s:%s (agent: %s)",
              cfg.host, cfg.port, cfg.agent_name)
     LOG.info("    Debounce: %d ms · TTS speed: %.2f", cfg.debounce_ms, cfg.tts_speed)
 
     stop_event = asyncio.Event()
 
     def _request_stop(*_):
-        LOG.info("Shutdown angefordert.")
+        LOG.info("Shutdown requested.")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -1410,7 +1414,7 @@ async def main():
             signal.signal(sig, _request_stop)
     await stop_event.wait()
 
-    LOG.info("Stoppe Server …")
+    LOG.info("Stopping server …")
     if BRIDGE is not None:
         await BRIDGE.stop()
     await runner.cleanup()

@@ -1,18 +1,18 @@
-"""Gemeinsame Backend-Abstraktionen.
+"""Shared backend abstractions.
 
-Re-exportiert die drei abstrakten Backend-Basisklassen und definiert
-``UpstreamTimeoutError`` (vom LLM-Layer geworfen, vom Server für Retry genutzt).
+Re-exports the three abstract backend base classes and defines
+``UpstreamTimeoutError`` (raised by the LLM layer, used by the server for retry).
 """
 
 from __future__ import annotations
 
 
 class BackendError(RuntimeError):
-    """Backend konnte nicht geladen werden (fehlende Deps, Key, Modell …)."""
+    """Backend could not be loaded (missing deps, key, model …)."""
 
 
 class UpstreamTimeoutError(RuntimeError):
-    """LLM-Gateway hat 408 / upstream provider timeout zurückgegeben."""
+    """LLM gateway returned 408 / upstream provider timeout."""
 
 
 from .stt.base import STTBackend  # noqa: E402

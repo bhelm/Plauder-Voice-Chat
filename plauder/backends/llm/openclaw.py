@@ -1,11 +1,11 @@
-"""LLM-Backend: OpenClaw Gateway (legacy).
+"""LLM backend: OpenClaw gateway (legacy).
 
-Das OpenClaw-Gateway spricht einen OpenAI-kompatiblen /chat/completions-Endpoint
-(openai-http Adapter), routet aber pro Agent/User über einen Session-Key. Wir
-schicken den Verlauf mit (die Session ist hier bewusst von der Session-Klasse
-verwaltet) und setzen das ``user``-Feld auf den abgeleiteten Session-Key.
+The OpenClaw gateway speaks an OpenAI-compatible /chat/completions endpoint
+(openai-http adapter), but routes per agent/user via a session key. We send
+the history along (the session is deliberately managed by the Session class
+here) and set the ``user`` field to the derived session key.
 
-Wirft UpstreamTimeoutError bei 408, damit der Server den Retry-Pfad nutzen kann.
+Raises UpstreamTimeoutError on 408 so the server can use the retry path.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class OpenClawLLMBackend(LLMBackend):
     async def load(self) -> None:
         if not self.token:
             from ..base import BackendError
-            raise BackendError("openclaw braucht OPENCLAW_GATEWAY_TOKEN.")
+            raise BackendError("openclaw needs OPENCLAW_GATEWAY_TOKEN.")
         self._session = ClientSession(timeout=ClientTimeout(total=self.timeout))
 
     async def close(self) -> None:
@@ -74,7 +74,7 @@ class OpenClawLLMBackend(LLMBackend):
 
     async def chat(self, messages: list[dict], system_hint: str | None = None) -> str:
         if self._session is None:
-            raise RuntimeError("LLM nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("LLM not initialized (load() did not run)")
         url = f"{self.gateway_url}/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.token}",
@@ -109,7 +109,7 @@ class OpenClawLLMBackend(LLMBackend):
 
     async def chat_stream(self, messages: list[dict], system_hint: str | None = None):
         if self._session is None:
-            raise RuntimeError("LLM nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("LLM not initialized (load() did not run)")
         url = f"{self.gateway_url}/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.token}",

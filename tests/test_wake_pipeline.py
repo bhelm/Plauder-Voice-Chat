@@ -1,16 +1,16 @@
-"""Wake-Word-Pipeline unter Last: was passiert mit dem Konversationsfenster,
-wenn WÄHREND einer laufenden Verarbeitung weiterer Voice-Input reinkommt?
+"""Wake-word pipeline under load: what happens to the conversation window
+when further voice input arrives WHILE processing is ongoing?
 
-Diese Tests simulieren die echte Pipeline mit Mock-Backends:
-  - ``ScriptedSTT``        liefert pro Segment einen vorgegebenen Text,
-  - ``GatedStreamingLLM``  hält die Antwort kontrolliert „in flight" (erstes
-                           Delta sofort, Rest erst nach Freigabe),
-  - ``FakeTTS``            liefert sofort etwas PCM.
+These tests simulate the real pipeline with mock backends:
+  - ``ScriptedSTT``        returns a predefined text per segment,
+  - ``GatedStreamingLLM``  keeps the reply controllably "in flight" (first
+                           delta immediately, the rest only after release),
+  - ``FakeTTS``            returns some PCM immediately.
 
-Damit lässt sich gezielt nachstellen: Fenster offen → Befehl → Antwort läuft →
-Fenster MANUELL schließen → noch während die Antwort läuft kommt weiterer
-Voice-Input (Echo der eigenen TTS, Folgegerede, Fuzzy-Fehltreffer). Das Fenster
-darf dabei NICHT wieder aufspringen.
+This lets us reproduce: window open → command → reply running →
+window closed MANUALLY → while the reply is still running, more
+voice input arrives (echo of one's own TTS, follow-up chatter, fuzzy
+mismatches). The window must NOT pop open again.
 """
 import asyncio
 import dataclasses
@@ -25,7 +25,7 @@ from plauder.session import ConversationManager
 
 # --- Mock-Backends ----------------------------------------------------------
 class ScriptedSTT:
-    """Liefert pro transcribe()-Aufruf den nächsten Text aus der Liste."""
+    """Returns the next text from the list per transcribe() call."""
     last_no_speech_prob = None
 
     def __init__(self, texts):
@@ -52,7 +52,7 @@ class FakeTTS:
 
 
 class GatedStreamingLLM:
-    """Hält die Antwort in-flight: erstes Delta sofort, Rest erst nach gate.set()."""
+    """Keeps the reply in-flight: first delta immediately, rest only after gate.set()."""
     loaded = True
 
     def __init__(self, deltas):
@@ -86,7 +86,7 @@ def _configure_wake(stt_texts, deltas, *, window_s=8.0, guard_s=2.0, mode="conve
     return cfg, llm
 
 
-# --- WS-Helfer --------------------------------------------------------------
+# --- WS helpers -------------------------------------------------------------
 async def _drain_until(ws, want_type, *, timeout=3.0):
     seen = []
     loop = asyncio.get_event_loop()
@@ -109,8 +109,8 @@ async def _drain_until(ws, want_type, *, timeout=3.0):
 
 
 async def _collect(ws, seconds):
-    """Sammelt ALLE Frame-Typen für `seconds` — um die ABWESENHEIT von Events
-    (z.B. wake.window) zu prüfen."""
+    """Collects ALL frame types for `seconds` — to check the ABSENCE of events
+    (e.g. wake.window)."""
     seen = []
     loop = asyncio.get_event_loop()
     deadline = loop.time() + seconds
@@ -134,19 +134,19 @@ async def _enable_wake(ws):
 
 
 async def _send_voice(ws, seg_id):
-    """Ein 'committed' Segment: segment.start (Meta) + ein Binär-PCM-Frame."""
+    """A 'committed' segment: segment.start (meta) + one binary PCM frame."""
     await ws.send_json({"type": "segment.start", "segmentId": seg_id})
     await ws.send_bytes(b"\x00" * 800)
 
 
 # --- Tests ------------------------------------------------------------------
 def test_nonwake_input_during_processing_does_not_reopen_window():
-    """Fenster geschlossen, Antwort läuft → Folgegerede OHNE Weckwort darf das
-    Fenster nicht aufreißen und die laufende Antwort nicht abbrechen."""
+    """Window closed, reply running → follow-up chatter WITHOUT a wake word must
+    not tear the window open nor abort the running reply."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia erzähl eine geschichte", "nur so nebenbei ohne anrede"],
         deltas=["Es war einmal eine Lampe. ", "Sie leuchtete schwach. ", "Schluss."],
-        guard_s=0.0,  # Guard AUS: hier soll allein das Gating schützen
+        guard_s=0.0,  # Guard OFF: here the gating alone should protect
     )
 
     async def run():
@@ -155,7 +155,7 @@ def test_nonwake_input_during_processing_does_not_reopen_window():
             await _drain_until(ws, "hello")
             await _enable_wake(ws)
 
-            await _send_voice(ws, "s1")                  # Weckwort + Befehl
+            await _send_voice(ws, "s1")                  # wake word + command
             rs, seen1 = await _drain_until(ws, "reply.start")
             assert rs is not None, f"keine reply.start; {seen1}"
 
@@ -163,13 +163,13 @@ def test_nonwake_input_during_processing_does_not_reopen_window():
             wc, _ = await _drain_until(ws, "wake.closed")
             assert wc is not None
 
-            await _send_voice(ws, "s2")                  # KEIN Weckwort, mitten drin
+            await _send_voice(ws, "s2")                  # NO wake word, in the middle
             seen = await _collect(ws, 0.6)
             assert "wake.window" not in seen, f"Fenster wieder aufgegangen: {seen}"
             assert "wake.detected" not in seen, f"wake.detected trotz geschlossen: {seen}"
             assert "transcript.ignored" in seen, f"Segment nicht ignoriert: {seen}"
 
-            # Laufende Antwort freigeben → sie muss UNVERSEHRT zu Ende laufen.
+            # Release the running reply → it must finish UNHARMED.
             llm.gate.set()
             reply, seen2 = await _drain_until(ws, "reply")
             assert reply is not None, f"Antwort abgebrochen? {seen2}"
@@ -180,9 +180,9 @@ def test_nonwake_input_during_processing_does_not_reopen_window():
 
 
 def test_wakeword_match_during_processing_is_ignored_while_closed():
-    """Selbst wenn STT während der laufenden Antwort etwas mit Weckwort liefert
-    (Echo der eigenen Stimme / Fuzzy-Fehltreffer), bleibt das Fenster zu —
-    solange die Antwort noch läuft."""
+    """Even if STT returns something with a wake word during the running reply
+    (echo of one's own voice / fuzzy mismatch), the window stays closed —
+    as long as the reply is still running."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia erzähl eine geschichte", "antonia neue frage zwischendurch"],
         deltas=["Teil eins. ", "Teil zwei. ", "Teil drei."],
@@ -201,7 +201,7 @@ def test_wakeword_match_during_processing_is_ignored_while_closed():
             await ws.send_json({"type": "wake.close", "playing": True})
             assert (await _drain_until(ws, "wake.closed"))[0] is not None
 
-            await _send_voice(ws, "s2")  # enthält "antonia" → würde sonst öffnen
+            await _send_voice(ws, "s2")  # contains "antonia" → would otherwise open
             seen = await _collect(ws, 0.6)
             assert "wake.window" not in seen, f"Echo/Fehltreffer hat geöffnet: {seen}"
             assert "wake.detected" not in seen, f"wake.detected trotz geschlossen: {seen}"
@@ -216,8 +216,8 @@ def test_wakeword_match_during_processing_is_ignored_while_closed():
 
 
 def test_playback_done_after_manual_close_does_not_reopen():
-    """Schließt der User mitten in der Antwort, darf das playback.done am Ende
-    der Antwort das Fenster NICHT wieder öffnen."""
+    """If the user closes in the middle of the reply, the playback.done at the
+    end of the reply must NOT reopen the window."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia sag was"],
         deltas=["Erster Satz. ", "Zweiter Satz."],
@@ -238,7 +238,7 @@ def test_playback_done_after_manual_close_does_not_reopen():
             llm.gate.set()
             end, _ = await _drain_until(ws, "audio.end")
             assert end is not None
-            # Client meldet Wiedergabe-Ende → darf das Fenster nicht öffnen.
+            # Client reports end of playback → must not open the window.
             await ws.send_json({"type": "playback.done", "turnId": end.get("turnId"),
                                 "audioId": end.get("audioId")})
             seen = await _collect(ws, 0.4)
@@ -249,9 +249,9 @@ def test_playback_done_after_manual_close_does_not_reopen():
 
 
 def test_barge_in_does_not_abort_reply_while_wake_closed():
-    """Kern des gemeldeten Bugs: Fenster geschlossen, Antonia denkt/spricht noch,
-    der User redet weiter → das Client-VAD schickt ein barge_in. Bei
-    geschlossenem Fenster darf das die laufende Antwort NICHT abbrechen."""
+    """Core of the reported bug: window closed, Antonia still thinking/speaking,
+    the user keeps talking → the client VAD sends a barge_in. With the window
+    closed, that must NOT abort the running reply."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia sag was"],
         deltas=["Erster Teil. ", "Zweiter Teil. ", "Dritter Teil."],
@@ -269,7 +269,7 @@ def test_barge_in_does_not_abort_reply_while_wake_closed():
             await ws.send_json({"type": "wake.close", "playing": True})
             assert (await _drain_until(ws, "wake.closed"))[0] is not None
 
-            # User redet weiter → Client würde barge_in senden (VAD onSpeechStart).
+            # User keeps talking → client would send barge_in (VAD onSpeechStart).
             await ws.send_json({"type": "barge_in", "reason": "vad-speech", "playing": False})
             seen = await _collect(ws, 0.5)
             assert "turn.discarded" not in seen, f"Antwort durch barge_in abgebrochen: {seen}"
@@ -284,11 +284,11 @@ def test_barge_in_does_not_abort_reply_while_wake_closed():
 
 
 def test_conversation_mode_reopens_window_after_reply():
-    """Standard-Modus: nach der Antwort öffnet playback.done das Konversations-
-    fenster wieder (Folgefragen ohne Weckwort)."""
+    """Default mode: after the reply, playback.done reopens the conversation
+    window (follow-up questions without a wake word)."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia sag was"], deltas=["Fertig."], mode="conversation")
-    llm.gate.set()  # nicht blockieren
+    llm.gate.set()  # don't block
 
     async def run():
         async with TestClient(TestServer(srv.build_app())) as client:
@@ -307,9 +307,9 @@ def test_conversation_mode_reopens_window_after_reply():
 
 
 def test_alexa_mode_closes_window_after_reply():
-    """Alexa-Modus (WAKE_MODE=alexa): nach der Antwort schließt das Fenster
-    (wake.closed reason=oneshot), KEIN Folgefragen-Fenster — und eine Folgefrage
-    OHNE Weckwort wird danach ignoriert."""
+    """Alexa mode (WAKE_MODE=alexa): after the reply the window closes
+    (wake.closed reason=oneshot), NO follow-up-question window — and a follow-up
+    question WITHOUT a wake word is ignored afterwards."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia sag was", "und was ist mit morgen"],
         deltas=["Fertig."], mode="alexa")
@@ -328,7 +328,7 @@ def test_alexa_mode_closes_window_after_reply():
             assert closed is not None and closed.get("reason") == "oneshot", seen
             assert "wake.window" not in seen, f"One-Shot öffnete trotzdem: {seen}"
 
-            # Folgefrage OHNE Weckwort → muss ignoriert werden (Fenster ist zu).
+            # Follow-up question WITHOUT a wake word → must be ignored (window is closed).
             await _send_voice(ws, "s2")
             ig, seen2 = await _drain_until(ws, "transcript.ignored")
             assert ig is not None, f"Folgefrage nicht ignoriert: {seen2}"
@@ -352,9 +352,9 @@ def test_hello_advertises_wake_mode():
 
 
 def test_fresh_wakeword_after_processing_reopens():
-    """Gegenprobe: NACH Abschluss der Antwort (und abgelaufenem Guard) muss ein
-    frisch gesprochenes Weckwort das Fenster wieder öffnen — sonst hätten wir
-    überdrückt."""
+    """Counter-check: AFTER the reply finishes (and the guard has lapsed), a
+    freshly spoken wake word must reopen the window — otherwise we would have
+    over-suppressed."""
     _cfg, llm = _configure_wake(
         stt_texts=["antonia sag was", "antonia bist du da"],
         deltas=["Kurz. ", "Antwort."],
@@ -377,9 +377,9 @@ def test_fresh_wakeword_after_processing_reopens():
             await ws.send_json({"type": "playback.done", "turnId": end.get("turnId"),
                                 "audioId": end.get("audioId")})
             await _collect(ws, 0.05)
-            await asyncio.sleep(0.25)   # Guard (0.1s) sicher abgelaufen
+            await asyncio.sleep(0.25)   # guard (0.1s) safely lapsed
 
-            await _send_voice(ws, "s2")  # frisches Weckwort → muss öffnen
+            await _send_voice(ws, "s2")  # fresh wake word → must open
             win, seen = await _drain_until(ws, "wake.window", timeout=2.0)
             assert win is not None, f"frisches Weckwort öffnete NICHT: {seen}"
             await ws.close()

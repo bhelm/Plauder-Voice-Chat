@@ -1,4 +1,4 @@
-"""Integration: ConversationManager-Verlauf + volle Audio-Pipeline (mock backends)."""
+"""Integration: ConversationManager history + full audio pipeline (mock backends)."""
 import asyncio
 import dataclasses
 
@@ -14,7 +14,7 @@ from tests.test_server import FakeSTT, FakeTTS, FakeLLM, _drain_until
 
 
 class _CollectWS:
-    """Minimaler WS-Doppel: sammelt nur send_json-Frames (für Unit-Tests)."""
+    """Minimal WS double: collects only send_json frames (for unit tests)."""
     def __init__(self):
         self.sent = []
 
@@ -41,7 +41,7 @@ def test_conversation_keeps_history_across_turns():
     asyncio.run(conv.chat("erste frage", user_key="u1"))
     llm.reply = "zweite antwort"
     asyncio.run(conv.chat("zweite frage", user_key="u1"))
-    # zweiter Call enthält den Verlauf des ersten.
+    # second call contains the history of the first.
     msgs, hint = llm.received[1]
     contents = [m["content"] for m in msgs]
     assert hint == "SYS"
@@ -66,7 +66,7 @@ def test_conversation_separate_keys_isolated():
     asyncio.run(conv.chat("a-frage", user_key="A"))
     asyncio.run(conv.chat("b-frage", user_key="B"))
     msgs, _ = llm.received[1]
-    assert [m["content"] for m in msgs] == ["b-frage"]  # B kennt A nicht
+    assert [m["content"] for m in msgs] == ["b-frage"]  # B doesn't know A
 
 
 def test_conversation_image_builds_multimodal():
@@ -81,10 +81,11 @@ def test_conversation_image_builds_multimodal():
     assert "text" in types and "image_url" in types
 
 
-# --- volle Audio-Pipeline über WebSocket ------------------------------------
+# --- full audio pipeline over WebSocket -------------------------------------
 def _configure_audio(reply="Audio-Antwort."):
-    # Wake-Word hier aus: diese Tests prüfen die Audio-Pipeline, nicht das Gate
-    # (FakeSTT liefert "hallo welt", was sonst ohne Wake-Word verworfen würde).
+    # Wake word off here: these tests check the audio pipeline, not the gate
+    # (FakeSTT returns "hallo welt", which would otherwise be discarded without
+    # a wake word).
     cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, wake_word_enabled=False)
     conv = ConversationManager(FakeLLM(reply), system_prompt="sys")
     srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
@@ -98,11 +99,11 @@ def test_audio_segment_pipeline_end_to_end():
         async with TestClient(TestServer(srv.build_app())) as client:
             ws = await client.ws_connect("/ws")
             await ws.receive_json()  # hello
-            # segment.start (Metadaten) + Binary-Audio (1s 16kHz float32)
+            # segment.start (metadata) + binary audio (1s 16kHz float32)
             await ws.send_json({"type": "segment.start", "segmentId": "seg1"})
             pcm = np.zeros(SAMPLE_RATE, dtype=np.float32).tobytes()
             await ws.send_bytes(pcm)
-            # Erwartung: transcript → turn.commit → reply → audio
+            # Expectation: transcript → turn.commit → reply → audio
             transcript, seen, _ = await _drain_until(ws, "transcript")
             assert transcript["text"] == "hallo welt"
             reply, seen2, _ = await _drain_until(ws, "reply")
@@ -113,8 +114,8 @@ def test_audio_segment_pipeline_end_to_end():
 
 
 def test_audio_segment_reports_first_audio_latency():
-    """audio.start trägt E2E-/First-Latenzen (bis zur ersten Wiedergabe),
-    getrennt von den Gesamtzeiten in reply/audio.end."""
+    """audio.start carries E2E/first latencies (up to first playback),
+    separate from the total times in reply/audio.end."""
     _configure_audio("Antwort auf Sprache.")
 
     async def run():
@@ -125,20 +126,20 @@ def test_audio_segment_reports_first_audio_latency():
             await ws.send_bytes(np.zeros(SAMPLE_RATE, dtype=np.float32).tobytes())
             start, seen, _ = await _drain_until(ws, "audio.start")
             assert start is not None, f"kein audio.start; gesehen: {seen}"
-            # E2E (fertig gesprochen → erste Wiedergabe) ist gesetzt, weil der
-            # Anker beim Voice-Segment gesetzt wurde.
+            # E2E (done speaking → first playback) is set, because the anchor
+            # was set at the voice segment.
             assert isinstance(start.get("e2eMs"), int) and start["e2eMs"] >= 0
             assert isinstance(start.get("llmFirstMs"), int) and start["llmFirstMs"] >= 0
             assert isinstance(start.get("ttsFirstMs"), int) and start["ttsFirstMs"] >= 0
-            # debounceMs begleitet e2eMs, damit der Client die Pause abspalten kann.
-            assert start.get("debounceMs") == 30   # aus _configure_audio
+            # debounceMs accompanies e2eMs so the client can split off the pause.
+            assert start.get("debounceMs") == 30   # from _configure_audio
             await ws.close()
 
     asyncio.run(run())
 
 
 def test_streamed_input_segment_end_to_end():
-    """B1: segment.stream.start + Frames + commit → assembliert → STT → reply."""
+    """B1: segment.stream.start + frames + commit → assembled → STT → reply."""
     _configure_audio("Antwort auf gestreamte Sprache.")
 
     async def run():
@@ -147,7 +148,7 @@ def test_streamed_input_segment_end_to_end():
             await ws.receive_json()  # hello
             await ws.send_json({"type": "segment.stream.start", "segmentId": "s1"})
             half = np.zeros(SAMPLE_RATE // 2, dtype=np.float32).tobytes()
-            await ws.send_bytes(half)        # Frame 1 (während "gesprochen" wird)
+            await ws.send_bytes(half)        # Frame 1 (while "speaking")
             await ws.send_bytes(half)        # Frame 2
             await ws.send_json({"type": "segment.stream.commit", "segmentId": "s1"})
             transcript, seen, _ = await _drain_until(ws, "transcript")
@@ -161,7 +162,7 @@ def test_streamed_input_segment_end_to_end():
 
 
 def test_streamed_input_emits_partial_transcripts():
-    """B2: während ein Segment eingestreamt wird, kommen transcript.partial."""
+    """B2: while a segment is streamed in, transcript.partial events arrive."""
     cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, streaming=True,
                               wake_word_enabled=False,
                               stt_partial=True, stt_partial_min_interval_ms=0,
@@ -175,7 +176,7 @@ def test_streamed_input_emits_partial_transcripts():
             ws = await client.ws_connect("/ws")
             await ws.receive_json()  # hello
             await ws.send_json({"type": "segment.stream.start", "segmentId": "p1"})
-            # 0.5s Audio → genug "neues" Audio für ein Partial.
+            # 0.5s audio → enough "new" audio for a partial.
             await ws.send_bytes(np.zeros(SAMPLE_RATE // 2, dtype=np.float32).tobytes())
             partial, seen, _ = await _drain_until(ws, "transcript.partial")
             assert partial is not None, f"kein transcript.partial; gesehen: {seen}"
@@ -189,7 +190,7 @@ def test_streamed_input_emits_partial_transcripts():
 
 
 def test_streamed_input_abort_discards_buffer():
-    """segment.stream.abort verwirft das Segment — kein transcript/reply."""
+    """segment.stream.abort discards the segment — no transcript/reply."""
     _configure_audio()
 
     async def run():
@@ -199,7 +200,7 @@ def test_streamed_input_abort_discards_buffer():
             await ws.send_json({"type": "segment.stream.start", "segmentId": "s9"})
             await ws.send_bytes(np.zeros(SAMPLE_RATE // 2, dtype=np.float32).tobytes())
             await ws.send_json({"type": "segment.stream.abort"})
-            # Danach ein ping → ack muss kommen, aber KEIN transcript davor.
+            # Then a ping → ack must arrive, but NO transcript before it.
             await ws.send_json({"type": "ping", "ts": 1})
             ack, seen, _ = await _drain_until(ws, "ack")
             assert ack is not None
@@ -210,7 +211,7 @@ def test_streamed_input_abort_discards_buffer():
 
 
 class _ScriptedSTT:
-    """Liefert vordefinierte Transkripte in Reihenfolge (für Wake-Word-Tests)."""
+    """Returns predefined transcripts in order (for wake-word tests)."""
     last_no_speech_prob = None
 
     def __init__(self, texts):
@@ -227,7 +228,7 @@ class _ScriptedSTT:
 
 
 def _configure_wake(texts, reply="Klar.", *, enabled=True):
-    # `enabled` = Start-Default des Wake-Modus (entspricht WAKE_WORD_ENABLED).
+    # `enabled` = start default of the wake mode (corresponds to WAKE_WORD_ENABLED).
     cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, streaming=False,
                               wake_word_enabled=enabled, wake_word="antonia",
                               wake_word_window_s=30.0)
@@ -268,7 +269,7 @@ def test_wake_gate_accepts_and_strips_wake_word():
             await _send_voice(ws, "g1")
             commit, seen, _ = await _drain_until(ws, "turn.commit")
             assert commit is not None, f"kein turn.commit; gesehen: {seen}"
-            assert commit["text"] == "wie spät ist es?"   # Wake-Word abgeschnitten
+            assert commit["text"] == "wie spät ist es?"   # wake word stripped
             reply, _, _ = await _drain_until(ws, "reply")
             assert reply["text"] == "Es ist drei."
             await ws.close()
@@ -277,7 +278,7 @@ def test_wake_gate_accepts_and_strips_wake_word():
 
 
 def test_wake_followup_within_window_bypasses_gate():
-    # 1. Segment mit Wake-Word → öffnet Fenster; 2. ohne Wake-Word → akzeptiert.
+    # 1. segment with wake word → opens window; 2. without wake word → accepted.
     _configure_wake(["Antonia, hallo.", "Und wie geht es dir?"])
 
     async def run():
@@ -288,7 +289,7 @@ def test_wake_followup_within_window_bypasses_gate():
             await _send_voice(ws, "g1")
             r1, _, _ = await _drain_until(ws, "reply")
             assert r1 is not None
-            # Folgefrage ohne Wake-Word — im offenen Fenster.
+            # Follow-up question without wake word — within the open window.
             await ws.send_json({"type": "segment.start", "segmentId": "g2"})
             await _send_voice(ws, "g2")
             commit, seen, _ = await _drain_until(ws, "turn.commit")
@@ -301,7 +302,7 @@ def test_wake_followup_within_window_bypasses_gate():
 
 
 def test_wake_default_off_no_gate():
-    # Start-Default AUS → Segment ohne Wake-Word geht trotzdem durch (kein Gate).
+    # Start default OFF → segment without wake word still passes (no gate).
     _configure_wake(["Wie spät ist es?"], reply="Es ist drei.", enabled=False)
 
     async def run():
@@ -309,7 +310,7 @@ def test_wake_default_off_no_gate():
             ws = await client.ws_connect("/ws")
             hello = await ws.receive_json()
             assert hello["wakeWord"]["available"] is True
-            assert hello["wakeWord"]["enabled"] is False     # Start-Default
+            assert hello["wakeWord"]["enabled"] is False     # start default
             await ws.send_json({"type": "segment.start", "segmentId": "g1"})
             await _send_voice(ws, "g1")
             reply, seen, _ = await _drain_until(ws, "reply")
@@ -321,8 +322,8 @@ def test_wake_default_off_no_gate():
 
 
 def test_wake_mode_toggled_on_via_settings_gates():
-    # Default AUS; Client schaltet Wake-Modus per 'settings' an → jetzt wird
-    # ein Segment ohne Wake-Word verworfen.
+    # Default OFF; client turns on wake mode via 'settings' → now a segment
+    # without a wake word is discarded.
     _configure_wake(["Wie spät ist es?"], enabled=False)
 
     async def run():
@@ -343,9 +344,9 @@ def test_wake_mode_toggled_on_via_settings_gates():
 
 
 def test_wake_disable_closes_conversation_window():
-    # Wake an → Wake-Wort öffnet Fenster; Wake aus schließt es (wake_until=0).
-    # Nach erneutem Einschalten ist das Fenster zu → Folgesegment ohne Wake-Wort
-    # wird wieder verworfen (Fenster wurde nicht über das Aus hinweg gehalten).
+    # Wake on → wake word opens window; wake off closes it (wake_until=0).
+    # After re-enabling, the window is closed → follow-up segment without a wake
+    # word is discarded again (the window was not kept across the off).
     _configure_wake(["Antonia, hallo.", "Wie geht es?"], enabled=False)
 
     async def run():
@@ -356,8 +357,8 @@ def test_wake_disable_closes_conversation_window():
             await _drain_until(ws, "settings.ack")
             await ws.send_json({"type": "segment.start", "segmentId": "g1"})
             await _send_voice(ws, "g1")
-            await _drain_until(ws, "reply")            # öffnet das Fenster
-            # Aus und wieder an → Fenster muss geschlossen bleiben.
+            await _drain_until(ws, "reply")            # opens the window
+            # Off and on again → window must stay closed.
             await ws.send_json({"type": "settings", "wakeWordEnabled": False})
             await _drain_until(ws, "settings.ack")
             await ws.send_json({"type": "settings", "wakeWordEnabled": True})
@@ -372,17 +373,17 @@ def test_wake_disable_closes_conversation_window():
 
 
 def test_partial_emits_wake_detected_once():
-    # Früh-Pling: das Weckwort im (gestreamten) Partial löst genau EIN
-    # wake.detected pro Segment aus — auch bei mehreren Partials.
+    # Early cue: the wake word in the (streamed) partial triggers exactly ONE
+    # wake.detected per segment — even with multiple partials.
     _configure_wake(["Antonia hallo"], enabled=False)
 
     async def run():
         state = TurnState()
-        state.wake_word_enabled = True        # Wake-Modus aktiv, Fenster zu
+        state.wake_word_enabled = True        # wake mode active, window closed
         ws = _CollectWS()
         seg = {"id": "s1", "done": False}
         await srv._do_partial(ws, state, seg, b"")
-        await srv._do_partial(ws, state, seg, b"")   # zweites Partial, gleiches Segment
+        await srv._do_partial(ws, state, seg, b"")   # second partial, same segment
         types = [m["type"] for m in ws.sent]
         assert types.count("wake.detected") == 1, types
 
@@ -394,7 +395,7 @@ def test_partial_no_wake_detected_when_mode_off():
 
     async def run():
         state = TurnState()
-        state.wake_word_enabled = False       # kein Wake-Modus → kein Pling
+        state.wake_word_enabled = False       # no wake mode → no cue
         ws = _CollectWS()
         await srv._do_partial(ws, state, {"id": "s1", "done": False}, b"")
         assert "wake.detected" not in [m["type"] for m in ws.sent]
@@ -403,7 +404,7 @@ def test_partial_no_wake_detected_when_mode_off():
 
 
 def test_wake_accept_emits_detected_and_window():
-    # Akzeptiertes Weckwort-Segment → wake.detected (Pling) + wake.window (Timer).
+    # Accepted wake-word segment → wake.detected (cue) + wake.window (timer).
     _configure_wake(["Antonia, wie spät ist es?"], reply="Es ist drei.")
 
     async def run():
@@ -423,8 +424,8 @@ def test_wake_accept_emits_detected_and_window():
 
 
 def test_wake_followup_refreshes_window_without_redetect():
-    # 1. Weckwort-Turn (detected+window). 2. Folgefrage im Fenster: window wird
-    # aufgefrischt, aber KEIN erneutes wake.detected (kein Weckwort nötig).
+    # 1. wake-word turn (detected+window). 2. follow-up question in the window:
+    # window is refreshed, but NO new wake.detected (no wake word needed).
     _configure_wake(["Antonia, hallo.", "Wie geht es?"])
 
     async def run():
@@ -440,16 +441,16 @@ def test_wake_followup_refreshes_window_without_redetect():
             await _send_voice(ws, "g2")
             commit, seen2, _ = await _drain_until(ws, "turn.commit")
             assert commit is not None, f"Folgefrage verworfen; gesehen: {seen2}"
-            assert "wake.window" in seen2, seen2        # Fenster aufgefrischt
-            assert "wake.detected" not in seen2, seen2  # kein zweites Pling
+            assert "wake.window" in seen2, seen2        # window refreshed
+            assert "wake.detected" not in seen2, seen2  # no second cue
             await ws.close()
 
     asyncio.run(run())
 
 
 def test_wake_command_window_reason_is_command():
-    # Eingehender Befehl → wake.window mit reason=command (Antwort folgt, der
-    # Client lässt den Idle-Timer NICHT laufen).
+    # Incoming command → wake.window with reason=command (a reply is coming, the
+    # client does NOT run the idle timer).
     _configure_wake(["Antonia, wie spät ist es?"])
 
     async def run():
@@ -469,7 +470,7 @@ def test_wake_command_window_reason_is_command():
 
 
 def test_wake_armed_window_reason_is_armed():
-    # Nur das Weckwort → wake.window mit reason=armed (Antonia wartet → Timer an).
+    # Only the wake word → wake.window with reason=armed (Antonia waits → timer on).
     _configure_wake(["Antonia"])
 
     async def run():
@@ -483,7 +484,7 @@ def test_wake_armed_window_reason_is_armed():
             win, seen, _ = await _drain_until(ws, "wake.window")
             assert win is not None, f"kein wake.window; gesehen: {seen}"
             assert win["reason"] == "armed"
-            armed, _, _ = await _drain_until(ws, "wake.armed")  # folgt direkt danach
+            armed, _, _ = await _drain_until(ws, "wake.armed")  # follows right after
             assert armed is not None
             await ws.close()
 
@@ -491,7 +492,7 @@ def test_wake_armed_window_reason_is_armed():
 
 
 def test_stop_command_closes_window():
-    # Im offenen Fenster beendet „stop" das Fenster (wake.closed, kein Turn).
+    # In the open window, "stop" ends the window (wake.closed, no turn).
     _configure_wake(["Antonia, erzähl was.", "stop"])
 
     async def run():
@@ -502,9 +503,9 @@ def test_stop_command_closes_window():
             await _drain_until(ws, "settings.ack")
             await ws.send_json({"type": "segment.start", "segmentId": "g1"})
             await _send_voice(ws, "g1")
-            await _drain_until(ws, "reply")          # Fenster ist nun offen
+            await _drain_until(ws, "reply")          # window is now open
             await ws.send_json({"type": "segment.start", "segmentId": "g2"})
-            await _send_voice(ws, "g2")              # „stop"
+            await _send_voice(ws, "g2")              # "stop"
             ev, seen, _ = await _drain_until(ws, "wake.closed")
             assert ev is not None, f"kein wake.closed; gesehen: {seen}"
             assert ev["reason"] == "stop_command"
@@ -515,18 +516,18 @@ def test_stop_command_closes_window():
 
 
 def test_wake_followup_accepted_if_speech_started_in_window():
-    # Race: Fenster läuft zwischen Sprech-Beginn und Commit/STT ab. Wer im noch
-    # offenen Fenster zu sprechen begann, muss trotzdem durchkommen.
+    # Race: window lapses between speech start and commit/STT. Whoever began
+    # speaking while the window was still open must still pass through.
     import time as _t
     _configure_wake(["Wie geht es?"], enabled=False)
 
     async def run():
         state = TurnState(); state.wake_word_enabled = True
         ws = _CollectWS()
-        state.wake_until = _t.time()                    # zum Commit bereits abgelaufen
+        state.wake_until = _t.time()                    # already lapsed at commit
         await srv._handle_audio_segment(
             ws, state, b"\x00\x00\x00\x00", "s1", "peer",
-            speech_start_ts=_t.time() - 1.0)            # Sprech-Beginn war IM Fenster
+            speech_start_ts=_t.time() - 1.0)            # speech start was IN the window
         if state.debounce_task:
             state.debounce_task.cancel()
         types = [m.get("type") for m in ws.sent]
@@ -543,10 +544,10 @@ def test_wake_followup_rejected_if_speech_started_after_window():
     async def run():
         state = TurnState(); state.wake_word_enabled = True
         ws = _CollectWS()
-        state.wake_until = _t.time()                    # abgelaufen
+        state.wake_until = _t.time()                    # lapsed
         await srv._handle_audio_segment(
             ws, state, b"\x00\x00\x00\x00", "s1", "peer",
-            speech_start_ts=None)                       # → Commit-Zeit, nach Ablauf
+            speech_start_ts=None)                       # → commit time, after lapse
         if state.debounce_task:
             state.debounce_task.cancel()
         types = [m.get("type") for m in ws.sent]
@@ -557,9 +558,9 @@ def test_wake_followup_rejected_if_speech_started_after_window():
 
 
 def test_barge_in_while_playing_keeps_window_open():
-    # Unterbricht man eine laufende Wiedergabe (barge_in playing=true), bleibt das
-    # Wake-Fenster offen → die unterbrechende Eingabe wird NICHT als „kein
-    # Weckwort" verworfen.
+    # If you interrupt an ongoing playback (barge_in playing=true), the wake
+    # window stays open → the interrupting input is NOT discarded as "no wake
+    # word".
     _configure_wake(["Wie geht es?"], enabled=False)
 
     async def run():
@@ -572,7 +573,7 @@ def test_barge_in_while_playing_keeps_window_open():
             win, _, _ = await _drain_until(ws, "wake.window")
             assert win is not None and win["reason"] == "command"
             await ws.send_json({"type": "segment.start", "segmentId": "g1"})
-            await _send_voice(ws, "g1")          # ohne Weckwort
+            await _send_voice(ws, "g1")          # without wake word
             commit, seen, _ = await _drain_until(ws, "turn.commit")
             assert commit is not None, f"Unterbrechung verworfen; gesehen: {seen}"
             assert "transcript.ignored" not in seen
@@ -582,8 +583,8 @@ def test_barge_in_while_playing_keeps_window_open():
 
 
 def test_barge_in_without_playing_does_not_open_window():
-    # Bloßes Geräusch ohne laufende Antwort darf das Fenster NICHT öffnen
-    # (sonst wäre das Gate dauerhaft offen).
+    # Mere noise without an ongoing reply must NOT open the window
+    # (otherwise the gate would be permanently open).
     _configure_wake(["Wie geht es?"], enabled=False)
 
     async def run():
@@ -594,7 +595,7 @@ def test_barge_in_without_playing_does_not_open_window():
             await _drain_until(ws, "settings.ack")
             await ws.send_json({"type": "barge_in", "reason": "vad-speech", "playing": False})
             await ws.send_json({"type": "segment.start", "segmentId": "g1"})
-            await _send_voice(ws, "g1")          # ohne Weckwort
+            await _send_voice(ws, "g1")          # without wake word
             ev, seen, _ = await _drain_until(ws, "transcript.ignored")
             assert ev is not None, f"sollte verworfen werden; gesehen: {seen}"
             await ws.close()

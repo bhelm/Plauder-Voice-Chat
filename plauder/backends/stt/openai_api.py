@@ -1,7 +1,7 @@
-"""STT-Backend: OpenAI Whisper API (whisper-1).
+"""STT backend: OpenAI Whisper API (whisper-1).
 
-Browser liefert 16 kHz float32-PCM; wir packen jedes Segment in ein In-Memory-WAV
-und schicken es an /v1/audio/transcriptions. Keine GPU, kein lokales Modell.
+The browser delivers 16 kHz float32 PCM; we pack each segment into an in-memory
+WAV and send it to /v1/audio/transcriptions. No GPU, no local model.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ class OpenAISTTBackend(STTBackend):
         if not self.api_key:
             from ..base import BackendError
             raise BackendError(
-                "OpenAI-STT braucht einen API-Key (STT_OPENAI_API_KEY / OPENAI_API_KEY).")
-        from openai import OpenAI  # cloud SDK, kein GPU-Dep
+                "OpenAI STT needs an API key (STT_OPENAI_API_KEY / OPENAI_API_KEY).")
+        from openai import OpenAI  # cloud SDK, no GPU dep
         kwargs = {"api_key": self.api_key}
         if self.base_url:
             kwargs["base_url"] = self.base_url
@@ -64,17 +64,17 @@ class OpenAISTTBackend(STTBackend):
         samples = audio_utils.pcm_bytes_to_float32_array(audio_pcm)
         wav_bytes = audio_utils.float32_to_pcm16_wav_bytes(samples, sample_rate)
         buf = io.BytesIO(wav_bytes)
-        buf.name = "audio.wav"  # OpenAI leitet das Format aus dem Namen ab
+        buf.name = "audio.wav"  # OpenAI infers the format from the name
         req = {"model": self.model, "file": buf, "response_format": "json"}
         if self.language:
             req["language"] = self.language
         resp = self._client.audio.transcriptions.create(**req)
-        # OpenAI liefert kein no_speech_prob.
+        # OpenAI does not provide no_speech_prob.
         self.last_no_speech_prob = None
         return (getattr(resp, "text", None) or "").strip()
 
     async def transcribe(self, audio_pcm: bytes, sample_rate: int) -> str:
         if self._client is None:
-            raise RuntimeError("STT nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("STT not initialized (load() did not run)")
         async with self._lock:
             return await asyncio.to_thread(self._transcribe_sync, audio_pcm, sample_rate)

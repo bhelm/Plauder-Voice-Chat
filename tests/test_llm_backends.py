@@ -1,4 +1,4 @@
-"""LLM-Backends (openai_compat + openclaw), gemockt — keine echten HTTP-Calls."""
+"""LLM backends (openai_compat + openclaw), mocked — no real HTTP calls."""
 import asyncio
 
 import pytest
@@ -169,7 +169,7 @@ def test_openclaw_upstream_timeout():
 
 # --- Streaming (chat_stream, SSE) -------------------------------------------
 class _FakeContent:
-    """Async-iterierbarer SSE-Body: liefert Zeilen als bytes (wie aiohttp)."""
+    """Async-iterable SSE body: yields lines as bytes (like aiohttp)."""
     def __init__(self, lines):
         self._lines = [(l + "\n").encode("utf-8") for l in lines]
 

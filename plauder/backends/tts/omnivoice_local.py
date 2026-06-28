@@ -1,10 +1,10 @@
-"""TTS-Backend: OmniVoice (lokal, GPU, k2-fsa/OmniVoice).
+"""TTS backend: OmniVoice (local, GPU, k2-fsa/OmniVoice).
 
-KRITISCH: ``omnivoice``/``torch`` werden NUR in load() importiert — niemals auf
-Modul-Ebene. Wenn TTS_BACKEND≠omnivoice_local, wird dieses Modul nicht importiert.
+CRITICAL: ``omnivoice``/``torch`` are imported ONLY in load() — never at module
+level. If TTS_BACKEND≠omnivoice_local, this module is not imported.
 
-OmniVoice liefert float32-Samples @24 kHz; wir wandeln sie in 16-bit-PCM-Bytes,
-um dem TTSBackend-Kontrakt (pcm_bytes, sample_rate) zu genügen.
+OmniVoice returns float32 samples @24 kHz; we convert them to 16-bit PCM bytes
+to satisfy the TTSBackend contract (pcm_bytes, sample_rate).
 """
 
 from __future__ import annotations
@@ -51,12 +51,12 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
 
     async def load(self) -> None:
         try:
-            from omnivoice import OmniVoice  # lazy! GPU-Dep
+            from omnivoice import OmniVoice  # lazy! GPU dep
         except ImportError as exc:
             from ..base import BackendError
             raise BackendError(
-                "TTS_BACKEND=omnivoice_local, aber omnivoice ist nicht installiert. "
-                "GPU-Setup nötig, oder TTS_BACKEND=openai verwenden."
+                "TTS_BACKEND=omnivoice_local, but omnivoice is not installed. "
+                "GPU setup required, or use TTS_BACKEND=openai."
             ) from exc
 
         def _build():
@@ -82,7 +82,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
         }
 
     def _synth_one(self, text: str, speed: float) -> np.ndarray:
-        # OmniVoice-API: generate(text, ...) -> (np.float32, sample_rate)
+        # OmniVoice API: generate(text, ...) -> (np.float32, sample_rate)
         out = self._tts.generate(
             text,
             mode=self.mode,
@@ -116,7 +116,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
 
     async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
         if self._tts is None:
-            raise RuntimeError("TTS nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("TTS not initialized (load() did not run)")
         async with self._lock:
             pcm = await asyncio.to_thread(self._synth_sync, text, speed)
         return pcm, self.sample_rate

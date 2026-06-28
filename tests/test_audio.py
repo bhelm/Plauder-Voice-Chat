@@ -1,4 +1,4 @@
-"""Audio-Utilities: PCM/WAV-Konvertierung, Frame-Wrapping, TTS-Chunking."""
+"""Audio utilities: PCM/WAV conversion, frame wrapping, TTS chunking."""
 import numpy as np
 
 from plauder import audio
@@ -59,7 +59,7 @@ def test_split_text_splits_long_text():
 
 def test_split_text_merges_short_sentences():
     out = audio.split_text_for_tts("Ja. Nein. Vielleicht.", 200)
-    # Kurze Sätze werden zu einem Stück zusammengefasst.
+    # Short sentences get merged into a single chunk.
     assert out == ["Ja. Nein. Vielleicht."]
 
 
@@ -76,10 +76,10 @@ def test_wrap_pcm_chunk_header():
 
 
 def test_iter_pcm_frames_even_sizes_and_coverage():
-    pcm = bytes(range(20))           # 20 Bytes
-    frames = list(audio.iter_pcm_frames(pcm, 7))   # 7 ist ungerade → wird zu 6
+    pcm = bytes(range(20))           # 20 bytes
+    frames = list(audio.iter_pcm_frames(pcm, 7))   # 7 is odd → becomes 6
     assert all(len(f) % 2 == 0 for f in frames)
-    assert b"".join(frames) == pcm   # verlustfrei
+    assert b"".join(frames) == pcm   # lossless
 
 
 def test_iter_pcm_frames_single_when_frame_large():
@@ -87,7 +87,7 @@ def test_iter_pcm_frames_single_when_frame_large():
     assert list(audio.iter_pcm_frames(pcm, 1000)) == [pcm]
 
 
-# --- Streaming-Satz-Splitter ------------------------------------------------
+# --- Streaming sentence splitter --------------------------------------------
 def test_split_stream_emits_complete_sentences_keeps_tail():
     sents, rest = audio.split_stream_sentences("Hallo Welt. Wie geht es dir", 200)
     assert sents == ["Hallo Welt."]
@@ -95,7 +95,7 @@ def test_split_stream_emits_complete_sentences_keeps_tail():
 
 
 def test_split_stream_holds_incomplete_sentence():
-    # Kein Satzzeichen + Whitespace am Ende → nichts flushen, alles im Rest.
+    # No punctuation + whitespace at the end → flush nothing, all in the rest.
     sents, rest = audio.split_stream_sentences("Noch kein Satzende", 200)
     assert sents == []
     assert rest == "Noch kein Satzende"

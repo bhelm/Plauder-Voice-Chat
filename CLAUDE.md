@@ -6,7 +6,19 @@ Browser speech-to-speech chat: mic → STT → LLM → TTS → speaker, with tur
 (debounce/coalescing), barge-in, low-latency streaming, and a wake word. The
 server is a `plauder/` package with **pluggable STT/TTS/LLM backends** chosen
 entirely via `.env` (no code changes). Comments, docs, and `.env.example` are in
-German — match that when editing.
+English — match that when editing.
+
+**Language / i18n.** `APP_LANGUAGE` (`en`/`de`, default `en`) is the single
+language switch. It drives the assistant's default spoken language (the
+`_DEFAULT_VOICE_HINTS` entry in `config.py`) and the STT default language, and it
+is the UI locale handed to the browser. The client (`static/index.html`) is i18n
+with an in-file `I18N = { en, de }` dictionary plus a tiny `t()` /
+`applyI18n()` layer; UI text lives under `data-i18n*` attributes or `t('key')`
+calls — never hard-code user-facing strings. The server injects the language at
+serve time by replacing the `__APP_LANG__` placeholder in `index.html` (so the
+page renders in the right locale with no flash) and also advertises it as
+`hello.lang`. When adding UI strings, add a key to **both** `I18N.en` and
+`I18N.de`.
 
 ## Commands
 

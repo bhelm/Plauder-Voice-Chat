@@ -1,8 +1,8 @@
-"""TTS-Backend: OpenAI TTS (tts-1 / tts-1-hd, Cloud).
+"""TTS backend: OpenAI TTS (tts-1 / tts-1-hd, cloud).
 
-Liefert raw PCM (16-bit signed LE, mono) bei response_format="pcm". Die
-Sample-Rate ist fix 24 kHz. Optionales satzweises Splitting (gegen niedrige
-Erst-Latenz) wird hier umgesetzt.
+Returns raw PCM (16-bit signed LE, mono) with response_format="pcm". The
+sample rate is fixed at 24 kHz. Optional sentence-wise splitting (to reduce
+first-audio latency) is implemented here.
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ class OpenAITTSBackend(TTSBackend):
         self.max_chars = max_chars
         self.gap_ms = gap_ms
         self.sample_rate = sample_rate
-        # local_speed=True: `speed` wird NICHT an den Server geschickt, sondern
-        # lokal per tonhöhen-erhaltender Zeitdehnung umgesetzt — für Server, die
-        # den OpenAI-`speed`-Parameter ignorieren (z.B. lokales XTTS).
+        # local_speed=True: `speed` is NOT sent to the server, but applied
+        # locally via pitch-preserving time stretching — for servers that
+        # ignore the OpenAI `speed` parameter (e.g. local XTTS).
         self.local_speed = local_speed
         self._client = None
         self._lock = asyncio.Lock()
@@ -55,7 +55,7 @@ class OpenAITTSBackend(TTSBackend):
         if not self.api_key:
             from ..base import BackendError
             raise BackendError(
-                "OpenAI-TTS braucht einen API-Key (TTS_OPENAI_API_KEY / OPENAI_API_KEY).")
+                "OpenAI TTS needs an API key (TTS_OPENAI_API_KEY / OPENAI_API_KEY).")
         from openai import OpenAI
         kwargs = {"api_key": self.api_key}
         if self.base_url:
@@ -85,8 +85,8 @@ class OpenAITTSBackend(TTSBackend):
         return max(0.25, min(4.0, s))
 
     def _synth_one(self, text: str, speed: float) -> np.ndarray:
-        # Bei local_speed das Tempo lokal (in _synth_sync) anwenden → Server mit
-        # speed=1.0 ansprechen, sonst würde es doppelt wirken (bzw. ignoriert).
+        # With local_speed, apply the tempo locally (in _synth_sync) → call the
+        # server with speed=1.0, otherwise it would apply twice (or be ignored).
         api_speed = 1.0 if self.local_speed else self._clamp_speed(speed)
         resp = self._client.audio.speech.create(
             model=self.model,
@@ -114,18 +114,18 @@ class OpenAITTSBackend(TTSBackend):
                     if gap.size and i < len(pieces) - 1:
                         parts.append(gap)
                 samples = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
-        # local_speed: Tempo tonhöhen-erhaltend lokal umsetzen (Server ignoriert speed).
+        # local_speed: apply tempo locally, pitch-preserving (server ignores speed).
         if self.local_speed:
             rate = self._clamp_speed(speed)
             if abs(rate - 1.0) > 1e-3:
                 samples = audio_utils.time_stretch(samples, rate, self.sample_rate)
-        # float32 [-1,1] → int16-PCM-Bytes
+        # float32 [-1,1] → int16 PCM bytes
         clipped = np.clip(samples, -1.0, 1.0)
         return (clipped * 32767.0).astype(np.int16).tobytes()
 
     async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
         if self._client is None:
-            raise RuntimeError("TTS nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("TTS not initialized (load() did not run)")
         async with self._lock:
             pcm = await asyncio.to_thread(self._synth_sync, text, speed)
         return pcm, self.sample_rate

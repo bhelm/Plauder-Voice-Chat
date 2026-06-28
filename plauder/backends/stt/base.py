@@ -1,4 +1,4 @@
-"""STT-Backend-Abstraktion."""
+"""STT backend abstraction."""
 
 from __future__ import annotations
 
@@ -6,35 +6,35 @@ import abc
 
 
 class STTBackend(abc.ABC):
-    """Spracherkennung. Implementierungen importieren schwere Deps (faster_whisper,
-    torch) NUR lazy in load()/__init__, niemals auf Modul-Ebene.
+    """Speech recognition. Implementations import heavy deps (faster_whisper,
+    torch) ONLY lazily in load()/__init__, never at module level.
     """
 
-    #: no_speech_prob des zuletzt transkribierten Segments (None, wenn das
-    #: Backend keins liefert — z.B. OpenAI). Direkt nach ``await transcribe()``
-    #: lesen (race-frei dank kooperativem Scheduling).
+    #: no_speech_prob of the most recently transcribed segment (None if the
+    #: backend does not provide one — e.g. OpenAI). Read directly after
+    #: ``await transcribe()`` (race-free thanks to cooperative scheduling).
     last_no_speech_prob: float | None = None
 
     @abc.abstractmethod
     async def load(self) -> None:
-        """Initialisiert das Backend (Client/Modell laden)."""
+        """Initializes the backend (load client/model)."""
 
     @abc.abstractmethod
     async def transcribe(self, audio_pcm: bytes, sample_rate: int) -> str:
-        """Transkribiert rohe float32-PCM-Bytes (Browser-Format) zu Text."""
+        """Transcribes raw float32 PCM bytes (browser format) to text."""
 
     @property
     def loaded(self) -> bool:  # pragma: no cover - trivial default
         return True
 
     def describe(self) -> dict:
-        """Healthz-Info für dieses Backend."""
+        """Healthz info for this backend."""
         return {"engine": self.__class__.__name__}
 
     @staticmethod
     def from_config(cfg) -> "STTBackend":
-        """Factory: wählt anhand von cfg.stt_backend. Importiert NUR das
-        gewählte Backend-Modul (lazy)."""
+        """Factory: selects based on cfg.stt_backend. Imports ONLY the
+        chosen backend module (lazily)."""
         name = cfg.stt_backend
         if name == "openai":
             from .openai_api import OpenAISTTBackend
@@ -43,4 +43,4 @@ class STTBackend(abc.ABC):
             from .whisper_local import WhisperLocalSTTBackend
             return WhisperLocalSTTBackend.from_config(cfg)
         from ..base import BackendError
-        raise BackendError(f"Unbekanntes STT_BACKEND: {name!r}")
+        raise BackendError(f"Unknown STT_BACKEND: {name!r}")

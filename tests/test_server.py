@@ -1,4 +1,4 @@
-"""HTTP-Routen, /healthz und WebSocket-Handler — mit Mock-Backends."""
+"""HTTP routes, /healthz and WebSocket handler — with mock backends."""
 import asyncio
 import dataclasses
 
@@ -47,7 +47,7 @@ class FakeLLM:
 
 
 class StreamingFakeLLM:
-    """Fake mit echtem chat_stream (mehrere Deltas)."""
+    """Fake with a real chat_stream (multiple deltas)."""
     loaded = True
 
     def __init__(self, deltas):
@@ -95,7 +95,7 @@ def test_ws_streaming_multi_sentence_pipelines_audio():
 
 
 def test_ws_streaming_no_reply_across_deltas_is_silent():
-    # NO_REPLY über mehrere Deltas verteilt → kein Audio, reply.silent.
+    # NO_REPLY spread across multiple deltas → no audio, reply.silent.
     _configure_streaming_llm(["NO_", "REPLY"])
 
     async def run():
@@ -106,7 +106,7 @@ def test_ws_streaming_no_reply_across_deltas_is_silent():
             silent, seen, _ = await _drain_until(ws, "reply.silent")
             assert silent is not None, f"kein reply.silent; gesehen: {seen}"
             assert silent["reason"] == "no_reply"
-            assert "audio.start" not in seen   # keine Sprachausgabe für NO_REPLY
+            assert "audio.start" not in seen   # no speech output for NO_REPLY
             await ws.close()
 
     asyncio.run(run())
@@ -114,7 +114,7 @@ def test_ws_streaming_no_reply_across_deltas_is_silent():
 
 def _configure(reply="Hallo, ich bin Antonia."):
     cfg = Config.from_env()
-    cfg = dataclasses.replace(cfg, debounce_ms=30)  # schnelle Tests
+    cfg = dataclasses.replace(cfg, debounce_ms=30)  # fast tests
     conv = ConversationManager(FakeLLM(reply), system_prompt="sys")
     srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
                   ghost=HallucinationFilter(enabled=False))
@@ -122,8 +122,8 @@ def _configure(reply="Hallo, ich bin Antonia."):
 
 
 async def _drain_until(ws, want_type, *, timeout=3.0):
-    """Liest WS-Frames, bis ein JSON-Frame mit type==want_type kommt.
-    Sammelt alle gesehenen Typen + ggf. erstes Binary."""
+    """Reads WS frames until a JSON frame with type==want_type arrives.
+    Collects all seen types + the first binary, if any."""
     seen = []
     binary = None
     loop = asyncio.get_event_loop()
@@ -206,7 +206,7 @@ def test_ws_text_message_full_pipeline():
             assert "turn.commit" in seen
             assert "reply.start" in seen
             assert "reply.delta" in seen
-            # Streaming-TTS: audio.start + ≥1 PCM-Chunk (VCT2-Binary) + audio.end
+            # Streaming TTS: audio.start + ≥1 PCM chunk (VCT2 binary) + audio.end
             end, seen2, binary2 = await _drain_until(ws, "audio.end")
             assert end is not None, f"kein audio.end; gesehen: {seen2}"
             assert "audio.start" in seen + seen2
@@ -220,7 +220,7 @@ def test_ws_text_message_full_pipeline():
 
 
 def test_ws_text_message_non_streaming_fallback():
-    """STREAMING=0: klassischer Pfad — audio.meta + ein VCT1-WAV-Frame."""
+    """STREAMING=0: classic path — audio.meta + one VCT1 WAV frame."""
     cfg = Config.from_env()
     cfg = dataclasses.replace(cfg, debounce_ms=30, streaming=False)
     conv = ConversationManager(FakeLLM("Hallo da."), system_prompt="sys")
@@ -236,7 +236,7 @@ def test_ws_text_message_non_streaming_fallback():
             assert meta is not None, f"kein audio.meta; gesehen: {seen}"
             assert "reply" in seen
             assert meta.get("framed") is True
-            # WAV-Frame (VCT1) folgt nach audio.meta
+            # WAV frame (VCT1) follows after audio.meta
             _, _, binary2 = await _drain_until(ws, "__never__", timeout=1.0)
             wav = binary or binary2
             assert wav is not None and wav[:4] == b"VCT1"

@@ -1,8 +1,8 @@
-"""Text-Sanitizer: Emoji/Markdown raus, nonverbale Tags normalisieren,
-Aussprache-Lexikon, NO_REPLY-Erkennung, Whisper-Halluzinations-Filter und
-Transkript-Merging.
+"""Text sanitizer: strip emoji/markdown, normalize nonverbal tags,
+pronunciation lexicon, NO_REPLY detection, Whisper hallucination filter and
+transcript merging.
 
-Reine Textverarbeitung — keine Netzwerk-/Backend-Abhängigkeiten.
+Pure text processing — no network/backend dependencies.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ _MULTI_SPACE = re.compile(r"[ \t]{2,}")
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
 
 # --------------------------------------------------------------------------- #
-# Non-verbale Tags (OmniVoice-Whitelist + deutsche Aliase)
+# Nonverbal tags (OmniVoice whitelist + German aliases)
 # --------------------------------------------------------------------------- #
 _NONVERBAL_TAGS = {
     "laughter", "sigh", "confirmation-en", "question-en", "question-ah",
@@ -64,7 +64,7 @@ def normalize_nonverbal_tags(text: str) -> str:
             return f"[{inner}]"
         if inner in _NONVERBAL_ALIASES:
             return f"[{_NONVERBAL_ALIASES[inner]}]"
-        return ""  # unbekannter Pseudo-Tag → nicht vorlesen
+        return ""  # unknown pseudo-tag → do not read aloud
 
     text = _BRACKET_TAG_RE.sub(_square, text)
 
@@ -80,13 +80,13 @@ def normalize_nonverbal_tags(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Aussprache-Lexikon
+# Pronunciation lexicon
 # --------------------------------------------------------------------------- #
 _pron_cache: dict = {"path": None, "mtime": None, "rules": []}
 
 
 def load_pronunciations(path: str | None):
-    """Lädt das Aussprache-Lexikon (JSON {wort: ersatz}). Cacht nach mtime."""
+    """Loads the pronunciation lexicon (JSON {word: replacement}). Cached by mtime."""
     if not path:
         return []
     try:
@@ -109,12 +109,12 @@ def load_pronunciations(path: str | None):
 
 
 def sanitize_for_tts(text: str, *, pronunciations_file: str | None = None) -> str:
-    """Macht LLM-Text TTS-tauglich: Code/Links/Markdown/Emojis raus, nonverbale
-    Tags normalisiert, Aussprache-Korrekturen, Whitespace normalisiert.
+    """Makes LLM text TTS-suitable: strip code/links/markdown/emoji, normalize
+    nonverbal tags, pronunciation corrections, normalize whitespace.
     """
     if not text:
         return text
-    text = _MD_CODE_FENCE.sub(" (Code-Block weggelassen) ", text)
+    text = _MD_CODE_FENCE.sub(" (code block omitted) ", text)
     text = _MD_INLINE_CODE.sub(lambda m: m.group(1), text)
     text = _MD_LINK.sub(lambda m: m.group(1), text)
     text = re.sub(r"[\U0001F602\U0001F923]+", " [laughter] ", text)
@@ -132,7 +132,7 @@ def sanitize_for_tts(text: str, *, pronunciations_file: str | None = None) -> st
 
 
 # --------------------------------------------------------------------------- #
-# NO_REPLY-Erkennung
+# NO_REPLY detection
 # --------------------------------------------------------------------------- #
 NO_REPLY_TOKEN = "NO_REPLY"
 _NO_REPLY_RE = re.compile(
@@ -145,7 +145,7 @@ _OPENCLAW_FALLBACK_RE = re.compile(
 
 
 def is_no_reply(text: str) -> bool:
-    """True, wenn der LLM-Output als „keine Antwort“ zu werten ist."""
+    """True if the LLM output is to be treated as 'no reply'."""
     if text is None:
         return False
     t = text.strip()
@@ -159,7 +159,7 @@ def is_no_reply(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Whisper-Halluzinations-Filter ("Thank you"-Geister)
+# Whisper hallucination filter ("Thank you" ghosts)
 # --------------------------------------------------------------------------- #
 def normalize_ghost(text: str) -> str:
     t = (text or "").strip().lower()
@@ -187,9 +187,9 @@ _GHOST_PHRASES_BASE = {
 
 
 class HallucinationFilter:
-    """Verwirft Whisper-Geister-Floskeln. Konservativ: Denylist-Treffer UND
-    (no_speech_prob hoch [ODER optional kurze Audio-Dauer]).
-    Aus Config gebaut, damit es testbar bleibt.
+    """Discards Whisper ghost phrases. Conservative: denylist hit AND
+    (no_speech_prob high [OR optionally short audio duration]).
+    Built from Config so it stays testable.
     """
 
     def __init__(self, *, enabled: bool = True, no_speech_prob_threshold: float = 0.6,
@@ -234,11 +234,11 @@ class HallucinationFilter:
 
 
 # --------------------------------------------------------------------------- #
-# Transkript-Merging
+# Transcript merging
 # --------------------------------------------------------------------------- #
 def merge_transcripts(parts: list[str]) -> str:
-    """Klebt Transkript-Teile zusammen; fügt einen Punkt ein, wenn das
-    Vorgänger-Stück nicht mit Satzzeichen endete.
+    """Glues transcript pieces together; inserts a period when the preceding
+    piece did not end with a punctuation mark.
     """
     pieces = [p.strip() for p in parts if p and p.strip()]
     if not pieces:

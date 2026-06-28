@@ -1,4 +1,4 @@
-"""TTS-Backends (openai + omnivoice_local), gemockt — keine API-Calls, keine GPU."""
+"""TTS backends (openai + omnivoice_local), mocked — no API calls, no GPU."""
 import asyncio
 import sys
 from unittest.mock import MagicMock
@@ -49,7 +49,7 @@ def test_synth_roundtrip_values():
     eng, _ = _openai_with_mock([0, 16384, -16384])
     pcm, _ = asyncio.run(eng.synth("x", speed=1.0))
     out = np.frombuffer(pcm, dtype=np.int16)
-    # Dekodieren (/32768) + Re-Enkodieren (*32767) ist bewusst minimal verlustig.
+    # Decoding (/32768) + re-encoding (*32767) is deliberately minimally lossy.
     assert abs(int(out[1]) - 16384) <= 1
 
 

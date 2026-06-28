@@ -1,7 +1,7 @@
-"""LLM-Backend: OpenAI-kompatibles /chat/completions (Fireworks, OpenAI, …).
+"""LLM backend: OpenAI-compatible /chat/completions (Fireworks, OpenAI, …).
 
-Stateless: bekommt die fertige Nachrichtenliste (Verlauf macht die Session) und
-gibt den Antworttext zurück. Wirft UpstreamTimeoutError bei 408.
+Stateless: receives the finished message list (the Session handles history) and
+returns the reply text. Raises UpstreamTimeoutError on 408.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class OpenAICompatLLMBackend(LLMBackend):
         if not self.api_key:
             from ..base import BackendError
             raise BackendError(
-                "openai_compat braucht einen API-Key (LLM_API_KEY / FIREWORKS_API_KEY).")
+                "openai_compat needs an API key (LLM_API_KEY / FIREWORKS_API_KEY).")
         self._session = ClientSession(timeout=ClientTimeout(total=self.timeout))
 
     async def close(self) -> None:
@@ -61,8 +61,8 @@ class OpenAICompatLLMBackend(LLMBackend):
 
     async def chat(self, messages: list[dict], system_hint: str | None = None) -> str:
         if self._session is None:
-            raise RuntimeError("LLM nicht initialisiert (load() nicht gelaufen)")
-        # base_url endet auf .../v1 → nur Endpoint anhängen (kein /v1/v1).
+            raise RuntimeError("LLM not initialized (load() did not run)")
+        # base_url ends in .../v1 → only append the endpoint (no /v1/v1).
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -96,7 +96,7 @@ class OpenAICompatLLMBackend(LLMBackend):
 
     async def chat_stream(self, messages: list[dict], system_hint: str | None = None):
         if self._session is None:
-            raise RuntimeError("LLM nicht initialisiert (load() nicht gelaufen)")
+            raise RuntimeError("LLM not initialized (load() did not run)")
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",

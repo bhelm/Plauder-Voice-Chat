@@ -1,4 +1,4 @@
-"""Erlaubt ``python -m plauder`` als Server-Start."""
+"""Allows ``python -m plauder`` as a server start."""
 
 from .server import run
 

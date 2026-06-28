@@ -1,7 +1,7 @@
-"""plauder — modularer Voice-Chat-Server mit pluggable STT/TTS/LLM-Backends.
+"""plauder — modular voice-chat server with pluggable STT/TTS/LLM backends.
 
-Per .env zwischen lokalen GPU-Modellen (faster_whisper, omnivoice) und Cloud-APIs
-(OpenAI, Fireworks) umschaltbar. Einstiegspunkt: ``plauder.server.main``.
+Switchable via .env between local GPU models (faster_whisper, omnivoice) and
+cloud APIs (OpenAI, Fireworks). Entry point: ``plauder.server.main``.
 """
 
 __version__ = "7.0.0"

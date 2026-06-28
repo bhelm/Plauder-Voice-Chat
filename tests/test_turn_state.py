@@ -1,4 +1,4 @@
-"""TurnState + VAD-Parameter (Debounce/Coalescing)."""
+"""TurnState + VAD parameters (debounce/coalescing)."""
 from plauder.turn_state import (
     VAD_REDEMPTION_MAX,
     VAD_REDEMPTION_MIN,
