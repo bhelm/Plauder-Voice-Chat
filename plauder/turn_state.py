@@ -46,6 +46,9 @@ class TurnState:
     # Legacy: parallel text tasks. Nothing appends to this anymore, but the
     # server still iterates it in `_cancel_in_flight` — so it is kept on purpose.
     text_tasks: list = field(default_factory=list)
+    # Detached segment-/partial-handler tasks, tracked so the connection can
+    # cancel them on close (otherwise they may send on a closed WebSocket).
+    inflight_tasks: set = field(default_factory=set)
     # User suffix that determines the LLM session key per connection.
     session_user: str | None = None
     # Wake word is a per-connection input mode (set by the client). When it is

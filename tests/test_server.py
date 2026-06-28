@@ -307,3 +307,49 @@ def test_index_injects_lang_de():
             assert "__APP_LANG__" not in html
 
     asyncio.run(run())
+
+
+# --- Connection task lifecycle (B1: tracked detached handlers) --------------
+def test_spawn_tracked_tracks_then_autodiscards():
+    """_spawn_tracked registers the task and the done-callback removes it."""
+    async def run():
+        state = srv.TurnState()
+
+        async def quick():
+            return 1
+
+        task = srv._spawn_tracked(state, quick())
+        assert task in state.inflight_tasks
+        await task
+        await asyncio.sleep(0)          # let the done-callback run
+        assert task not in state.inflight_tasks
+
+    asyncio.run(run())
+
+
+def test_cancel_connection_tasks_cancels_everything():
+    """The WS-close cleanup cancels debounce, agent, legacy text AND the
+    tracked segment/partial handlers (otherwise they could send on a closed ws)."""
+    async def run():
+        state = srv.TurnState()
+
+        async def forever():
+            await asyncio.sleep(3600)
+
+        tracked = srv._spawn_tracked(state, forever())
+        state.debounce_task = asyncio.create_task(forever())
+        state.agent_task = asyncio.create_task(forever())
+        text_task = asyncio.create_task(forever())
+        state.text_tasks.append(text_task)
+        await asyncio.sleep(0)          # let them start
+
+        srv._cancel_connection_tasks(state)
+
+        for task in (tracked, state.debounce_task, state.agent_task, text_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert task.cancelled()
+
+    asyncio.run(run())

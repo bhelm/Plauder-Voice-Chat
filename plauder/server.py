@@ -700,9 +700,36 @@ def _resume_debounce(ws, state: TurnState) -> None:
 
     Used by the segment paths that drop the current segment (ghost-filtered,
     wake-gated, empty transcript) but must not strand earlier pending input.
+
+    NOTE: deliberately does NOT cancel an existing debounce_task. That slot is
+    reused by `_debounce_then_run` to hold the *running* turn once the timer
+    elapses, so cancelling it here would abort an in-flight reply — which the
+    wake "ignored during processing" tests rely on NOT happening. A true
+    debounce-reset that is safe against this would need to separate the timer
+    slot from the running-turn slot (see B2 in the review notes).
     """
     if state.has_pending():
         state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+
+
+def _spawn_tracked(state: TurnState, coro):
+    """Launch a detached handler task but track it so the connection can cancel
+    it on close (otherwise a late handler may send on a closed WebSocket)."""
+    task = asyncio.create_task(coro)
+    state.inflight_tasks.add(task)
+    task.add_done_callback(state.inflight_tasks.discard)
+    return task
+
+
+def _cancel_connection_tasks(state: TurnState) -> None:
+    """Cancel every task owned by a connection (debounce, agent, legacy text,
+    and the tracked segment/partial handlers). Called when the WS closes."""
+    for task in (state.debounce_task, state.agent_task):
+        if task and not task.done():
+            task.cancel()
+    for task in list(state.text_tasks) + list(state.inflight_tasks):
+        if not task.done():
+            task.cancel()
 
 
 async def _debounce_then_run(ws, state: TurnState):
@@ -1032,7 +1059,7 @@ def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
     seg["partial_running"] = True
     seg["last_partial_ts"] = now
     seg["last_partial_len"] = buf_len
-    asyncio.create_task(_do_partial(ws, state, seg, bytes(seg["buf"])))
+    _spawn_tracked(state, _do_partial(ws, state, seg, bytes(seg["buf"])))
 
 
 # ============================================================================ #
@@ -1050,7 +1077,10 @@ async def ws_handler(request):
     state.debounce_ms = CFG.debounce_ms if CFG else 1200
     # Start default of the wake mode; the client toggles it via 'settings'.
     state.wake_word_enabled = bool(CFG.wake_word_enabled) if CFG else False
-    pending_segment_meta: deque = deque()
+    # Bounded: pairs a `segment.start` with the next binary frame (FIFO, normally
+    # depth 1). The cap stops a client that sends starts without frames from
+    # growing it without limit.
+    pending_segment_meta: deque = deque(maxlen=64)
     # B1: streamed input segment (frames arrive while speaking). None = no active
     # stream segment → binary frames are full segments.
     active_stream: dict | None = None
@@ -1206,7 +1236,7 @@ async def ws_handler(request):
                         active_stream = None
                         pcm = bytes(_seg["buf"])
                         if pcm:
-                            asyncio.create_task(_handle_audio_segment(
+                            _spawn_tracked(state, _handle_audio_segment(
                                 ws, state, pcm, _seg["id"], peer,
                                 speech_start_ts=_seg.get("speech_start_ts"),
                                 barge_in=_seg.get("barge_in", False)))
@@ -1298,7 +1328,7 @@ async def ws_handler(request):
                     _meta = pending_segment_meta.popleft()
                 else:
                     _meta = {"id": _short_id(), "speech_start_ts": None, "barge_in": False}
-                asyncio.create_task(_handle_audio_segment(
+                _spawn_tracked(state, _handle_audio_segment(
                     ws, state, msg.data, _meta["id"], peer,
                     speech_start_ts=_meta.get("speech_start_ts"),
                     barge_in=_meta.get("barge_in", False)))
@@ -1308,13 +1338,7 @@ async def ws_handler(request):
     finally:
         if BRIDGE is not None:
             BRIDGE.unregister_broadcast(ws)
-        if state.debounce_task and not state.debounce_task.done():
-            state.debounce_task.cancel()
-        if state.agent_task and not state.agent_task.done():
-            state.agent_task.cancel()
-        for tt in state.text_tasks:
-            if not tt.done():
-                tt.cancel()
+        _cancel_connection_tasks(state)
         LOG.info("ws close: %s", peer)
         if not ws.closed:
             await ws.close()
