@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Entrypoint-Shim.
+"""Entrypoint shim.
 
-Der monolithische Server wurde in das Package ``plauder`` zerlegt. Diese
-Datei bleibt als Einstiegspunkt erhalten, damit ``python server.py`` (und
-start.sh) unverändert funktionieren. Die gesamte Logik liegt in
-``plauder/`` (config, server, audio, sanitizer, turn_state, session, backends).
+The monolithic server was split into the ``plauder`` package. This file stays
+as an entry point so ``python server.py`` (and start.sh) keep working
+unchanged. All logic lives in ``plauder/`` (config, server, app, images, audio,
+sanitizer, turn_state, session, backends).
 """
 
 from plauder.server import run

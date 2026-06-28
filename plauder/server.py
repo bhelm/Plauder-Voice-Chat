@@ -16,12 +16,8 @@ Pipeline:
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
-import mimetypes
-import signal
-import sys
 import time
 import uuid
 from collections import deque
@@ -33,7 +29,8 @@ from . import audio as audio_utils
 from . import sanitizer
 from . import wake
 from .backends import LLMBackend, STTBackend, TTSBackend, UpstreamTimeoutError
-from .config import SAMPLE_RATE, Config, load_config
+from .config import SAMPLE_RATE, Config
+from .images import _resolve_image_urls
 from .session import ConversationManager
 from .telegram_bridge import TelegramBridge
 from .turn_state import TurnState, vad_params_for_debounce
@@ -43,13 +40,7 @@ LOG = logging.getLogger("voice-chat")
 HERE = Path(__file__).resolve().parent.parent
 STATIC_DIR = HERE / "static"
 INDEX_HTML = STATIC_DIR / "index.html"
-UPLOAD_DIR = HERE / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
 
-ALLOWED_IMAGE_MIME = {
-    "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp", "image/bmp",
-}
-MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 WS_MAX_MSG_BYTES = 16 * 1024 * 1024   # max size of a single WebSocket frame (image data URLs)
 WS_HEARTBEAT_S = 20.0                 # WebSocket ping interval
 AGENT_RETRY_DELAY_S = 0.5             # pause before the single silent retry on an idle timeout
@@ -167,98 +158,6 @@ async def healthz(_request):
             "connected_browsers": len(BRIDGE._broadcast_channels) if BRIDGE else 0,
         },
     })
-
-
-async def upload_image(request):
-    """Accepts an image as multipart/form-data, returns a URL."""
-    try:
-        reader = await request.multipart()
-    except Exception as exc:
-        return web.json_response({"ok": False, "error": f"multipart parse: {exc}"}, status=400)
-
-    field_part = await reader.next()
-    if field_part is None or field_part.name != "file":
-        return web.json_response({"ok": False, "error": "missing field 'file'"}, status=400)
-
-    content_type = (field_part.headers.get("Content-Type") or "").lower().split(";")[0].strip()
-    if content_type not in ALLOWED_IMAGE_MIME:
-        return web.json_response(
-            {"ok": False, "error": f"unsupported content type: {content_type or '<none>'}"},
-            status=400)
-
-    orig_name = field_part.filename or "upload"
-    # NEVER take the suffix from the user filename (XSS protection: evil.html as image/jpeg).
-    suffix = {
-        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
-        "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
-    }.get(content_type, ".bin")
-    safe_id = uuid.uuid4().hex
-    out_path = UPLOAD_DIR / f"{safe_id}{suffix}"
-
-    total = 0
-    with out_path.open("wb") as f:
-        while True:
-            chunk = await field_part.read_chunk(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                f.close()
-                try:
-                    out_path.unlink()
-                except Exception:
-                    pass
-                return web.json_response(
-                    {"ok": False, "error": f"file too large (>{MAX_UPLOAD_BYTES} bytes)"},
-                    status=413)
-            f.write(chunk)
-
-    rel_url = f"/uploads/{out_path.name}"
-    LOG.info("upload accepted: name=%r bytes=%d type=%s -> %s",
-             orig_name, total, content_type, rel_url)
-    return web.json_response({
-        "ok": True, "url": rel_url, "name": orig_name,
-        "bytes": total, "contentType": content_type,
-    })
-
-
-def _image_url_to_data_url(url: str) -> str | None:
-    if not url:
-        return None
-    if url.startswith("data:") or url.startswith("http://") or url.startswith("https://"):
-        return url
-    if not url.startswith("/uploads/"):
-        return None
-    name = url[len("/uploads/"):]
-    if "/" in name or "\\" in name or name in ("", ".", ".."):
-        return None
-    path = UPLOAD_DIR / name
-    if not path.is_file():
-        return None
-    mime, _ = mimetypes.guess_type(str(path))
-    if not mime:
-        mime = "application/octet-stream"
-    try:
-        b = path.read_bytes()
-    except Exception:
-        return None
-    b64 = base64.b64encode(b).decode("ascii")
-    return f"data:{mime};base64,{b64}"
-
-
-async def _resolve_image_urls(image_urls: list, log_tag: str) -> list:
-    if not image_urls:
-        return []
-    results = await asyncio.gather(*(
-        asyncio.to_thread(_image_url_to_data_url, u) for u in image_urls
-    ))
-    out: list = []
-    for u, durl in zip(image_urls, results):
-        if durl:
-            out.append(durl)
-        else:
-            LOG.warning("%s image %r could not be resolved", log_tag, u)
-    return out
 
 
 # ============================================================================ #
@@ -1344,129 +1243,12 @@ async def ws_handler(request):
             await ws.close()
     return ws
 
-
 # ============================================================================ #
-# App boot
+# App boot — build_app / init_backends / main / run live in plauder.app and are
+# re-exported here so `plauder.server.run` (entrypoint shims) and the tests'
+# `srv.build_app` keep working. Imported at the bottom to avoid an import cycle.
 # ============================================================================ #
-@web.middleware
-async def _security_headers_mw(request, handler):
-    resp = await handler(request)
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    return resp
-
-
-def build_app() -> web.Application:
-    app = web.Application(client_max_size=WS_MAX_MSG_BYTES,
-                          middlewares=[_security_headers_mw])
-    app.router.add_get("/", index)
-    app.router.add_get("/healthz", healthz)
-    app.router.add_get("/ws", ws_handler)
-    app.router.add_post("/upload", upload_image)
-    if STATIC_DIR.exists():
-        app.router.add_static("/static/", STATIC_DIR, show_index=False)
-    app.router.add_static("/uploads/", UPLOAD_DIR, show_index=False)
-    return app
-
-
-async def init_backends(cfg: Config):
-    """Builds and loads the chosen backends. Raises on error (caller exits)."""
-    stt = STTBackend.from_config(cfg)
-    tts = TTSBackend.from_config(cfg)
-    llm = LLMBackend.from_config(cfg)
-
-    await stt.load()
-    await tts.load()
-    await llm.load()
-
-    if cfg.stt_warmup:
-        try:
-            import numpy as np
-            t0 = time.time()
-            await stt.transcribe(np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32).tobytes(),
-                                 SAMPLE_RATE)
-            LOG.info("STT Warm-up: %.2fs", time.time() - t0)
-        except Exception as exc:
-            LOG.warning("STT Warm-up: %s", exc)
-    if cfg.tts_warmup:
-        try:
-            t0 = time.time()
-            await tts.synth("Hello.", speed=cfg.tts_speed)
-            LOG.info("TTS Warm-up: %.2fs", time.time() - t0)
-        except Exception as exc:
-            LOG.warning("TTS Warm-up: %s", exc)
-
-    conv = ConversationManager(llm, system_prompt=cfg.resolved_voice_system(),
-                               history_turns=cfg.llm_history_turns)
-    return stt, tts, conv
-
-
-async def main():
-    cfg = load_config()
-    logging.basicConfig(
-        level=getattr(logging, cfg.log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
-    try:
-        cfg.validate()
-    except Exception:
-        LOG.exception("Configuration invalid")
-        sys.exit(2)
-
-    if cfg.house_mode:
-        LOG.info("🏠 HOUSE_MODE active — speaker_id=%d wake_word=%d auth=%d",
-                 cfg.house_speaker_id, cfg.house_wake_word, cfg.house_auth)
-
-    try:
-        stt, tts, conv = await init_backends(cfg)
-    except Exception:
-        LOG.exception("Backend initialization failed")
-        sys.exit(3)
-
-    bridge = None  # Telegram bridge is legacy/optional; off by default.
-
-    configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge)
-
-    LOG.info("STT-Backend: %s · %s", cfg.stt_backend, stt.describe())
-    LOG.info("TTS-Backend: %s · %s", cfg.tts_backend, tts.describe())
-    LOG.info("LLM-Backend: %s · %s", cfg.llm_backend, conv.llm.describe())
-
-    app = build_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, cfg.host, cfg.port)
-    await site.start()
-
-    LOG.info("🎙️  Voice-Chat server running at http://%s:%s (agent: %s)",
-             cfg.host, cfg.port, cfg.agent_name)
-    LOG.info("    Debounce: %d ms · TTS speed: %.2f", cfg.debounce_ms, cfg.tts_speed)
-
-    stop_event = asyncio.Event()
-
-    def _request_stop(*_):
-        LOG.info("Shutdown requested.")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _request_stop)
-        except NotImplementedError:
-            signal.signal(sig, _request_stop)
-    await stop_event.wait()
-
-    LOG.info("Stopping server …")
-    if BRIDGE is not None:
-        await BRIDGE.stop()
-    await runner.cleanup()
-    if conv is not None and hasattr(conv.llm, "close"):
-        await conv.llm.close()
-
-
-def run():
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
-
+from .app import build_app, init_backends, main, run  # noqa: E402,F401
 
 if __name__ == "__main__":
     run()

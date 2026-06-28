@@ -52,7 +52,15 @@ its `start.sh` parent), confirm port 8319 is free, then
   `LLM_API_KEY` → `FIREWORKS_API_KEY`). `validate()` checks only the *active* backend.
 - **`server.py`** — aiohttp HTTP/WS transport + turn orchestration only. Runtime
   state (CFG/STT/TTS/CONV/…) lives in module globals set via `configure()`; tests
-  inject mock backends through it.
+  inject mock backends through it. Connection-owned tasks (debounce, agent,
+  tracked segment/partial handlers) are cancelled on close via
+  `_cancel_connection_tasks`.
+- **`app.py`** — app boot/wiring: `build_app()` (routes + middleware),
+  `init_backends()`, `main()`/`run()`. Reads `server.*` at call time (re-exported
+  from `server` so the entrypoint shims and `srv.build_app` still resolve); kept
+  out of `server.py` to separate process lifecycle from request handling.
+- **`images.py`** — self-contained `/upload` handler + `/uploads/...` → data-URL
+  resolution for the multimodal LLM call (no runtime backend state).
 - **`backends/{stt,tts,llm}/`** — each has a `base.py` abstract class with a
   `from_config()` factory dispatching on `STT_BACKEND`/`TTS_BACKEND`/`LLM_BACKEND`.
   **Heavy GPU deps (`faster_whisper`, `torch`, `omnivoice`) are imported only inside

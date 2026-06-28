@@ -243,20 +243,22 @@ no GPU. Lazy imports and all backend combinations are covered.
 
 ```
 plauder/
-├── config.py              # .env-Loading, Config-Dataclass, Validierung
-├── server.py              # aiohttp App, Routen, WS-Handler, Turn-/Streaming-Orchestrierung
-├── audio.py               # PCM/WAV/numpy, Frame-Formate (VCT1/VCT2), Satz-Splitter
-├── turn_state.py          # Debounce + Coalescing, VAD-Parameter
-├── sanitizer.py           # Emoji/Markdown-Stripping, Ghost-Filter, NO_REPLY
-├── wake.py                # Wake-Word-Matching (STT-Prefix, fuzzy)
-├── session.py             # ConversationManager (Verlauf pro Session-Key)
-├── telegram_bridge.py     # optionale Telegram-Spiegelung (Legacy, Default aus)
+├── config.py              # .env loading, Config dataclass, validation
+├── server.py              # WS handler + turn/streaming orchestration; runtime state
+├── app.py                 # app boot/wiring: build_app, init_backends, main/run
+├── images.py              # /upload handler + /uploads → data-URL resolution
+├── audio.py               # PCM/WAV/numpy, frame formats (VCT1/VCT2), sentence splitter
+├── turn_state.py          # debounce + coalescing, VAD parameters
+├── sanitizer.py           # emoji/markdown stripping, ghost filter, NO_REPLY
+├── wake.py                # wake-word matching (STT prefix, fuzzy)
+├── session.py             # ConversationManager (history per session key)
+├── telegram_bridge.py     # optional Telegram mirroring (legacy, off by default)
 └── backends/
     ├── stt/{base,openai_api,whisper_local}.py
     ├── tts/{base,openai_api,omnivoice_local}.py
     └── llm/{base,openai_compat,openclaw}.py
-server.py                  # Entrypoint-Shim → plauder.server.run()
-static/index.html          # kompletter Browser-Client (Audio, WS, UI)
+server.py                  # entrypoint shim → plauder.server.run()
+static/index.html          # complete browser client (audio, WS, UI)
 ```
 
 > **Secrets & paths:** API keys and machine-specific paths belong
