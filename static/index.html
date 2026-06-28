@@ -711,15 +711,16 @@
     </div>
   </footer>
 
-  <script src="/static/vendor/ort.js"></script>
+  <script src="__BASE_PATH__/static/vendor/ort.js"></script>
   <script>
     // ort looks for the WASM files in the build directory by default.
-    // We host them under /static/vendor/ — that's what we point to here.
+    // We host them under <base>/static/vendor/ — that's what we point to here.
+    // The base prefix below is injected by the server ('' at root, '/voice' behind a proxy).
     if (window.ort && window.ort.env && window.ort.env.wasm) {
-      window.ort.env.wasm.wasmPaths = '/static/vendor/';
+      window.ort.env.wasm.wasmPaths = '__BASE_PATH__/static/vendor/';
     }
   </script>
-  <script src="/static/vendor/bundle.min.js"></script>
+  <script src="__BASE_PATH__/static/vendor/bundle.min.js"></script>
 
   <script>
     /* ===== i18n =====
@@ -731,6 +732,18 @@
        markup elements via the data-i18n* attribute. */
     const SERVER_LANG = "__APP_LANG__";
     let LANG = (SERVER_LANG === 'en' || SERVER_LANG === 'de') ? SERVER_LANG : 'en';
+
+    /* Sub-path the app is served under, injected by the server: '' at root or
+       e.g. '/voice' behind a reverse proxy. All WS/upload/asset URLs are built
+       relative to it. Falls back to '' if the placeholder was not substituted. */
+    const BASE = (() => {
+      const b = "__BASE_PATH__";
+      return b.charAt(0) === '/' ? b.replace(/\/+$/, '') : '';
+    })();
+    // Prefix an app-relative /uploads/… URL with BASE for browser display, while
+    // the value sent back to the server stays canonical (/uploads/…).
+    const mediaUrl = (u) => (typeof u === 'string' && u.charAt(0) === '/') ? BASE + u : u;
+
     const I18N = {
       en: {
         // App / header
@@ -2085,7 +2098,7 @@
       if (ws && ws.readyState <= 1) return;
       setWs('warn', t('status.connecting'));
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const url = `${proto}://${location.host}/ws`;
+      const url = `${proto}://${location.host}${BASE}/ws`;
       try { ws = new WebSocket(url); }
       catch (err) {
         setWs('err', t('status.error'));
@@ -2736,8 +2749,8 @@
         if (!silent) setVad('warn', t('vad.loading'));
         vad = await window.vad.MicVAD.new({
           // Local asset paths (no CDN)
-          modelURL: '/static/vendor/silero_vad.onnx',
-          workletURL: '/static/vendor/vad.worklet.bundle.min.js',
+          modelURL: `${BASE}/static/vendor/silero_vad.onnx`,
+          workletURL: `${BASE}/static/vendor/vad.worklet.bundle.min.js`,
           // Vom User per Slider gewaehlte Aktivierungsschwelle. negative liegt
           // konventionell ~0.15 darunter (Hysterese), min. 0.05.
           positiveSpeechThreshold: vadActivationThreshold,
@@ -3263,7 +3276,7 @@
       try {
         const fd = new FormData();
         fd.append('file', file, file.name);
-        const resp = await fetch('/upload', { method: 'POST', body: fd });
+        const resp = await fetch(`${BASE}/upload`, { method: 'POST', body: fd });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.ok) {
           throw new Error(data.error || `HTTP ${resp.status}`);
@@ -3301,7 +3314,7 @@
         imgsWrap.className = 'images';
         for (const a of readyAtts) {
           const im = document.createElement('img');
-          im.src = a.url; im.alt = a.name; im.title = a.name;
+          im.src = mediaUrl(a.url); im.alt = a.name; im.title = a.name;
           imgsWrap.appendChild(im);
         }
         el.appendChild(imgsWrap);

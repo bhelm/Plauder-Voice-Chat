@@ -309,6 +309,61 @@ def test_index_injects_lang_de():
     asyncio.run(run())
 
 
+# --- Sub-path (BASE_PATH) support -------------------------------------------
+def _configure_base(base):
+    cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, base_path=base)
+    conv = ConversationManager(FakeLLM(), system_prompt="sys")
+    srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
+                  ghost=HallucinationFilter(enabled=False))
+    return cfg
+
+
+def test_base_path_default_root_unprefixed():
+    """Default (no BASE_PATH): everything at root, asset URLs unprefixed."""
+    _configure_base("")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            resp = await client.get("/")
+            assert resp.status == 200
+            html = await resp.text()
+            assert "__BASE_PATH__" not in html
+            assert 'src="/static/vendor/ort.js"' in html
+
+    asyncio.run(run())
+
+
+def test_base_path_serves_under_prefix():
+    """BASE_PATH=/voice: routes live under /voice, root 404s, assets prefixed."""
+    _configure_base("/voice")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            resp = await client.get("/voice/")
+            assert resp.status == 200
+            html = await resp.text()
+            assert "__BASE_PATH__" not in html
+            assert 'src="/voice/static/vendor/ort.js"' in html
+            assert (await client.get("/")).status == 404          # not at root
+            assert (await client.get("/voice")).status == 200     # no trailing slash
+            assert (await client.get("/voice/healthz")).status == 200
+
+    asyncio.run(run())
+
+
+def test_ws_hello_advertises_base_path():
+    _configure_base("/voice")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/voice/ws")
+            hello, _, _ = await _drain_until(ws, "hello")
+            assert hello["basePath"] == "/voice"
+            await ws.close()
+
+    asyncio.run(run())
+
+
 # --- Connection task lifecycle (B1: tracked detached handlers) --------------
 def test_spawn_tracked_tracks_then_autodiscards():
     """_spawn_tracked registers the task and the done-callback removes it."""

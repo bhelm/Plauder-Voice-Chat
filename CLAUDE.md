@@ -20,6 +20,17 @@ page renders in the right locale with no flash) and also advertises it as
 `hello.lang`. When adding UI strings, add a key to **both** `I18N.en` and
 `I18N.de`.
 
+**Sub-path / `BASE_PATH`.** `BASE_PATH` (default `''` = root, e.g. `/voice`) lets
+the app run behind a reverse proxy under a sub-path. `build_app()` registers every
+route under the prefix; `index()` injects it into `index.html` via the
+`__BASE_PATH__` placeholder (same mechanism as `__APP_LANG__`), and `hello`
+carries `basePath`. The client reads it into a `BASE` const and builds **all**
+WS / `/upload` / `/uploads` / `/static` URLs with it (head `<script src>` and the
+ort `wasmPaths` use the injected `__BASE_PATH__` directly, since they run before
+`BASE` exists). Image URLs sent back to the server stay canonical (`/uploads/…`,
+prefixed only for display via `mediaUrl()`). Any new client URL or absolute asset
+path must go through `BASE`/`__BASE_PATH__`, or it breaks under a sub-path.
+
 ## Commands
 
 ```bash

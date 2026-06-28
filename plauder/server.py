@@ -123,9 +123,14 @@ async def index(_request):
     if not INDEX_HTML.exists():
         return web.Response(status=500, text=f"index.html missing: {INDEX_HTML}")
     # Inject the configured UI language (APP_LANGUAGE) so the page renders in the
-    # right locale immediately, without a flash of the fallback language.
+    # right locale immediately, without a flash of the fallback language, and the
+    # sub-path prefix (BASE_PATH) so the client builds WS/upload/asset URLs that
+    # resolve behind a reverse proxy.
     lang = (CFG.app_language if CFG else "en")
-    html = INDEX_HTML.read_text(encoding="utf-8").replace("__APP_LANG__", lang)
+    base = (CFG.base_path if CFG else "")
+    html = (INDEX_HTML.read_text(encoding="utf-8")
+            .replace("__APP_LANG__", lang)
+            .replace("__BASE_PATH__", base))
     return web.Response(text=html, content_type="text/html")
 
 
@@ -992,6 +997,7 @@ async def ws_handler(request):
         "msg": f"Server ready – agent: {CFG.agent_name}.",
         "agent_name": CFG.agent_name,
         "lang": (CFG.app_language if CFG else "en"),
+        "basePath": (CFG.base_path if CFG else ""),
         "stt": (STT.describe() if STT else {}),
         "agent": {
             "name": CFG.agent_name, "agent_id": _agent_id(),

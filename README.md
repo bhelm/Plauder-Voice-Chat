@@ -83,6 +83,34 @@ The browser client auto-renders in the selected language, so no extra setup is
 needed. `APP_LANGUAGE=de` restores the previous German experience (German UI and
 a German-speaking assistant).
 
+### Sub-path / reverse proxy (`BASE_PATH`)
+
+To run the app under a sub-path instead of the domain root (e.g. behind a shared
+reverse proxy), set `BASE_PATH`:
+
+```bash
+BASE_PATH=/voice
+```
+
+All routes then live under that prefix (`/voice/`, `/voice/ws`, `/voice/upload`,
+`/voice/static/…`, `/voice/uploads/…`, `/voice/healthz`), and the server injects
+the prefix into the page so the client builds its WebSocket, upload and asset
+URLs accordingly. Empty (default) serves everything at the root.
+
+Configure the proxy to forward the sub-path **without stripping** it — the app
+expects to see `/voice/...`. Example for nginx (note: WebSockets need the upgrade
+headers):
+
+```nginx
+location /voice/ {
+    proxy_pass         http://127.0.0.1:8319;   # no trailing slash → prefix kept
+    proxy_http_version 1.1;
+    proxy_set_header   Upgrade $http_upgrade;
+    proxy_set_header   Connection "upgrade";
+    proxy_set_header   Host $host;
+}
+```
+
 ### Health check
 
 ```bash

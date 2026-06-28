@@ -126,6 +126,15 @@ def _norm_lang(value: str) -> str:
     return code if code in SUPPORTED_LANGUAGES else "en"
 
 
+def _norm_base_path(value: str) -> str:
+    """Normalize BASE_PATH to '' (root) or '/sub' (no trailing slash).
+
+    Lets the app run behind a reverse proxy at a sub-path, e.g. BASE_PATH=/voice
+    serves everything under /voice/… ('voice', '/voice', '/voice/' all work)."""
+    p = (value or "").strip().strip("/")
+    return f"/{p}" if p else ""
+
+
 VALID_STT_BACKENDS = ("openai", "whisper_local")
 VALID_TTS_BACKENDS = ("openai", "omnivoice_local")
 VALID_LLM_BACKENDS = ("openai_compat", "openclaw")
@@ -146,6 +155,9 @@ class Config:
     # App / UI language ('en'/'de'). Drives the UI i18n locale handed to the
     # browser and the assistant's default spoken language (see _DEFAULT_VOICE_HINTS).
     app_language: str = "en"
+    # Sub-path the app is served under, '' (root) or '/voice'. Lets it run behind
+    # a reverse proxy at a sub-path; all routes + client URLs use this prefix.
+    base_path: str = ""
 
     # --- Backend selection ---
     stt_backend: str = "openai"
@@ -304,6 +316,7 @@ class Config:
 
         # App/UI language; also the default for STT (overridable via STT_LANGUAGE).
         app_language = _norm_lang(_first(_env("APP_LANGUAGE"), _env("APP_LANG"), default="en"))
+        base_path = _norm_base_path(_env("BASE_PATH"))
 
         house_mode = env_flag("HOUSE_MODE", False)
         stt_backend = _first(_env("STT_BACKEND"), default="openai").lower()
@@ -320,6 +333,7 @@ class Config:
             system_prompt=_env("SYSTEM_PROMPT"),
             log_level=_first(_env("LOG_LEVEL"), default="INFO").upper(),
             app_language=app_language,
+            base_path=base_path,
 
             stt_backend=stt_backend,
             tts_backend=_first(_env("TTS_BACKEND"), default="openai").lower(),

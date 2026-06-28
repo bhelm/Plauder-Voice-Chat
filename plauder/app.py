@@ -35,13 +35,22 @@ async def _security_headers_mw(request, handler):
 def build_app() -> web.Application:
     app = web.Application(client_max_size=server.WS_MAX_MSG_BYTES,
                           middlewares=[_security_headers_mw])
-    app.router.add_get("/", server.index)
-    app.router.add_get("/healthz", server.healthz)
-    app.router.add_get("/ws", server.ws_handler)
-    app.router.add_post("/upload", upload_image)
+    # Everything is mounted under BASE_PATH ('' = root, '/voice' = sub-path), so
+    # the app works behind a reverse proxy that does NOT strip the prefix.
+    base = server.CFG.base_path if server.CFG else ""
+
+    def p(path: str) -> str:
+        return f"{base}{path}"
+
+    app.router.add_get(p("/"), server.index)
+    if base:                       # also serve the prefix without a trailing slash
+        app.router.add_get(base, server.index)
+    app.router.add_get(p("/healthz"), server.healthz)
+    app.router.add_get(p("/ws"), server.ws_handler)
+    app.router.add_post(p("/upload"), upload_image)
     if server.STATIC_DIR.exists():
-        app.router.add_static("/static/", server.STATIC_DIR, show_index=False)
-    app.router.add_static("/uploads/", UPLOAD_DIR, show_index=False)
+        app.router.add_static(p("/static/"), server.STATIC_DIR, show_index=False)
+    app.router.add_static(p("/uploads/"), UPLOAD_DIR, show_index=False)
     return app
 
 
