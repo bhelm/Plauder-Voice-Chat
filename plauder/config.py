@@ -221,6 +221,13 @@ class Config:
     llm_history_turns: int = 20
     llm_retry_timeout_on_idle: bool = True
 
+    # --- Hermes memory binding (optional) ---
+    # Session keys for the two voice modes: "main" shares memory + history
+    # with the Telegram main session; "separate" uses an independent session.
+    hermes_session_key_main: str = ""
+    hermes_session_key_separate: str = ""
+    hermes_session_id: str = ""
+
     # --- LLM: OpenClaw (legacy) ---
     openclaw_gateway_url: str = "http://localhost:8080"
     openclaw_gateway_token: str = ""
@@ -393,6 +400,11 @@ class Config:
             llm_timeout=_env_int("LLM_TIMEOUT", _env_int("OPENCLAW_TIMEOUT", 300)),
             llm_history_turns=_env_int("LLM_HISTORY_TURNS", 20),
             llm_retry_timeout_on_idle=env_flag("OPENCLAW_RETRY_TIMEOUT", True),
+
+            # Hermes memory binding
+            hermes_session_key_main=_env("HERMES_SESSION_KEY_MAIN"),
+            hermes_session_key_separate=_env("HERMES_SESSION_KEY_SEPARATE"),
+            hermes_session_id=_env("HERMES_SESSION_ID"),
 
             # LLM openclaw (legacy)
             openclaw_gateway_url=_first(_env("OPENCLAW_GATEWAY_URL"),

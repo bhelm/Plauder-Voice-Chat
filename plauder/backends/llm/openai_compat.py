@@ -22,12 +22,15 @@ class OpenAICompatLLMBackend(LLMBackend):
     _error_label = "LLM"
 
     def __init__(self, *, api_key: str, base_url: str, model: str,
-                 max_tokens: int = 4096, timeout: int = 300):
+                 max_tokens: int = 4096, timeout: int = 300,
+                 session_key: str = "", session_id: str = ""):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.session_key = session_key
+        self.session_id = session_id
         self._session: ClientSession | None = None
         self.last_meta: dict = {}
 
@@ -90,6 +93,10 @@ class OpenAICompatLLMBackend(LLMBackend):
             "Authorization": f"Bearer {self._auth_token}",
             "Content-Type": "application/json",
         }
+        if self.session_key:
+            headers["X-Hermes-Session-Key"] = self.session_key
+        if self.session_id:
+            headers["X-Hermes-Session-Id"] = self.session_id
         body = {
             "model": self.model,
             "messages": full_messages,

@@ -116,6 +116,34 @@ def _session_key_for_user(user_id: str) -> str:
     return f"agent:{_agent_id()}:openai-user:{user_id}"
 
 
+def _hermes_session_key_for_mode(mode: str) -> str:
+    """Map the client-chosen hermes mode ('main'/'separate') to the concrete
+    session key from the .env. Returns '' if no key is configured."""
+    if not CFG:
+        return ""
+    if mode == "main":
+        return CFG.hermes_session_key_main
+    return CFG.hermes_session_key_separate
+
+
+def _apply_hermes_headers(state: TurnState) -> None:
+    """Set the Hermes session headers on the LLM backend right before a request.
+    The LLM backend is a process-wide singleton; we update its mutable
+    session_key / session_id so the next _build_request() includes the correct
+    X-Hermes-Session-Key / X-Hermes-Session-Id headers."""
+    if CONV is None:
+        return
+    llm = CONV.llm
+    sk = _hermes_session_key_for_mode(state.hermes_mode)
+    llm.session_key = sk
+    if state.hermes_mode == "main":
+        llm.session_id = state.hermes_session_id_main
+    else:
+        llm.session_id = state.hermes_session_id_separate
+    LOG.debug("hermes headers: mode=%s key=%s sid=%s",
+              state.hermes_mode, sk, llm.session_id[:12] if llm.session_id else "")
+
+
 # ============================================================================ #
 # HTTP routes
 # ============================================================================ #
@@ -249,6 +277,7 @@ async def _run_turn(ws, state: TurnState):
 
 async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
                           text_parts, image_urls, segment_ids):
+    _apply_hermes_headers(state)
     resolved_imgs = await _resolve_image_urls(image_urls, f"turn={turn_id}")
 
     if voice_merged and (text_parts or image_urls):
@@ -1026,6 +1055,8 @@ async def ws_handler(request):
             "debounce_ms_min": CFG.debounce_ms_min, "debounce_ms_max": CFG.debounce_ms_max,
             "vad": vad_params_for_debounce(state.debounce_ms),
         },
+        "hermesMode": state.hermes_mode,
+        "hermesAvailable": bool(CFG.hermes_session_key_main or CFG.hermes_session_key_separate) if CFG else False,
         "ts": time.time(),
     })
 
@@ -1186,10 +1217,19 @@ async def ws_handler(request):
                     state.session_user = new_user
                     if CONV is not None:
                         CONV.reset(new_user)
-                    LOG.info("session reset for %s: user=%s", peer, new_user)
+                    # Rotate the Hermes session ID for the active mode so
+                    # X-Hermes-Session-Id points to a fresh conversation thread.
+                    import uuid as _uuid
+                    if state.hermes_mode == "main":
+                        state.hermes_session_id_main = _uuid.uuid4().hex
+                    else:
+                        state.hermes_session_id_separate = _uuid.uuid4().hex
+                    LOG.info("session reset for %s: user=%s hermes_mode=%s",
+                             peer, new_user, state.hermes_mode)
                     await ws.send_json({
                         "type": "session.reset.ack", "sessionUser": new_user,
                         "sessionKey": _session_key_for_user(new_user),
+                        "hermesMode": state.hermes_mode,
                         "sharedWithTelegram": False, "ts": time.time(),
                     })
                 elif t == "settings":
@@ -1210,13 +1250,20 @@ async def ws_handler(request):
                         # Leaving wake mode → close an open conversation window.
                         if was_on and not state.wake_word_enabled:
                             state.wake_until = 0.0
+                    if "hermesMode" in data:
+                        mode = str(data["hermesMode"]).strip().lower()
+                        if mode in ("main", "separate"):
+                            state.hermes_mode = mode
+                            LOG.info("hermes mode changed to %s for %s", mode, peer)
                     vad_params = vad_params_for_debounce(state.debounce_ms)
-                    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s",
-                             state.speed, state.debounce_ms, state.wake_word_enabled)
+                    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s hermes=%s",
+                             state.speed, state.debounce_ms, state.wake_word_enabled,
+                             state.hermes_mode)
                     await ws.send_json({
                         "type": "settings.ack", "speed": state.speed,
                         "debounceMs": state.debounce_ms,
                         "wakeWordEnabled": state.wake_word_enabled,
+                        "hermesMode": state.hermes_mode,
                         "vad": vad_params, "ts": time.time(),
                     })
                 else:

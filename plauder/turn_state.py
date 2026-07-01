@@ -73,6 +73,11 @@ class TurnState:
     # contributing to the turn arrived at the server ("user is done speaking").
     # The time until the first playback is measured against this point.
     speech_end_ts: float = 0.0
+    # Hermes memory binding: which mode is active ("main" or "separate").
+    hermes_mode: str = "separate"
+    # Per-mode session IDs (rotate on /new to start a fresh conversation thread).
+    hermes_session_id_main: str = field(default_factory=lambda: uuid.uuid4().hex)
+    hermes_session_id_separate: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def has_pending(self) -> bool:
         return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)
