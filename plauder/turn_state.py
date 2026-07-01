@@ -7,8 +7,23 @@ off in ONE LLM call.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import uuid
 from dataclasses import dataclass, field
+
+
+def _stable_session_id() -> str:
+    """Derive a deterministic session ID from HERMES_SESSION_KEY_SEPARATE.
+
+    Uses SHA-256 of the key so the voice session ID is stable across reconnects
+    (same key → same ID → Hermes loads the previous turn history). Falls back to
+    a random UUID if the env var is not set.
+    """
+    key = os.environ.get("HERMES_SESSION_KEY_SEPARATE", "")
+    if not key:
+        return uuid.uuid4().hex
+    return hashlib.sha256(key.encode()).hexdigest()
 
 # VAD frames ≈ 32 ms per frame at 16 kHz/512 samples (silero-vad-web).
 VAD_FRAME_MS = 32
@@ -73,11 +88,9 @@ class TurnState:
     # contributing to the turn arrived at the server ("user is done speaking").
     # The time until the first playback is measured against this point.
     speech_end_ts: float = 0.0
-    # Hermes memory binding: which mode is active ("main" or "separate").
-    hermes_mode: str = "separate"
-    # Per-mode session IDs (rotate on /new to start a fresh conversation thread).
-    hermes_session_id_main: str = field(default_factory=lambda: uuid.uuid4().hex)
-    hermes_session_id_separate: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Hermes session ID for the voice session (deterministic from the session
+    # key so it survives reconnects; rotated on explicit /new).
+    hermes_session_id_separate: str = field(default_factory=_stable_session_id)
 
     def has_pending(self) -> bool:
         return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)

@@ -22,3 +22,6 @@ speakers.json
 
 # .env-Backups (enthalten Secrets)
 .env.bak-*
+
+# Interne Diagnose-Notizen (enthalten Session-Keys/Chat-IDs)
+HERMES_MEMORY_NOTES.md

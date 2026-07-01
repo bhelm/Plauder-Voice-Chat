@@ -37,23 +37,7 @@
     /* Mic now lives in the header (more compact than the former 96px hero). */
     header .mic-btn, header .stop-btn { width: 48px; height: 48px; font-size: 22px; border-width: 2px; flex: 0 0 auto; }
     .header-meter { width: 90px; flex: 0 0 auto; }
-    /* Hermes mode toggle */
-    .hermes-toggle {
-      display: flex; gap: 0; border: 1px solid var(--border);
-      border-radius: 8px; overflow: hidden; flex: 0 0 auto;
-    }
-    .hermes-btn {
-      padding: 4px 10px; font-size: 12px; font-weight: 600;
-      background: var(--panel-2); color: var(--muted);
-      border: none; border-radius: 0; cursor: pointer;
-      transition: background .15s, color .15s;
-      white-space: nowrap;
-    }
-    .hermes-btn + .hermes-btn { border-left: 1px solid var(--border); }
-    .hermes-btn.active {
-      background: rgba(122,162,255,0.18); color: var(--accent);
-    }
-    .hermes-btn:hover:not(.active) { background: #232a36; }
+
 
     /* Body: chat + (optional right-docked) settings drawer */
     .body { flex: 1; display: flex; min-height: 0; }
@@ -582,10 +566,7 @@
     <button id="micBtn" class="mic-btn" disabled data-i18n-title="mic.title" title="Microphone — channel on/off">🎤</button>
     <button id="stopBtn" class="stop-btn" hidden data-i18n-title="stop.title" title="Stop processing (transcription / reply / speech output)">⏹</button>
     <div class="meter header-meter"><div id="meterBar" class="meter-bar"></div></div>
-    <div id="hermesToggle" class="hermes-toggle" style="display:none">
-      <button id="hermesBtnMain" class="hermes-btn" data-mode="main" title="">Main</button>
-      <button id="hermesBtnSeparate" class="hermes-btn active" data-mode="separate" title="">Separat</button>
-    </div>
+
     <div class="header-status">
       <span class="status-pill" data-i18n-title="ws.pill_title" title="WebSocket connection to the server">
         <span id="wsDot" class="dot"></span><span class="lbl" id="wsStatus" data-i18n="status.connecting">connecting…</span>
@@ -878,11 +859,7 @@
         // Attachments / upload
         "attach.remove": "Remove",
         "upload.failed_title": "Upload failed: {err}",
-        // Hermes mode toggle
-        "hermes.label_main": "Main",
-        "hermes.label_separate": "Separate",
-        "hermes.title_main": "Shares memory and conversation history with the Telegram main session",
-        "hermes.title_separate": "Independent voice session (own conversation history, shared long-term memory)",
+
         // Misc
         "common.off": "off",
         // Errors
@@ -1016,11 +993,7 @@
         // Attachments / upload
         "attach.remove": "Entfernen",
         "upload.failed_title": "Upload fehlgeschlagen: {err}",
-        // Hermes mode toggle
-        "hermes.label_main": "Main",
-        "hermes.label_separate": "Separat",
-        "hermes.title_main": "Teilt Memory und Gesprächsverlauf mit der Telegram-Hauptsession",
-        "hermes.title_separate": "Unabhängige Voice-Session (eigener Gesprächsverlauf, geteiltes Langzeitgedächtnis)",
+
         // Misc
         "common.off": "aus",
         // Errors
@@ -1097,36 +1070,12 @@
       } catch (_) {}
     }
 
-    /* ===== Hermes Mode Toggle (Main / Separate) ===== */
-    let hermesMode = (() => {
-      const m = localStorage.getItem('hermesMode');
-      return (m === 'main' || m === 'separate') ? m : 'separate';
-    })();
-    const hermesToggle      = document.getElementById('hermesToggle');
-    const hermesBtnMain     = document.getElementById('hermesBtnMain');
-    const hermesBtnSeparate = document.getElementById('hermesBtnSeparate');
-
-    function updateHermesToggleUi() {
-      hermesBtnMain.classList.toggle('active', hermesMode === 'main');
-      hermesBtnSeparate.classList.toggle('active', hermesMode === 'separate');
-      hermesBtnMain.textContent = t('hermes.label_main');
-      hermesBtnSeparate.textContent = t('hermes.label_separate');
-      hermesBtnMain.title = t('hermes.title_main');
-      hermesBtnSeparate.title = t('hermes.title_separate');
-    }
-    updateHermesToggleUi();
-
-    function setHermesMode(mode) {
-      if (mode !== 'main' && mode !== 'separate') return;
-      if (mode === hermesMode) return;
-      hermesMode = mode;
-      try { localStorage.setItem('hermesMode', mode); } catch (_) {}
-      updateHermesToggleUi();
-      // Notify server of the mode change via settings message.
-      if (typeof sendSettings === 'function') sendSettings();
-    }
-    hermesBtnMain.addEventListener('click', () => setHermesMode('main'));
-    hermesBtnSeparate.addEventListener('click', () => setHermesMode('separate'));
+    /* ===== Hermes Mode =====
+       Fixed to 'separate' — the main mode toggle was removed because without a
+       gateway change (api_server key→session_id resolution) main only provides
+       Honcho peer-memory (identical to separate) but does NOT share the Telegram
+       turn history, making the toggle functionally meaningless. */
+    const hermesMode = 'separate';
 
     /* ===== DOM ===== */
     const chatLog       = document.getElementById('chatLog');
@@ -2257,18 +2206,9 @@
             }
             applyServerVadParams(m.turn.vad);
           }
-          // Hermes mode toggle: show only if server has keys configured.
-          if (m.hermesAvailable) {
-            hermesToggle.style.display = '';
-            updateHermesToggleUi();
-          }
           break;
         case 'settings.ack':
           applyServerVadParams(m.vad);
-          if (m.hermesMode) {
-            hermesMode = m.hermesMode;
-            updateHermesToggleUi();
-          }
           break;
         case 'session.reset.ack':
           newSessionBtn.disabled = false;
