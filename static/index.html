@@ -132,19 +132,42 @@
     .stop-btn:hover { filter: brightness(1.1); }
     .stop-btn:active { transform: scale(0.94); }
     .stop-btn[hidden] { display: none; }
-    /* Per-message speaker button (pause/resume/replay of the TTS). */
+    /* Per-message kebab (⋮) menu for speaker controls + download. */
     .bubble.agent { position: relative; padding-right: 36px; }
-    .spk-btn {
+    .msg-menu-wrap {
       position: absolute; top: 5px; right: 5px;
+      z-index: 10;
+    }
+    .msg-menu-btn {
       width: 26px; height: 26px; border-radius: 50%;
       border: 1px solid var(--border); background: var(--panel-2);
-      color: var(--text); font-size: 13px; line-height: 1; padding: 0;
+      color: var(--text); font-size: 15px; line-height: 1; padding: 0;
       display: flex; align-items: center; justify-content: center;
-      cursor: pointer; opacity: 0.6; touch-action: none;
+      cursor: pointer; opacity: 0.45; touch-action: none;
       transition: opacity .15s, background .15s;
+      font-family: system-ui, sans-serif;
     }
-    .spk-btn:hover { opacity: 1; }
-    .spk-btn.disabled { opacity: 0.25; cursor: default; }
+    .msg-menu-btn:hover { opacity: 1; }
+    .msg-menu-btn.disabled { opacity: 0.2; cursor: default; }
+    .msg-menu-drop {
+      display: none; position: absolute; top: 30px; right: 0;
+      min-width: 170px;
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 4px 0;
+      box-shadow: 0 6px 24px rgba(0,0,0,.5);
+      z-index: 20;
+    }
+    .msg-menu-drop.open { display: block; }
+    .msg-menu-drop button {
+      display: flex; align-items: center; gap: 8px;
+      width: 100%; padding: 8px 14px; border: none; border-radius: 0;
+      background: transparent; color: var(--text); font-size: 13px;
+      cursor: pointer; text-align: left; white-space: nowrap;
+    }
+    .msg-menu-drop button:hover:not(:disabled) { background: rgba(255,255,255,.07); }
+    .msg-menu-drop button:disabled { opacity: 0.35; cursor: default; }
+    /* Legacy compat: keep .spk-btn selector working for refreshSpeakerButtons */
+    .spk-btn { display: none; }
     .mic-status { font-size: 13px; color: var(--muted); text-align: center; min-height: 1.4em; }
     .mic-status.speaking { color: var(--ok); font-weight: 600; }
     .mic-status.thinking { color: var(--accent-2); font-weight: 600; }
@@ -867,6 +890,13 @@
         "speaker.tip": "Click: play / pause · Hold: from the start",
         "speaker.no_audio": "No audio (e.g. after reloading the page)",
         "speaker.no_audio_prev": "No audio (previous session)",
+        // Message menu
+        "msg.menu": "More",
+        "msg.play_audio": "Play audio",
+        "msg.pause_audio": "Pause audio",
+        "msg.replay_audio": "Replay from start",
+        "msg.download_audio": "Download audio",
+        "msg.no_audio": "No audio available",
         // Attachments / upload
         "attach.remove": "Remove",
         "upload.failed_title": "Upload failed: {err}",
@@ -1004,6 +1034,13 @@
         "speaker.tip": "Klick: Abspielen / Pause · Gedrückt halten: von vorn",
         "speaker.no_audio": "Kein Audio (z.B. nach Neuladen der Seite)",
         "speaker.no_audio_prev": "Kein Audio (vorherige Sitzung)",
+        // Message menu
+        "msg.menu": "Mehr",
+        "msg.play_audio": "Audio abspielen",
+        "msg.pause_audio": "Audio pausieren",
+        "msg.replay_audio": "Von vorn abspielen",
+        "msg.download_audio": "Audio herunterladen",
+        "msg.no_audio": "Kein Audio verfügbar",
         // Attachments / upload
         "attach.remove": "Entfernen",
         "upload.failed_title": "Upload fehlgeschlagen: {err}",
@@ -1464,11 +1501,11 @@
           md.innerHTML = renderMarkdown(msg.text || '');
           el.appendChild(md);
           if (msg.meta) { const mm = document.createElement('div'); mm.className = 'meta'; mm.textContent = msg.meta; el.appendChild(mm); }
-          // After a reload there's no audio left → disabled speaker button.
-          const spk = makeSpeakerButton(null);
-          spk.classList.add('disabled');
-          spk.title = t('speaker.no_audio_prev');
-          el.appendChild(spk);
+          // After a reload there's no audio left → disabled menu.
+          const menu = makeSpeakerButton(null);
+          const menuBtn = menu.querySelector('.msg-menu-btn');
+          if (menuBtn) { menuBtn.classList.add('disabled'); menuBtn.title = t('speaker.no_audio_prev'); }
+          el.appendChild(menu);
           chatLog.appendChild(el);
         } else {
           const el = addBubble('user', msg.text);
@@ -1676,7 +1713,7 @@
       const label = reason === 'no_reply' ? t('agent.silent', { name: AGENT_NAME }) : t('agent.silent_generic');
       setAgentBubbleMd(el, label);
       setMeta(el, t('meta.llm_no_reply', { ms: llmMs }));
-      const spk = el.querySelector('.spk-btn'); if (spk) spk.remove();   // no TTS → no button
+      const menu = el.querySelector('.msg-menu-wrap'); if (menu) menu.remove();   // no TTS → no menu
     }
     function appendTtsToAgentBubble(turnId, ttsMs) {
       const el = turnAgentBubble.get(turnId);
@@ -2083,6 +2120,7 @@
     }
 
     function refreshSpeakerButtons() {
+      // Update legacy .spk-btn elements (kept for any edge-case callers)
       document.querySelectorAll('.spk-btn[data-turn]').forEach((btn) => {
         const T = btn.dataset.turn;
         const liveStream = !!(streamPlayer && streamPlayer.turnId === T);
@@ -2099,34 +2137,131 @@
         btn.textContent = playing ? '⏸' : (paused ? '▶️' : '🔊');
         btn.title = hasAudio ? t('speaker.tip') : t('speaker.no_audio');
       });
+      // Update kebab menu buttons
+      document.querySelectorAll('.msg-menu-wrap[data-turn]').forEach((wrap) => {
+        const T = wrap.dataset.turn;
+        const liveStream = !!(streamPlayer && streamPlayer.turnId === T);
+        const liveWav = !!(currentAudioEl && currentTurnId === T);
+        const hasAudio = ttsCache.has(T) || liveStream || liveWav;
+        let playing = false, paused = false;
+        if (liveStream) { playing = !playbackUserPaused; paused = playbackUserPaused; }
+        else if (liveWav) { playing = !currentAudioEl.paused; paused = currentAudioEl.paused; }
+        else if (replayTurnId === T) {
+          playing = !replayAudio.paused;
+          paused = replayAudio.paused && replayAudio.currentTime > 0 && !replayAudio.ended;
+        }
+        const menuBtn = wrap.querySelector('.msg-menu-btn');
+        if (menuBtn) menuBtn.classList.toggle('disabled', !hasAudio);
+        const playItem = wrap.querySelector('.mm-play');
+        const dlItem = wrap.querySelector('.mm-download');
+        if (playItem) {
+          playItem.disabled = !hasAudio;
+          const icon = playing ? '⏸' : '▶️';
+          const label = playing ? t('msg.pause_audio') : t('msg.play_audio');
+          playItem.textContent = '';
+          playItem.append(icon + ' ' + label);
+        }
+        if (dlItem) dlItem.disabled = !hasAudio;
+      });
     }
 
     replayAudio.addEventListener('play', refreshSpeakerButtons);
     replayAudio.addEventListener('pause', refreshSpeakerButtons);
     replayAudio.addEventListener('ended', refreshSpeakerButtons);
 
+    // Close any open message menu
+    let _openMenu = null;
+    function closeMessageMenu() {
+      if (_openMenu) { _openMenu.classList.remove('open'); _openMenu = null; }
+    }
+    document.addEventListener('click', (e) => {
+      if (_openMenu && !e.target.closest('.msg-menu-wrap')) closeMessageMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeMessageMenu();
+    });
+
+    function downloadTtsAudio(turnId) {
+      const c = ttsCache.get(turnId);
+      if (!c || !c.url) return;
+      const a = document.createElement('a');
+      a.href = c.url;
+      const prefix = AGENT_NAME.toLowerCase().replace(/[^a-z0-9]/g, '-') || 'voice-reply';
+      a.download = prefix + '-' + (turnId || 'audio').substr(0, 8) + '.wav';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+
     function makeSpeakerButton(turnId) {
+      // Returns a ⋮ menu wrapper (replaces the old bare speaker button).
+      const wrap = document.createElement('div');
+      wrap.className = 'msg-menu-wrap';
+      if (turnId) wrap.dataset.turn = turnId;
+
       const btn = document.createElement('button');
-      btn.className = 'spk-btn';
-      if (turnId) btn.dataset.turn = turnId;
-      btn.textContent = '🔊';
-      btn.title = t('speaker.tip');
-      let holdTimer = null, didHold = false;
-      const clear = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
-      btn.addEventListener('pointerdown', (e) => {
+      btn.className = 'msg-menu-btn';
+      btn.textContent = '\u22EE';   // ⋮
+      btn.title = t('msg.menu');
+      btn.setAttribute('aria-label', t('msg.menu'));
+      btn.addEventListener('click', (e) => {
         e.preventDefault(); e.stopPropagation();
         if (btn.classList.contains('disabled')) return;
-        didHold = false;
-        holdTimer = setTimeout(() => { didHold = true; if (turnId) onSpeakerHold(turnId); }, 450);
+        const drop = wrap.querySelector('.msg-menu-drop');
+        if (!drop) return;
+        if (drop.classList.contains('open')) { closeMessageMenu(); return; }
+        closeMessageMenu();   // close any other open menu first
+        drop.classList.add('open');
+        _openMenu = drop;
       });
-      btn.addEventListener('pointerup', (e) => {
-        e.preventDefault(); clear();
-        if (btn.classList.contains('disabled')) return;
-        if (!didHold && turnId) onSpeakerTap(turnId);
+
+      const drop = document.createElement('div');
+      drop.className = 'msg-menu-drop';
+
+      // Play / Pause item
+      const playItem = document.createElement('button');
+      playItem.className = 'mm-play';
+      playItem.textContent = '▶️ ' + t('msg.play_audio');
+      playItem.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (turnId) onSpeakerTap(turnId);
+        closeMessageMenu();
       });
-      btn.addEventListener('pointerleave', clear);
-      btn.addEventListener('pointercancel', clear);
-      return btn;
+      drop.appendChild(playItem);
+
+      // Replay from start
+      const replayItem = document.createElement('button');
+      replayItem.className = 'mm-replay';
+      replayItem.textContent = '🔁 ' + t('msg.replay_audio');
+      replayItem.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (turnId) onSpeakerHold(turnId);
+        closeMessageMenu();
+      });
+      drop.appendChild(replayItem);
+
+      // Download item
+      const dlItem = document.createElement('button');
+      dlItem.className = 'mm-download';
+      dlItem.textContent = '💾 ' + t('msg.download_audio');
+      dlItem.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (turnId) downloadTtsAudio(turnId);
+        closeMessageMenu();
+      });
+      drop.appendChild(dlItem);
+
+      wrap.appendChild(btn);
+      wrap.appendChild(drop);
+
+      // Also add a hidden .spk-btn so refreshSpeakerButtons legacy path works
+      const legacyBtn = document.createElement('button');
+      legacyBtn.className = 'spk-btn';
+      if (turnId) legacyBtn.dataset.turn = turnId;
+      legacyBtn.textContent = '🔊';
+      wrap.appendChild(legacyBtn);
+
+      return wrap;
     }
 
     /* ===== Barge-In =========================================================
