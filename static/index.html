@@ -2,7 +2,7 @@
 <html lang="__APP_LANG__">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title data-i18n="app_title">🎙️ Plauder</title>
   <style>
     :root {
@@ -28,7 +28,7 @@
       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       height: 100%;
     }
-    body { display: flex; flex-direction: column; min-height: 100vh; }
+    body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
     header {
       padding: 10px 16px;
       border-bottom: 1px solid var(--border);
@@ -46,6 +46,7 @@
     /* Footer: status on the left, stats on the right */
     footer {
       padding: 8px 16px; border-top: 1px solid var(--border);
+      padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
       background: var(--panel); display: flex; align-items: center; gap: 14px;
       font-size: 12.5px; flex-wrap: wrap;
     }
@@ -662,6 +663,13 @@
     </div>
 
     <div class="card">
+      <div class="label" data-i18n="settings.microphone">Microphone</div>
+      <select id="micSelect" style="width:100%;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit;cursor:pointer;outline:none;">
+        <option value="" data-i18n="settings.microphone_default">System default</option>
+      </select>
+    </div>
+
+    <div class="card">
       <div class="label" data-i18n="settings.volume">Volume</div>
       <div class="slider-row">
         <input id="volume" type="range" min="0" max="100" value="80" />
@@ -776,6 +784,9 @@
         "settings.speed": "Speaking speed",
         "settings.debounce": "Thinking-pause tolerance",
         "settings.debounce_help": "How long may you pause within a sentence without the agent replying prematurely? Affects both the browser VAD and the server debounce.",
+        "settings.microphone": "Microphone",
+        "settings.microphone_default": "System default",
+        "settings.microphone_fallback": "Microphone {n}",
         "settings.volume": "Volume",
         "settings.cue_volume_help": "Wake tones (pling/plong) · 0 = off",
         "settings.connection": "Connection / session",
@@ -910,6 +921,9 @@
         "settings.speed": "Sprechgeschwindigkeit",
         "settings.debounce": "Denkpausen-Toleranz",
         "settings.debounce_help": "Wie lange darfst du innerhalb eines Satzes pausieren, ohne dass der Agent vorzeitig antwortet? Wirkt sowohl auf das Browser-VAD als auch auf den Server-Debounce.",
+        "settings.microphone": "Mikrofon",
+        "settings.microphone_default": "Systemstandard",
+        "settings.microphone_fallback": "Mikrofon {n}",
         "settings.volume": "Lautstärke",
         "settings.cue_volume_help": "Wake-Töne (Pling/Plong) · 0 = aus",
         "settings.connection": "Verbindung / Session",
@@ -1137,6 +1151,68 @@
       debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
       volumeLabel.textContent = volume.value + '%';
     })();
+
+    /* ===== Microphone selection =====
+       Lets users pick a specific mic when multiple audio-input devices are
+       present.  The chosen deviceId is persisted in localStorage and threaded
+       into every getUserMedia call (startMic, ensurePttCtx) plus the Silero
+       VAD init.  '' = system default (no deviceId constraint). */
+    const micSelect = document.getElementById('micSelect');
+    let selectedMicId = loadSavedSetting('micDeviceId') || '';
+
+    function micConstraints() {
+      const c = {
+        echoCancellation: true, noiseSuppression: true,
+        autoGainControl: true, channelCount: 1, sampleRate: 16000,
+      };
+      if (selectedMicId) c.deviceId = { exact: selectedMicId };
+      return c;
+    }
+
+    async function refreshMicList() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const mics = devices.filter(d => d.kind === 'audioinput');
+        const prev = micSelect.value;
+        // Keep the default option, rebuild the rest.
+        while (micSelect.options.length > 1) micSelect.remove(1);
+        mics.forEach((d, i) => {
+          const opt = document.createElement('option');
+          opt.value = d.deviceId;
+          opt.textContent = d.label || t('settings.microphone_fallback', { n: i + 1 });
+          micSelect.appendChild(opt);
+        });
+        // Restore previous selection if still available.
+        if (prev && Array.from(micSelect.options).some(o => o.value === prev)) {
+          micSelect.value = prev;
+        } else if (selectedMicId && Array.from(micSelect.options).some(o => o.value === selectedMicId)) {
+          micSelect.value = selectedMicId;
+        } else {
+          micSelect.value = '';
+          selectedMicId = '';
+          saveSetting('micDeviceId', '');
+        }
+      } catch (e) { console.warn('[mic-select] enumerateDevices failed:', e); }
+    }
+
+    micSelect.addEventListener('change', async () => {
+      selectedMicId = micSelect.value;
+      saveSetting('micDeviceId', selectedMicId);
+      // Restart the active capture pipeline so the new device takes effect.
+      if (micActive && vadLike()) {
+        restartVadSoon();
+      } else if (inputMode === 'ptt' && (pttCtx || pttStream)) {
+        const wasRecording = pttRecording;
+        if (wasRecording) await stopPttRecording();
+        await teardownPttCtx();
+        await ensurePttCtx();
+      }
+    });
+
+    // Initial enumeration (labels may be empty before permission grant).
+    refreshMicList();
+
     const vadThreshold      = document.getElementById('vadThreshold');
     const vadThresholdLabel = document.getElementById('vadThresholdLabel');
     const vadProbBar        = document.getElementById('vadProbBar');
@@ -2717,12 +2793,11 @@
       try {
         if (!silent) setMicUi('loading');
         micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true, noiseSuppression: true,
-            autoGainControl: true, channelCount: 1, sampleRate: 16000,
-          },
+          audio: micConstraints(),
           video: false,
         });
+        // Re-enumerate so device labels become visible after permission grant.
+        refreshMicList();
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const src = audioCtx.createMediaStreamSource(micStream);
         analyser = audioCtx.createAnalyser();
@@ -2760,6 +2835,9 @@
         if (!window.vad) throw new Error(t('err.vad_not_loaded'));
         if (!silent) setVad('warn', t('vad.loading'));
         vad = await window.vad.MicVAD.new({
+          // Use the already-opened mic stream so the VAD captures from the
+          // user-selected device instead of opening its own default-device stream.
+          stream: micStream,
           // Local asset paths (no CDN)
           modelURL: `${BASE}/static/vendor/silero_vad.onnx`,
           workletURL: `${BASE}/static/vendor/vad.worklet.bundle.min.js`,
@@ -2959,12 +3037,11 @@
       // key. Stream + context stay open during PTT mode.
       if (pttCtx && pttStream && pttSource && pttNode) return;
       pttStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true, noiseSuppression: true,
-          autoGainControl: true, channelCount: 1, sampleRate: 16000,
-        },
+        audio: micConstraints(),
         video: false,
       });
+      // Re-enumerate so device labels become visible after permission grant.
+      refreshMicList();
       pttCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
       if (pttCtx.state === 'suspended') {
         try { await pttCtx.resume(); } catch(_) {}
@@ -3507,6 +3584,8 @@
 
     async function handleDeviceChange() {
       console.log('[device-switch] devicechange detected');
+      // Refresh the microphone dropdown so newly connected/disconnected devices appear.
+      refreshMicList();
 
       // --- 1) Switch playback output (AudioContext.setSinkId) ---
       // setSinkId('') = system default output device.
