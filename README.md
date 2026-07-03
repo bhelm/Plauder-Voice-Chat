@@ -166,12 +166,14 @@ active. In the cloud default no GPU code is ever loaded.
 2. `TurnState` collects inputs within the debounce window (`DEBOUNCE_MS`); new input
    aborts in-flight LLM/TTS calls (barge-in).
 3. STT → text; Whisper hallucinations are filtered out.
-4. **Wake-word gate** (only in wake mode, per connection): only segments
+4. **Voice-lock gate** (only when enrolled): segments not spoken by the owner
+   are dropped; mixed segments are trimmed to the owner's part.
+5. **Wake-word gate** (only in wake mode, per connection): only segments
    addressed to the AI trigger a turn.
-5. `ConversationManager` appends the history and calls the LLM
+6. `ConversationManager` appends the history and calls the LLM
    (`chat_stream` in streaming mode, otherwise `chat`).
-6. `sanitizer` removes emojis/Markdown/links; TTS synthesizes sentence by sentence.
-7. Audio goes to the browser as turn-id-tagged frames.
+7. `sanitizer` removes emojis/Markdown/links; TTS synthesizes sentence by sentence.
+8. Audio goes to the browser as turn-id-tagged frames.
 
 ---
 
@@ -233,41 +235,54 @@ owner profile. A mismatch is dropped as `transcript.ignored` (`speaker_mismatch`
 **before** it reaches the wake gate or the LLM, and it does not interrupt a running
 reply. It is language-independent, so Whisper keeps doing the German ASR.
 
-**Mixed segments are trimmed:** when a segment ≥ 2 s mixes the owner with other
-voices speaking right before/after (sequential — e.g. the kids keep talking into
-your sentence), the gate analyzes ~1 s windows, keeps only the owner's spans and
-re-transcribes just those (one extra STT call in the mixed case). Simultaneous
+**Mixed segments are trimmed, sentence-level:** when other voices talk into the
+same segment right before/after the owner (a train announcement, kids, a video),
+the gate scores **equal-length ~3 s blocks** on a fixed grid — embedding scores
+are heavily length-sensitive, so only same-length blocks of the same segment are
+comparable — and cuts sustained foreign passages (≥ 2.5 s) relative to the
+segment's best block, then re-transcribes the kept audio (one extra STT call in
+the mixed case). Single foreign words are deliberately never cut: they don't
+falsify the transcript, and short-clip scores are unreliable. The removed text
+stays visible in the transcript, red and struck through. Simultaneous
 overlapping speech cannot be separated this way — that would need neural
 target-speaker extraction. Kill switch: `SPEAKER_TRIM=0`.
 
 **Barge-in follows the lock too:** while the lock is engaged the client does not
 stop playback on VAD speech (any voice would trigger that). Playback is only
 *ducked* while the server verifies the speaker on the live input stream
-(~1 s of audio); a confirmed owner voice cancels the reply (`audio.stop`), a
+(~1.5 s of audio); a confirmed owner voice cancels the reply (`audio.stop`), a
 foreign voice lets it keep playing at full volume. The stop button and
 push-to-talk always interrupt (deliberate user actions).
 
 **Setup** (optional, off by default):
 
 1. `pip install sherpa-onnx` (bundles the kaldi-fbank the model expects; no torch).
-2. Download a speaker-embedding model, e.g.
-   `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` (multilingual, ~28 MB) from
+2. Download a speaker-embedding model — recommended:
+   `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx` (~28 MB) from
    the [sherpa-onnx speaker models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recognition-models).
+   (Benchmarked on real field audio it separates owner vs. foreign voices far
+   better than `campplus_en_voxceleb_16k.onnx` — same size and CPU speed.)
 3. In `.env`: `SPEAKER_LOCK_ENABLED=1` and `SPEAKER_MODEL_PATH=/abs/path/model.onnx`.
 4. Start the server, open the UI → **Voice lock** card → **Learn my voice**
-   (records ~6 s; add another sample if recognition is unreliable). The profile is
-   written to `SPEAKER_PROFILE_PATH` and reused across restarts.
+   (records ~6 s; 3–5 samples with your everyday mic and distance give a solid
+   profile). The profile is written to `SPEAKER_PROFILE_PATH` and reused across
+   restarts. The strictness slider in the card adjusts the threshold live.
 
 Until a profile is enrolled the gate stays open (fail-open), and any load problem
-(missing model/dep) simply disables it rather than blocking the mic.
+(missing model/dep) simply disables it rather than blocking the mic. The profile
+is **model-specific**: after switching `SPEAKER_MODEL_PATH` a profile enrolled
+with another model is ignored (logged) and you re-enroll.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SPEAKER_LOCK_ENABLED` | `0` | Enable the voice gate |
 | `SPEAKER_MODEL_PATH` | — | Absolute path to the CAM++/WeSpeaker ONNX model |
 | `SPEAKER_PROFILE_PATH` | `./speaker_profile.json` | Where the enrolled profile is stored |
-| `SPEAKER_THRESHOLD` | `0.5` | Cosine similarity to accept (higher = stricter) |
+| `SPEAKER_THRESHOLD` | `0.5` | Cosine similarity to accept (higher = stricter; start default — the UI slider adjusts it live) |
 | `SPEAKER_MIN_DUR_S` | `0.6` | Segments shorter than this can't be verified → dropped |
+| `SPEAKER_TRIM` | `1` | Cut sustained foreign passages out of mixed segments |
+| `SPEAKER_DEBUG` | `0` | Log per-block scores per segment (threshold tuning) |
+| `SPEAKER_DUMP_DIR` | — | Dump gated segments + enroll takes as WAVs (offline gate debugging; newest ~200 kept) |
 | `SPEAKER_PROVIDER` | `cpu` | onnxruntime provider: `cpu` \| `cuda` |
 
 ---
@@ -331,7 +346,9 @@ plauder/
 ├── turn_state.py          # debounce + coalescing, VAD parameters
 ├── sanitizer.py           # emoji/markdown stripping, ghost filter, NO_REPLY
 ├── wake.py                # wake-word matching (STT prefix, fuzzy)
+├── speaker_verify.py      # voice lock: speaker embeddings, enrollment, block scoring
 ├── session.py             # ConversationManager (history per session key)
+├── hermes_history.py      # optional: fetch prior history from a Hermes gateway
 ├── telegram_bridge.py     # optional Telegram mirroring (legacy, off by default)
 └── backends/
     ├── stt/{base,openai_api,whisper_local}.py
