@@ -26,23 +26,32 @@ PCM_CHUNK_MAGIC = b"VCT2"
 
 
 def pcm_bytes_to_float32_array(pcm_bytes: bytes) -> np.ndarray:
-    """Raw float32 PCM bytes (as from the browser) → numpy array."""
-    return np.frombuffer(pcm_bytes, dtype=np.float32)
+    """Raw float32 PCM bytes (as from the browser) → numpy array.
+    Browser frames can arrive truncated; trailing partial samples are dropped
+    instead of raising (np.frombuffer requires 4-byte alignment)."""
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 4)
+    return np.frombuffer(pcm_bytes[:usable], dtype=np.float32)
 
 
 def crop_f32_spans(pcm_bytes: bytes, sample_rate: int, spans) -> bytes:
     """Cut ``[(start_s, end_s), …]`` spans out of a float32 mono buffer and
-    concatenate them (speaker-lock trimming of mixed-voice segments)."""
+    concatenate them (speaker-lock trimming of mixed-voice segments).
+    Spans are sorted and overlaps merged so audio is never duplicated or
+    reordered by a sloppy caller."""
     samples = pcm_bytes_to_float32_array(pcm_bytes)
-    parts = []
-    for s, e in spans:
+    norm: list[list[int]] = []
+    for s, e in sorted(spans):
         a = max(0, int(s * sample_rate))
         b = min(samples.shape[0], int(e * sample_rate))
-        if b > a:
-            parts.append(samples[a:b])
-    if not parts:
+        if b <= a:
+            continue
+        if norm and a <= norm[-1][1]:
+            norm[-1][1] = max(norm[-1][1], b)
+        else:
+            norm.append([a, b])
+    if not norm:
         return b""
-    return np.concatenate(parts).astype(np.float32).tobytes()
+    return np.concatenate([samples[a:b] for a, b in norm]).astype(np.float32).tobytes()
 
 
 def float32_to_pcm16_bytes(samples):
@@ -245,6 +254,14 @@ def split_text_for_tts(text: str, max_chars: int) -> list[str]:
 # flush prematurely while more characters may still follow (e.g. "z.B.").
 _STREAM_BOUNDARY_RE = re.compile(r"(.*?[.!?…]['\"\)\]»]?)\s", re.S)
 
+# The candidate "sentence" ends in an abbreviation or ordinal, not a real
+# boundary: a single letter + "." ("z.", "B.", "u. a."), a known German/English
+# abbreviation, or a bare number ("1.", "2024."). Mid-stream these must keep
+# buffering — otherwise "z.B. eine Sache" ships "z.B." as its own TTS call.
+_ABBREV_TAIL_RE = re.compile(
+    r"(?:\b[A-Za-zÄÖÜäöü]|\b(?:z\s?\.\s?B|u\s?\.\s?a|d\s?\.\s?h|bzw|ca|ggf|evtl"
+    r"|inkl|vgl|usw|etc|Nr|Dr|Prof|Mr|Mrs|Ms|St)|\b\d{1,4})\.$")
+
 
 def split_stream_sentences(buffer: str, max_chars: int) -> tuple[list[str], str]:
     """Cuts all already-complete sentences out of a continuously growing LLM
@@ -260,12 +277,25 @@ def split_stream_sentences(buffer: str, max_chars: int) -> tuple[list[str], str]
     buf = buffer
     while buf:
         m = _STREAM_BOUNDARY_RE.match(buf)
-        if m:
+        if m and not _ABBREV_TAIL_RE.search(m.group(1).rstrip()):
             sent = m.group(1).strip()
             if sent:
                 sentences.append(sent)
             buf = buf[m.end():]
             continue
+        if m:
+            # Abbreviation/ordinal boundary: try the NEXT boundary within the
+            # same buffer so "z.B. eine Sache. Und" still flushes one sentence.
+            nxt = _STREAM_BOUNDARY_RE.match(buf, m.end())
+            while nxt and _ABBREV_TAIL_RE.search(
+                    buf[:nxt.end()].rstrip().rstrip("'\"»)]")):
+                nxt = _STREAM_BOUNDARY_RE.match(buf, nxt.end())
+            if nxt:
+                sent = buf[:nxt.end()].strip()
+                if sent:
+                    sentences.append(sent)
+                buf = buf[nxt.end():]
+                continue
         if len(buf) > max_chars > 0:
             cut = buf.rfind(" ", 0, max_chars)
             if cut <= 0:

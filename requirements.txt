@@ -8,9 +8,6 @@ aiohttp>=3.9,<4
 openai>=1.0,<2
 numpy>=1.24,<3
 
-# The .env is loaded by the package itself (its own mini parser); python-dotenv
-# is optional/convenience.
-python-dotenv>=1.0,<2
 
 # Tests
 pytest>=7.0,<9

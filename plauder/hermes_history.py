@@ -65,14 +65,24 @@ async def fetch_history(
         LOG.warning("hermes history: fetch failed: %s", exc)
         return []
 
-    # The API returns {"data": [...]} or {"messages": [...]}.
-    raw = data.get("data") or data.get("messages") or []
+    # The API returns {"data": [...]} or {"messages": [...]} — or, from other
+    # server versions, a bare list. Anything malformed must not violate the
+    # "never raises" contract, so shape-check every level.
+    if isinstance(data, dict):
+        raw = data.get("data") or data.get("messages") or []
+    elif isinstance(data, list):
+        raw = data
+    else:
+        raw = []
+    if not isinstance(raw, list):
+        raw = []
 
-    # Filter to user/assistant only (skip tool, system, etc.).
+    # Filter to user/assistant only (skip tool, system, malformed entries).
     chat = [
-        {"role": m["role"], "content": m.get("content") or ""}
+        {"role": m["role"], "content": str(m.get("content"))}
         for m in raw
-        if m.get("role") in ("user", "assistant") and m.get("content")
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant") and m.get("content")
     ]
 
     # Cap to the last max_messages entries.

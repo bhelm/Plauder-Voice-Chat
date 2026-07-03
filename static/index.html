@@ -1097,6 +1097,7 @@
         "sys.new_session_requested": "✍️  Requesting new session …",
         "wake.ignored_count": "🔇 ignored (no wake word) · {count}×",
         "wake.ignored_text": "🔇 “{text}” — ignored (no wake word)",
+        "wake.ignored_closed": "🔇 “{text}” — ignored (channel closed)",
         "wake.ignored_speaker": "🔇 “{text}” — ignored (not your voice)",
         "wake.ignored_speaker_count": "🔇 ignored (not your voice) · {count}×",
         // Voice lock: realtime segment chips
@@ -1268,6 +1269,7 @@
         "sys.new_session_requested": "✍️  Neue Session angefordert …",
         "wake.ignored_count": "🔇 ignoriert (kein Wake-Word) · {count}×",
         "wake.ignored_text": '🔇 „{text}" — ignoriert (kein Wake-Word)',
+        "wake.ignored_closed": '🔇 „{text}" — ignoriert (Kanal geschlossen)',
         "wake.ignored_speaker": '🔇 „{text}" — ignoriert (nicht deine Stimme)',
         "wake.ignored_speaker_count": "🔇 ignoriert (nicht deine Stimme) · {count}×",
         // Voice lock: Echtzeit-Segment-Chips
@@ -1850,7 +1852,9 @@
       }
       _lastIgnoredCount = 1;
       _lastIgnoredReason = reason;
-      const key = reason === 'speaker_mismatch' ? 'wake.ignored_speaker' : 'wake.ignored_text';
+      const key = reason === 'speaker_mismatch' ? 'wake.ignored_speaker'
+                : reason === 'wake_closed' ? 'wake.ignored_closed'
+                : 'wake.ignored_text';
       _lastIgnoredBubble = addBubble('wake-ignored', t(key, { text: txt }));
     }
 
@@ -2020,23 +2024,35 @@
     function setBubbleText(el, turnId, plainText, partialSuffix) {
       const arr = turnVoiceHtml.get(turnId);
       let box = el.querySelector(':scope > .vtext');
+      // Den TEXT-Knoten der Bubble suchen — firstChild blind zu nehmen
+      // zerstört Bild-Bubbles (dort ist firstChild der .images-Container).
+      const findTextNode = () => {
+        for (const n of el.childNodes) {
+          if (n.nodeType === Node.TEXT_NODE) return n;
+        }
+        return null;
+      };
       if (arr && arr.length) {
         if (!box) {
           box = document.createElement('span');
           box.className = 'vtext';
-          el.replaceChild(box, el.firstChild);
+          const txtNode = findTextNode();
+          if (txtNode) el.replaceChild(box, txtNode);
+          else el.insertBefore(box, el.querySelector(':scope > .meta'));
         }
         box.innerHTML = arr.join(' ') + (partialSuffix ? ' ' + escHtml(partialSuffix) + ' …' : '');
         return;
       }
-      if (box) box.textContent = plainText;
-      else el.firstChild.nodeValue = plainText;
+      if (box) { box.textContent = plainText; return; }
+      const txtNode = findTextNode();
+      if (txtNode) txtNode.nodeValue = plainText;
+      else el.insertBefore(document.createTextNode(plainText), el.querySelector(':scope > .meta'));
     }
     function updateUserBubble(turnId, text, debounceMs) {
       const el = getOrCreateUserBubble(turnId);
       setBubbleText(el, turnId, text || '…');
       el.classList.add('collecting');
-      el.classList.remove('pending');
+      el.classList.remove('pending', 'partial');
       if (debounceMs) setMeta(el, t('turn.collecting', { id: turnId.substr(0,4), s: (debounceMs/1000).toFixed(1) }));
     }
     function commitUserBubble(turnId, text) {
@@ -2055,6 +2071,27 @@
       el.classList.add('collecting', 'partial');
       el.classList.remove('pending');
       setMeta(el, t('turn.listening', { id: turnId.substr(0,4) }));
+    }
+    // Letzter committeter turn.pending-Text pro Turn — Basis, um eine Bubble
+    // nach einem verworfenen Segment (Ghost/leer/ignored) aus dem
+    // Partial-Zustand zurückzusetzen statt den nie akzeptierten Text stehen
+    // zu lassen.
+    const turnPendingText = new Map();
+    function clearStalePartial(turnId) {
+      const el = turnId ? turnUserBubble.get(turnId) : null;
+      if (!el || !el.classList.contains('partial')) return;
+      const pend = turnPendingText.get(turnId);
+      const hasHtml = (turnVoiceHtml.get(turnId) || []).length > 0;
+      if (pend || hasHtml) {
+        setBubbleText(el, turnId, pend || '…');
+        el.classList.remove('partial');
+        setMeta(el, t('turn.meta', { id: turnId.substr(0,4) }));
+      } else {
+        // Bubble existierte nur wegen des Partials → weg damit; sonst erbt
+        // der NÄCHSTE Turn eine Bubble mit nie akzeptiertem Text.
+        el.remove();
+        turnUserBubble.delete(turnId);
+      }
     }
     function discardTurn(turnId) {
       // Current user bubble stays; agent bubble (if any) is struck through
@@ -2872,6 +2909,12 @@
           if (m.messages && m.messages.length) {
             clearTranscript();
             chatLog.innerHTML = '';
+            // Alle Bubble-Maps zeigen jetzt auf detached DOM-Knoten — leeren,
+            // sonst updaten Events eines laufenden Turns unsichtbare Bubbles.
+            turnUserBubble.clear(); turnAgentBubble.clear();
+            turnVoiceHtml.clear(); turnReplyText.clear();
+            turnPendingText.clear(); segPartialText.clear();
+            _lastSegFeed = null; _lastIgnoredBubble = null; _coalesceCarry = null;
             addBubble('sys', t('sys.previous_session'));
             for (const msg of m.messages) {
               if (msg.role === 'assistant') {
@@ -2914,6 +2957,7 @@
             if (turnUserBubble.has(m.turnId)) {
               pushVoiceHtml(m.turnId, cutHtml);
               setBubbleText(turnUserBubble.get(m.turnId), m.turnId, '');
+              turnUserBubble.get(m.turnId).classList.remove('partial');
             } else {
               // No open turn: minimal red line (the text appears exactly once).
               if (_lastSegFeed && _lastSegFeed.parentNode && chatLog.lastElementChild === _lastSegFeed) {
@@ -2930,6 +2974,7 @@
             }
           } else {
             showIgnoredBubble(m.text, m.reason);
+            clearStalePartial(m.turnId);
           }
           if (m.segmentId) segPartialText.delete(m.segmentId);
           if (micActive) setMicUi('listening');
@@ -2978,6 +3023,10 @@
           // Window ended (stop command / manual / Alexa one-shot) → timer
           // off + closing cue. In one-shot mode this happens after EVERY
           // reply → no bubble (otherwise spam), just the subtle cue.
+          // Ein Stopp-Kommando muss auch die CLIENTSEITIG noch gepufferten
+          // Audio-Sekunden stoppen: der Server kann nach audio.end kein
+          // audio.stop mehr für diese Id senden (audio_ids bereits geräumt).
+          if (m.reason === 'stop_command') { stopCurrentAudio(); stopStreamPlayback(); }
           cancelWakeWindowTimer();
           setWakeWindowActive(false);
           playCue('off');
@@ -3016,10 +3065,13 @@
           }
           if (m.segmentId) segPartialText.delete(m.segmentId);
           if (!m.text) {
-            // ignore — turn.pending does not arrive
+            // Segment dropped (leer/ghost) — turn.pending kommt nicht; eine
+            // evtl. vom Partial erzeugte Bubble darf nicht hängen bleiben.
+            clearStalePartial(m.turnId);
           }
           break;
         case 'turn.pending':
+          turnPendingText.set(m.turnId, m.text);
           updateUserBubble(m.turnId, m.text, m.debounceMs);
           if (micActive) setMicUi('collecting');
           break;
@@ -3037,6 +3089,7 @@
           } else {
             discardTurn(m.turnId);
           }
+          turnPendingText.delete(m.turnId);
           // Also stop the audio of the discarded turn if it is currently playing.
           stopAudioForTurn(m.turnId);
           setAgentBusy(false);
@@ -3081,6 +3134,12 @@
             commitUserBubble(m.turnId, m.text);
             if (micActive) setMicUi('thinking');
           }
+          turnPendingText.delete(m.turnId);
+          // Ein bis hierhin nicht konsumierter Coalesce-Carry gehört zu KEINEM
+          // späteren Turn mehr (z.B. wenn dieser Turn ein Text-Send war, der
+          // getOrCreateUserBubble nie durchlief) — sonst klebt er irgendwann
+          // an einer völlig fremden Voice-Bubble.
+          _coalesceCarry = null;
           persistMsg('user', m.text);   // remember for reload restoration
           break;
         case 'reply.start':
@@ -3136,7 +3195,13 @@
           break;
         case 'audio.start':
           // A2: progressive PCM-Wiedergabe starten (Chunks folgen als VCT2-Binary).
-          startStreamPlayback(m.turnId, m.audioId, m.sampleRate);
+          // Nur im Streaming-Pfad (sampleRate gesetzt): der klassische Pfad
+          // (STREAMING=0) liefert ein VCT1-WAV und sendet kein audio.end —
+          // ein hier gestarteter Stream-Player bliebe für immer "playing"
+          // (Stop-Button dauerhaft an, Wake-Timer blockiert, Phantom-Barge-ins).
+          if (Number.isFinite(m.sampleRate)) {
+            startStreamPlayback(m.turnId, m.audioId, m.sampleRate);
+          }
           // E2E latency to first playback + first-token values for agent/TTS.
           if (Number.isFinite(m.e2eMs)) {
             lastE2e.textContent = `${m.e2eMs}ms`;
@@ -3179,6 +3244,8 @@
           break;
         case 'transcript.error':
           addBubble('err', t('err.stt', { error: m.error }));
+          if (m.segmentId) segPartialText.delete(m.segmentId);
+          clearStalePartial(m.turnId);
           break;
         case 'ack':
           break;
@@ -3252,7 +3319,10 @@
       turnUserBubble.clear();
       turnVoiceHtml.clear();
       segPartialText.clear();
+      turnPendingText.clear();
+      turnReplyText.clear();   // sonst belebt ein spätes reply.delta eine Bubble im geleerten Chat
       _coalesceCarry = null;
+      _lastSegFeed = null; _lastIgnoredBubble = null;
       turnAgentBubble.clear();
       pendingTextLocalTurnIds.length = 0;
       clearTranscript();   // gespeichertes Transkript verwerfen → Reload startet frisch
@@ -3641,6 +3711,9 @@
         addBubble('err', t('err.ws_not_connected_segment'));
         return;
       }
+      // Während des Enrollments interpretiert der Server Binärframes als
+      // Enroll-Aufnahme — ein Segment jetzt würde beide Ströme vermischen.
+      if (enrolling) return;
       ws.send(JSON.stringify({
         type: 'segment.start',
         segmentId,
@@ -3806,7 +3879,14 @@
         ws.send(JSON.stringify({ type: 'speaker.enroll.start' }));
         const target = 16000 * ENROLL_SECONDS;
         let sent = 0;
-        await new Promise((resolve) => {
+        await new Promise((resolve, reject) => {
+          // Ohne Timeout hinge die Aufnahme für immer, wenn der
+          // ScriptProcessor stumm stirbt (Tab im Hintergrund, Gerät weg) —
+          // und das finally liefe nie: enrolling bliebe true, der VAD-Tap
+          // dauerhaft unterdrückt (Spracheingabe tot bis zum Reload).
+          const deadline = setTimeout(
+            () => reject(new Error('enrollment timed out (no audio frames)')),
+            ENROLL_SECONDS * 1000 + 8000);
           tap.onaudioprocess = (ev) => {
             if (sent >= target) return;
             const ds = downsampleTo16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
@@ -3815,7 +3895,7 @@
             const pct = Math.min(100, Math.round((sent / target) * 100));
             if (voiceLockProg) voiceLockProg.style.width = pct + '%';
             enrollVoiceLabel.textContent = t('voicelock.recording', { pct });
-            if (sent >= target) resolve();
+            if (sent >= target) { clearTimeout(deadline); resolve(); }
           };
           src.connect(tap);
           sink = ctx.createGain(); sink.gain.value = 0;
@@ -3941,6 +4021,7 @@
 
     async function startPttRecording() {
       if (pttRecording || pttArming) return;
+      if (enrolling) return;   // Enroll-Aufnahme läuft: PTT-Frames würden den binären Kanal korrumpieren
       // Speech start for the speaker-ID hold = moment of the key press (PTT has
       // keinen VAD-onSpeechStart). Vor bargeInStop setzen.
       lastSpeechStartTs = Date.now();
@@ -4010,7 +4091,14 @@
     async function teardownPttCtx() {
       pttRecording = false;
       pttPostRollFramesLeft = 0;
-      pttPendingFinalize = null;
+      // Eine noch ausstehende Post-Roll-Finalisierung SOFORT ausführen statt
+      // wegwerfen — sonst verschluckt ein Mikro-/Moduswechsel direkt nach dem
+      // Loslassen der PTT-Taste die komplette Aufnahme.
+      if (pttPendingFinalize) {
+        const fin = pttPendingFinalize;
+        pttPendingFinalize = null;
+        try { fin(); } catch (_) {}
+      }
       pttBuffers = [];
       pttPreRoll = [];
       try { if (pttNode) pttNode.disconnect(); } catch(_) {}

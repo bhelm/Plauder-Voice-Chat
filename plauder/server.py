@@ -5,12 +5,14 @@ Transport + turn orchestration only. STT/TTS/LLM sit behind pluggable
 backends (see plauder.backends), chosen via .env. Text processing
 (sanitizer, hallucination filter, merging) and turn state are separate modules.
 
-Pipeline:
-  Browser (16 kHz float32 PCM via VAD/push-to-talk)
+Pipeline (STREAMING=1, the default — see _stream_reply_and_tts):
+  Browser (16 kHz float32 PCM via VAD/push-to-talk/wake word)
     └─ WebSocket → TurnState (debounce + coalescing)
                  → STT.transcribe → hallucination filter
-                 → ConversationManager.chat (LLM + history)
-                 → sanitizer → TTS.synth → WAV → browser
+                 → speaker-lock gate → wake-word gate
+                 → ConversationManager.chat_stream (LLM tokens live)
+                 → sanitizer → sentence-wise TTS → VCT2 PCM chunks → browser
+STREAMING=0 falls back to chat() → TTS.synth → one WAV (VCT1).
 """
 
 from __future__ import annotations
@@ -269,6 +271,7 @@ async def _run_turn(ws, state: TurnState):
              turn_id, len(state.pending_texts), len(text_parts), len(image_urls), combined[:200])
 
     state.inflight_combined = combined   # for coalescing (see _capture_coalesce)
+    state.inflight_images = list(image_urls)
     state.audio_started = False          # no audio of THIS turn emitted yet
     if BRIDGE:
         BRIDGE.begin_local_call()
@@ -278,6 +281,7 @@ async def _run_turn(ws, state: TurnState):
                               image_urls=image_urls, segment_ids=segment_ids)
     finally:
         state.inflight_combined = None
+        state.inflight_images = []
         if BRIDGE:
             BRIDGE.end_local_call()
 
@@ -335,6 +339,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
     try:
         allow_retry = (CFG.llm_retry_timeout_on_idle
                        and not _queue_has_more_work(state, exclude_task=state.agent_task))
+        _apply_hermes_headers(state)   # see _consume_stream: singleton race
         reply_text, meta_agent, retried = await _agent_chat_with_retry(
             combined, image_urls=resolved_imgs if resolved_imgs else None,
             allow_retry=allow_retry, user_key=state.session_user or _default_user())
@@ -348,11 +353,13 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
                             "error": "upstream provider timeout",
                             "errorKind": "upstream_timeout", "ts": time.time()})
+        await _reopen_wake_window_after_silent(ws, state)
         return
     except Exception as exc:
         LOG.exception("turn=%s agent failed", turn_id)
         await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
                             "error": str(exc), "ts": time.time()})
+        await _reopen_wake_window_after_silent(ws, state)
         return
 
     if sanitizer.is_no_reply(reply_text):
@@ -364,6 +371,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
             "usage": meta_agent.get("usage"),
             "finishReason": meta_agent.get("finish_reason"), "ts": time.time(),
         })
+        await _reopen_wake_window_after_silent(ws, state)
         return
 
     llm_ms = int((time.time() - t_llm) * 1000)
@@ -509,9 +517,10 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
 
     async def _emit_text():
         """Sends new reply text to the client — but only once it's clear that
-        it's not a pure NO_REPLY (otherwise 'NO_REPLY' would briefly flash up)."""
+        it's not a pure NO_REPLY (otherwise 'NO_REPLY' — or a partial 'NO_'
+        token — would briefly flash up)."""
         full = "".join(parts)
-        if not flushed_any["v"] and sanitizer.is_no_reply(full.strip()):
+        if not flushed_any["v"] and sanitizer.is_no_reply_prefix(full.strip()):
             return
         if len(full) > sent_len["v"]:
             await ws.send_json({
@@ -521,8 +530,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
 
     async def _release(force: bool = False):
         full = "".join(parts).strip()
-        if not flushed_any["v"] and not force and sanitizer.is_no_reply(full):
-            return  # still looks like NO_REPLY → hold back the sentences
+        if not flushed_any["v"] and not force and sanitizer.is_no_reply_prefix(full):
+            return  # could still become NO_REPLY → hold back the sentences
         while held:
             cleaned = sanitizer.sanitize_for_tts(held.pop(0), pronunciations_file=pron)
             if cleaned:
@@ -533,6 +542,12 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
 
     async def _consume_stream():
         nonlocal pending
+        # Re-apply THIS connection's Hermes session id right before the call:
+        # it lives on the process-wide LLM singleton, and awaits between turn
+        # start and request build let a concurrent connection overwrite it
+        # (cross-session contamination). This shrinks the race window to the
+        # request build itself.
+        _apply_hermes_headers(state)
         agen = CONV.chat_stream(
             combined, user_key=state.session_user or _default_user(),
             image_urls=resolved_imgs if resolved_imgs else None)
@@ -584,6 +599,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
         await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
                             "error": "upstream provider timeout",
                             "errorKind": "upstream_timeout", "ts": time.time()})
+        await _reopen_wake_window_after_silent(ws, state)
         return
     except Exception as exc:
         await _drain_tts()
@@ -591,41 +607,51 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
         LOG.exception("turn=%s agent stream failed", turn_id)
         await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
                             "error": str(exc), "ts": time.time()})
+        await _reopen_wake_window_after_silent(ws, state)
         return
 
-    # Take the remaining buffer as the last sentence.
-    if pending.strip():
-        held.append(pending.strip())
-    full_reply = "".join(parts).strip()
-    llm_ms = int((time.time() - t_llm) * 1000)
-    meta = dict(getattr(CONV, "last_stream_meta", {}) or {})
+    # From here on the TTS worker is still alive — a barge-in cancel landing in
+    # any of the awaits below must not orphan it (it would keep sending audio
+    # of the discarded turn and then block forever on the sentence queue).
+    try:
+        # Take the remaining buffer as the last sentence.
+        if pending.strip():
+            held.append(pending.strip())
+        full_reply = "".join(parts).strip()
+        llm_ms = int((time.time() - t_llm) * 1000)
+        meta = dict(getattr(CONV, "last_stream_meta", {}) or {})
 
-    if sanitizer.is_no_reply(full_reply):
-        await _drain_tts()
-        state.audio_ids.discard(audio_id)
-        LOG.info("turn=%s agent NO_REPLY llm=%dms (stream)", turn_id, llm_ms)
+        if sanitizer.is_no_reply(full_reply):
+            await _drain_tts()
+            state.audio_ids.discard(audio_id)
+            LOG.info("turn=%s agent NO_REPLY llm=%dms (stream)", turn_id, llm_ms)
+            await ws.send_json({
+                "type": "reply.silent", "turnId": turn_id, "replyId": reply_id,
+                "reason": "no_reply", "llmMs": llm_ms, "usage": meta.get("usage"),
+                "finishReason": meta.get("finish_reason"), "ts": time.time()})
+            await _reopen_wake_window_after_silent(ws, state)
+            return
+
+        await _release(force=True)            # release held-back sentences
+        await _emit_text()                    # remaining text to the client
+        cleaned_full = sanitizer.sanitize_for_tts(full_reply, pronunciations_file=pron)
+        LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
         await ws.send_json({
-            "type": "reply.silent", "turnId": turn_id, "replyId": reply_id,
-            "reason": "no_reply", "llmMs": llm_ms, "usage": meta.get("usage"),
-            "finishReason": meta.get("finish_reason"), "ts": time.time()})
-        return
+            "type": "reply", "turnId": turn_id, "replyId": reply_id,
+            "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
+            "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
+            "streamed": True, "ts": time.time()})
 
-    await _release(force=True)            # release held-back sentences
-    await _emit_text()                    # remaining text to the client
-    cleaned_full = sanitizer.sanitize_for_tts(full_reply, pronunciations_file=pron)
-    LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
-    await ws.send_json({
-        "type": "reply", "turnId": turn_id, "replyId": reply_id,
-        "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
-        "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
-        "streamed": True, "ts": time.time()})
+        if BRIDGE and BRIDGE.enabled and cleaned_full:
+            BRIDGE.remember_self_sent(full_reply)
+            asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
 
-    if BRIDGE and BRIDGE.enabled and cleaned_full:
-        BRIDGE.remember_self_sent(full_reply)
-        asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
-
-    results = await _drain_tts()
-    state.audio_ids.discard(audio_id)
+        results = await _drain_tts()
+        state.audio_ids.discard(audio_id)
+    except asyncio.CancelledError:
+        tts_task.cancel()
+        await asyncio.gather(tts_task, return_exceptions=True)
+        raise
     total_chunks = next((r for r in results if isinstance(r, int)), 0)
     if started["audio"]:
         tts_ms = int((time.time() - t_tts0["t"]) * 1000) if t_tts0["t"] else 0
@@ -711,6 +737,14 @@ def _capture_coalesce(state: TurnState) -> str | None:
     return None
 
 
+def _capture_coalesce_images(state: TurnState) -> list:
+    """Image URLs belonging to the coalescable in-flight turn (see above)."""
+    if (state.agent_task and not state.agent_task.done()
+            and not state.audio_started):
+        return list(state.inflight_images)
+    return []
+
+
 def _hermes_keeps_history() -> bool:
     """True when the LLM backend continues a server-side Hermes session
     (X-Hermes-Session-Id). The gateway then loads the transcript from ITS
@@ -731,10 +765,14 @@ async def _coalesce_cancel(state: TurnState, ws):
     input over — visually always (flag), textually only when the backend does
     not keep server-side history."""
     resume = _capture_coalesce(state)
+    resume_imgs = _capture_coalesce_images(state)
     await _cancel_in_flight(state, ws, coalesced=bool(resume))
     if resume and not _hermes_keeps_history():
         state.pending_texts.insert(0, resume)
-        LOG.info("turn coalesced: re-queued %r", resume[:60])
+        if resume_imgs:
+            state.pending_image_urls[:0] = resume_imgs
+        LOG.info("turn coalesced: re-queued %r (+%d imgs)",
+                 resume[:60], len(resume_imgs))
 
 
 async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False):
@@ -828,6 +866,17 @@ async def _open_wake_window(ws, state: TurnState, now: float | None = None,
         "windowS": CFG.wake_word_window_s, "ts": now})
 
 
+async def _reopen_wake_window_after_silent(ws, state: TurnState):
+    """A silent/failed reply produces no audio, so no playback.done will
+    refresh the window — without this, the client-side window indicator and
+    the server gate drift apart by the LLM latency (follow-ups get ignored
+    while the mic still glows). Re-sync both with reason='done' (idle timer
+    runs from now)."""
+    if (CFG and state.wake_word_enabled and state.wake_until > 0
+            and not _wake_oneshot()):
+        await _open_wake_window(ws, state, reason="done")
+
+
 async def _emit_wake_detected(ws, state: TurnState, segment_id):
     """Acoustic early feedback: send a `wake.detected` once per segment as soon
     as the wake word is recognized (partial OR final segment)."""
@@ -876,6 +925,10 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         LOG.exception("STT failed for segment %s", segment_id)
         await ws.send_json({"type": "transcript.error", "segmentId": segment_id,
                             "turnId": state.turn_id, "error": str(exc), "ts": time.time()})
+        # The up-front _coalesce_cancel may have killed the ticking debounce —
+        # without a resume, already-committed (coalesced) input would be
+        # stranded forever (every other drop path resumes too).
+        _resume_debounce(ws, state)
         return
     LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
 
@@ -960,9 +1013,11 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             matched = True
             LOG.info("speaker: short segment passes while composing seg=%s "
                      "dur=%.1fs score=%.3f", segment_id, duration_s, res.score)
-        if res.matched:
+        if res.matched and res.reason == "match":
             # Only STRICT matches refresh the continuity anchor (a chain of
-            # continuity accepts must not drift the reference downwards).
+            # continuity accepts must not drift the reference downwards; a
+            # fail-open verify — reason "error"/"no_profile", score 0.0 —
+            # must not zero the anchor either).
             state.speaker_last_own = res.score
             state.speaker_last_own_ts = time.time()
 
@@ -1104,6 +1159,13 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         # close the conversation window (the wake word is needed again).
         if wake.is_stop_command(command_text):
             await _cancel_in_flight(state, ws)
+            # "Stop" also discards whatever was composed but not yet
+            # dispatched — otherwise it silently rides into the NEXT accepted
+            # turn minutes later.
+            state.pending_texts.clear()
+            state.pending_segment_ids.clear()
+            state.pending_text_parts.clear()
+            state.pending_image_urls.clear()
             state.wake_until = 0.0
             state.wake_detected_seg = None
             LOG.info("wake: stop seg=%s → window closed", segment_id)
@@ -1113,10 +1175,13 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             return
 
         # Command to the AI → refresh the window; a reply is coming, so the
-        # idle timer does NOT run (reason=command). Then clear the running turn.
+        # idle timer does NOT run (reason=command). Then clear the running turn
+        # — coalescing (not a plain cancel): a follow-up spoken before the
+        # reply became audible must carry the committed input over, exactly
+        # like the VAD/speaker-gated paths.
         await _open_wake_window(ws, state, now, reason="command")
         text = command_text
-        await _cancel_in_flight(state, ws)
+        await _coalesce_cancel(state, ws)
 
     # Speaker-ID (House-Mode, optional, failsafe)
     speaker_info = None
@@ -1159,6 +1224,14 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     # respective last segment wins → measurement from "user last spoke".
     state.speech_end_ts = t0
     await _send_turn_pending(ws, state)
+    # (Re)arm the debounce. Two segments can be in STT concurrently — both
+    # would arm a timer and the SAME pending input would dispatch twice.
+    # Cancel a ticking timer first; never touch a slot that already runs the
+    # turn (the gates above own that decision — see _resume_debounce).
+    if state.agent_task and not state.agent_task.done():
+        return
+    if state.debounce_task and not state.debounce_task.done():
+        state.debounce_task.cancel()
     state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
 
 
@@ -1168,6 +1241,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
 async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
     """Transcribes the buffer accumulated so far and sends a
     transcript.partial — UI only, does not change any turn state."""
+    id_at_start = seg.get("id")
     try:
         text = await STT.transcribe(pcm, SAMPLE_RATE)
     except Exception:
@@ -1175,8 +1249,10 @@ async def _do_partial(ws, state: TurnState, seg: dict, pcm: bytes):
         text = ""
     finally:
         seg["partial_running"] = False
-    # Segment committed/aborted in the meantime? Then discard the partial.
-    if seg.get("done") or not text:
+    # Segment committed/aborted — or re-armed by the owner-watch under a new
+    # virtual id (the audio this partial saw is no longer in the buffer)?
+    # Then discard the partial.
+    if seg.get("done") or seg.get("id") != id_at_start or not text:
         return
     seg["partial_text"] = text
     # Early cue: detect the wake word already in the growing partial (wake mode
@@ -1442,17 +1518,26 @@ async def _owner_watch_step(ws, state: TurnState, seg: dict, pcm: bytes,
         return
     buf_s = len(seg["buf"]) / (SAMPLE_RATE * 4.0)   # may have grown during embeds
     pcm_all = bytes(seg["buf"])
+    # Commit ONLY the owner's head [0, cut+pad]: the block veto just confirmed
+    # the tail is a DIFFERENT speaker, and at ~2-2.6 s it is too short for the
+    # commit gate's trim (min foreign region 2.5 s) — committing the whole
+    # buffer leaked exactly the foreign words the watch exists to keep out.
+    cut_bytes = min(len(pcm_all),
+                    int((cut_s + 0.25) * SAMPLE_RATE) * 4)
+    pcm_head = pcm_all[:cut_bytes]
     seg_id = seg["id"]
-    LOG.info("owner-watch: auto-commit seg=%s (%.1fs audio, owner quiet %.1fs, "
-             "head=%.2f tail=%.2f)", seg_id, buf_s, quiet_s, head_sc, tail_sc)
+    LOG.info("owner-watch: auto-commit seg=%s (%.1fs of %.1fs audio, owner "
+             "quiet %.1fs, head=%.2f tail=%.2f)", seg_id,
+             len(pcm_head) / (SAMPLE_RATE * 4.0), buf_s, quiet_s, head_sc, tail_sc)
     speech_start = seg.get("speech_start_ts")
     barge = seg.get("barge_in", False)
-    # Re-arm the stream as a FRESH virtual segment: the client keeps streaming;
-    # whatever follows (the kids' tail, or the owner speaking again) is judged
-    # on its own at the real commit / the next auto-commit.
+    # Re-arm the stream as a FRESH virtual segment seeded with the tail: the
+    # client keeps streaming; whatever follows (the kids' tail, or the owner
+    # speaking again — possibly already begun inside the tail) is judged on
+    # its own at the real commit / the next auto-commit.
     seg["own_cuts"] = seg.get("own_cuts", 0) + 1
     seg["id"] = f"{seg_id}-c{seg['own_cuts']}"
-    seg["buf"] = bytearray()
+    seg["buf"] = bytearray(pcm_all[cut_bytes:])
     seg["speech_start_ts"] = None
     seg["barge_in"] = False
     seg["last_partial_len"] = 0
@@ -1465,7 +1550,7 @@ async def _owner_watch_step(ws, state: TurnState, seg: dict, pcm: bytes,
     seg["own_seen"] = False
     seg["own_last_end"] = 0.0
     _spawn_tracked(state, _handle_audio_segment(
-        ws, state, pcm_all, seg_id, peer,
+        ws, state, pcm_head, seg_id, peer,
         speech_start_ts=speech_start, barge_in=barge))
   finally:
     seg["own_running"] = False
@@ -1548,7 +1633,10 @@ async def ws_handler(request):
     })
 
     # --- Load conversation history from Hermes backend (cross-device) ------
-    if CFG and CONV is not None:
+    # Only when a Hermes session key is actually configured: without it the
+    # session id would be probed against a NON-Hermes endpoint (e.g. Fireworks)
+    # — a real, authenticated HTTP call per connect for nothing.
+    if CFG and CONV is not None and CFG.hermes_session_key_separate:
         try:
             history = await fetch_history(
                 base_url=CFG.llm_base_url,
@@ -1685,6 +1773,7 @@ async def ws_handler(request):
                         "buf": bytearray(),
                         "speech_start_ts": speech_start_ts,
                         "barge_in": bool(data.get("bargeIn")),
+                        "ptt": bool(data.get("ptt")),
                         # B2: partial throttle state.
                         "partial_running": False, "last_partial_ts": 0.0,
                         "last_partial_len": 0, "partial_text": "", "done": False,
@@ -1705,17 +1794,21 @@ async def ws_handler(request):
                             _spawn_tracked(state, _handle_audio_segment(
                                 ws, state, pcm, _seg["id"], peer,
                                 speech_start_ts=_seg.get("speech_start_ts"),
-                                barge_in=_seg.get("barge_in", False)))
+                                barge_in=_seg.get("barge_in", False),
+                                ptt=_seg.get("ptt", False)))
                 elif t == "segment.stream.abort":
                     if active_stream is not None:
                         active_stream["done"] = True
                     active_stream = None
                 elif t == "speaker.enroll.start":
                     # Begin buffering the owner's enrollment recording. Drop any
-                    # half-streamed segment so its frames don't leak into it.
+                    # half-streamed segment so its frames don't leak into it,
+                    # and any queued segment.start metas — they would pair with
+                    # the wrong binary frame after enrollment (FIFO desync).
                     if active_stream is not None:
                         active_stream["done"] = True
                         active_stream = None
+                    pending_segment_meta.clear()
                     enroll_stream = bytearray() if (SPEAKER and SPEAKER.loaded) else None
                     if SPEAKER is None or not SPEAKER.loaded:
                         await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
@@ -1776,6 +1869,11 @@ async def ws_handler(request):
                     await _cancel_in_flight(state, ws)
                     state.pending_texts.clear()
                     state.pending_segment_ids.clear()
+                    # Typed text / attached images composed before the reset
+                    # must not ride into the fresh session either.
+                    state.pending_text_parts.clear()
+                    state.pending_image_urls.clear()
+                    state.speech_end_ts = 0.0
                     pending_segment_meta.clear()
                     if active_stream is not None:
                         active_stream["done"] = True

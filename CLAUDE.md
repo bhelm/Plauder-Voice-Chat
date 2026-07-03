@@ -43,7 +43,7 @@ curl http://127.0.0.1:8319/healthz       # 200 + active backends
 
 There is **no lint step** and no pytest config file; tests rely on `tests/conftest.py`.
 
-The browser client is a single hand-written file, `static/index.html` (~2200 lines
+The browser client is a single hand-written file, `static/index.html` (~4500 lines
 of inline JS — no build step). After editing its JS, syntax-check by extracting the
 `<script>` blocks and running `node --check`; it cannot be unit-tested here.
 
@@ -108,7 +108,7 @@ can't do SSE).
 - **B2** streaming STT: while a segment streams in, the server throttle-runs STT on
   the growing buffer and emits `transcript.partial` (default on for `whisper_local`).
 
-### Wake word (`WAKE_WORD_ENABLED=1`, default on)
+### Wake word (`WAKE_WORD_ENABLED`, start-default off)
 
 `plauder/wake.py` gates **voice** turns on an STT-prefix match (fuzzy, tolerates
 Whisper mishearings; default word = `AGENT_NAME` lowercased). Non-matching segments

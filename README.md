@@ -6,8 +6,8 @@ end-to-end streaming, wake word, text input and image uploads.
 
 The server is a clean Python package (`plauder/`) with **pluggable
 backends** for STT, TTS and LLM. Via `.env` you can switch between cloud APIs
-(OpenAI, Fireworks) and local models (faster-whisper, OmniVoice, OpenClaw)
-— without changing any code.
+(OpenAI, Fireworks), local models (faster-whisper, OmniVoice) and gateway
+backends (OpenClaw) — without changing any code.
 
 ---
 
@@ -60,7 +60,8 @@ with **"Antonia, …"** (e.g. "Antonia, what time is it?") and may keep talking 
 in wake mode straight away: `WAKE_WORD_ENABLED=1` in the `.env`.
 
 `start.sh` is idempotent (callable any number of times) and listens on
-`${HOST}:${PORT}` (default `0.0.0.0:8319`).
+`${HOST}:${PORT}` — the `.env.example` template sets `0.0.0.0:8319`; without a
+`HOST` entry the server binds `127.0.0.1` only.
 
 ### Minimal `.env` (cloud)
 
@@ -136,7 +137,7 @@ curl http://localhost:8319/healthz   # 200 + aktive Backends
                           ▼   │
    ┌───────────────────────────────────────────────────────────────┐
    │                  plauder/server.py  (HTTP/WS-Layer)          │
-   │   Routen: / , /healthz , /ws , /upload                          │
+   │   Routen: / , /healthz , /ws , /upload , /uploads/… , /static/… │
    │   ws_handler ─ Audio-Segmente/-Frames & Text                   │
    │       ├─► turn_state.TurnState   (Debounce + Coalescing)        │
    │       ├─► wake                   (Wake-Word-Gate)               │
@@ -167,7 +168,9 @@ active. In the cloud default no GPU code is ever loaded.
 
 1. The browser sends speech frames (VAD live / PTT) and/or text over the WebSocket.
 2. `TurnState` collects inputs within the debounce window (`DEBOUNCE_MS`); new input
-   aborts in-flight LLM/TTS calls (barge-in).
+   aborts in-flight LLM/TTS calls (barge-in) — with wake word or voice lock
+   active only AFTER the segment passes the gate, so foreign voices can't
+   interrupt a running reply.
 3. STT → text; Whisper hallucinations are filtered out.
 4. **Voice-lock gate** (only when enrolled): segments not spoken by the owner
    are dropped; mixed segments are trimmed to the owner's part.
@@ -222,9 +225,11 @@ configure the matching:
 |---|---|---|
 | `WAKE_WORD_ENABLED` | `0` | Startup default: `1` = UI starts in wake mode |
 | `WAKE_WORD` | = `AGENT_NAME` | Wake word (empty = agent name lowercased) |
+| `WAKE_MODE` | `conversation` | `conversation` = follow-up window stays open · `alexa` = one-shot, wake word needed every time |
 | `WAKE_WORD_WINDOW_S` | `8` | Follow-up question window after a reply (s) |
 | `WAKE_WORD_FUZZY` | `1` | Tolerate mishearings |
 | `WAKE_WORD_ANYWHERE` | `0` | `1` = wake word anywhere instead of only at the start |
+| `WAKE_WORD_STRIP` | `1` | Cut the wake word out of the text before the LLM |
 | `WAKE_WORD_RATIO` | `0.78` | Fuzzy threshold (higher = stricter) |
 
 ---
@@ -262,7 +267,7 @@ push-to-talk always interrupt (deliberate user actions).
 1. `pip install sherpa-onnx` (bundles the kaldi-fbank the model expects; no torch).
 2. Download a speaker-embedding model — recommended:
    `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx` (~28 MB) from
-   the [sherpa-onnx speaker models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recognition-models).
+   the [sherpa-onnx speaker models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models).
    (Benchmarked on real field audio it separates owner vs. foreign voices far
    better than `campplus_en_voxceleb_16k.onnx` — same size and CPU speed.)
 3. In `.env`: `SPEAKER_LOCK_ENABLED=1` and `SPEAKER_MODEL_PATH=/abs/path/model.onnx`.

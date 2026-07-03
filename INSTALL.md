@@ -41,8 +41,8 @@ cp .env.example .env        # then edit — see next section
 
 `start.sh` is **idempotent**: it creates `.venv/` on first run, installs
 `requirements.txt`, and starts the server. Run it as often as you like; it never
-destroys anything. The server listens on `${HOST}:${PORT}` (default
-`0.0.0.0:8319`).
+destroys anything. The server listens on `${HOST}:${PORT}` — the `.env.example`
+template sets `0.0.0.0:8319`; without a `HOST` entry it binds `127.0.0.1` only.
 
 Sanity check:
 
@@ -75,7 +75,7 @@ Useful basics:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HOST` / `PORT` | `0.0.0.0` / `8319` | Bind address |
+| `HOST` / `PORT` | `127.0.0.1` / `8319` | Bind address (`.env.example` sets `HOST=0.0.0.0`) |
 | `AGENT_NAME` | `Antonia` | Assistant name; doubles as the default wake word |
 | `APP_LANGUAGE` | `en` | UI + assistant + STT language (`en`/`de`) |
 | `DEBOUNCE_MS` | `1200` | Pause after speech before the turn is submitted |

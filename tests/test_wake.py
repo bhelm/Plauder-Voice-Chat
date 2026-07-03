@@ -99,3 +99,13 @@ def test_stop_command_fuzzy_mishearing():
     assert is_stop_command("stoppp") is True
     # not without fuzzy
     assert is_stop_command("stoppp", fuzzy=False) is False
+
+
+def test_shorter_name_does_not_match_wake_word():
+    """Regression: "Anton" (a real name, 2 chars short) scores 0.83 against
+    "antonia" and used to trigger the assistant. Mishearings of roughly the
+    same length (Antonja, Anthonia) still match."""
+    from plauder.wake import match_wake
+    assert match_wake("Anton komm her", "antonia")[0] is False
+    assert match_wake("Antonja, wie spät ist es?", "antonia")[0] is True
+    assert match_wake("Anthonia was geht", "antonia")[0] is True

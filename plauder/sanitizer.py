@@ -153,6 +153,18 @@ def is_no_reply(text: str) -> bool:
     return False
 
 
+def is_no_reply_prefix(text: str) -> bool:
+    """True while the streamed text SO FAR could still become a pure NO_REPLY.
+
+    The streaming path must hold back reply.delta/TTS until this returns False
+    — checking only ``is_no_reply`` lets a partial token leak ("NO_" is not a
+    complete NO_REPLY, gets emitted, then the reply turns silent)."""
+    t = (text or "").lstrip().lstrip("*_`\"'([").lstrip()
+    if len(t) <= len(NO_REPLY_TOKEN):
+        return NO_REPLY_TOKEN.startswith(t.upper())
+    return is_no_reply(text)
+
+
 # --------------------------------------------------------------------------- #
 # Whisper hallucination filter ("Thank you" ghosts)
 # --------------------------------------------------------------------------- #
@@ -178,8 +190,9 @@ _GHOST_PHRASES_BASE = {
 # genuine speech directed at a voice assistant, so they are filtered
 # UNCONDITIONALLY (no no_speech_prob / duration corroboration needed — important
 # because cloud STT backends do not report no_speech_prob at all). Matched as a
-# substring of the normalized transcript so trailing years / channel names still
-# hit ("Untertitel des ZDF, 2020", "Untertitelung des ZDF für Funk, 2017").
+# PREFIX of the normalized transcript so trailing years / channel names still
+# hit ("Untertitel des ZDF, 2020") without swallowing genuine speech that only
+# contains the phrase mid-sentence.
 _GHOST_ALWAYS_SUBSTR_BASE = (
     "untertitel des zdf", "untertitelung des zdf", "untertitel von",
     "untertitel im auftrag", "untertitel der amara", "amara.org",
@@ -193,9 +206,10 @@ class HallucinationFilter:
     """Discards Whisper ghost phrases. Two tiers:
 
     * Credit-roll / outro phrases (``_GHOST_ALWAYS_SUBSTR_BASE``) are filtered
-      UNCONDITIONALLY — matched as a substring so trailing years/channel names
-      still hit. These never occur as genuine speech, and cloud STT backends
-      report no ``no_speech_prob``, so gating them would disable the filter.
+      UNCONDITIONALLY — matched as a prefix so trailing years/channel names
+      still hit. As whole utterances these never occur as genuine speech, and
+      cloud STT backends report no ``no_speech_prob``, so gating them would
+      disable the filter.
     * Ambiguous short phrases (``_GHOST_PHRASES_BASE``: "danke", "bye", …) stay
       conservative: exact denylist hit AND (no_speech_prob high OR short audio).
 
@@ -243,7 +257,12 @@ class HallucinationFilter:
         if not norm:
             return False
         # Tier 1: credit-roll phrases → always ghost, no corroboration needed.
-        if any(sub in norm for sub in self.always_substr):
+        # PREFIX match: a hallucinated credit roll IS the whole utterance
+        # ("Untertitel von Stephanie Geiges", "Untertitel des ZDF, 2020"), so
+        # trailing names/years still hit — but genuine speech that merely
+        # CONTAINS the phrase ("Kannst du Untertitel von dem Video erzeugen")
+        # is not swallowed.
+        if any(norm.startswith(sub) for sub in self.always_substr):
             return True
         # Tier 2: ambiguous short phrases → need a corroborating signal.
         if norm not in self.phrases:

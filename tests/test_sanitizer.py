@@ -72,6 +72,10 @@ def test_hallucination_filter_credit_roll_always():
     assert hf.is_hallucination("Untertitel der Amara.org-Community")
     # A genuine request that merely mentions subtitles must NOT be filtered.
     assert not hf.is_hallucination("Mach mal die Untertitel an", no_speech_prob=None)
+    # Genuine speech CONTAINING a credit-roll phrase mid-sentence passes
+    # (prefix rule): only utterances that ARE the credit roll are ghosts.
+    assert not hf.is_hallucination("Kannst du Untertitel von dem Video erzeugen")
+    assert not hf.is_hallucination("Er sagte please subscribe im Video")
 
 
 def test_hallucination_filter_extra_substring_rule():

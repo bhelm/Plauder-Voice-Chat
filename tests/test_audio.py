@@ -112,3 +112,32 @@ def test_split_stream_multiple_sentences_at_once():
     sents, rest = audio.split_stream_sentences("Eins. Zwei! Drei? ", 200)
     assert sents == ["Eins.", "Zwei!", "Drei?"]
     assert rest == ""
+
+
+def test_split_stream_sentences_keeps_abbreviations():
+    """Abbreviations/ordinals are not sentence boundaries mid-stream: "z.B."
+    must not ship as its own TTS sentence."""
+    from plauder.audio import split_stream_sentences
+    sents, rest = split_stream_sentences("z.B. eine Sache, die noch geht ", 220)
+    assert sents == [] and rest.startswith("z.B.")
+    sents, rest = split_stream_sentences("Das gilt z.B. hier. Und weiter ", 220)
+    assert sents == ["Das gilt z.B. hier."]
+    sents, rest = split_stream_sentences("1. Erstens kommt das. 2. Zweitens ", 220)
+    assert sents == ["1. Erstens kommt das."] and rest.startswith("2.")
+
+
+def test_pcm_bytes_to_float32_tolerates_truncated_buffer():
+    import numpy as np
+    from plauder.audio import pcm_bytes_to_float32_array, crop_f32_spans
+    buf = np.zeros(10, np.float32).tobytes() + b"\x01\x02"   # 2 trailing bytes
+    assert pcm_bytes_to_float32_array(buf).shape[0] == 10
+    assert crop_f32_spans(buf, 10, [(0.0, 1.0)]) != b""
+
+
+def test_crop_f32_spans_merges_overlaps():
+    import numpy as np
+    from plauder.audio import crop_f32_spans
+    seg = np.arange(10, dtype=np.float32)
+    out = np.frombuffer(crop_f32_spans(seg.tobytes(), 1, [(4.0, 8.0), (0.0, 5.0)]),
+                        dtype=np.float32)
+    assert out.tolist() == list(range(8))   # sorted + merged, no duplication

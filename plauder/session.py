@@ -8,6 +8,8 @@ connections.
 
 from __future__ import annotations
 
+from . import sanitizer
+
 
 class ConversationManager:
     def __init__(self, llm, *, system_prompt: str = "", history_turns: int = 20):
@@ -55,7 +57,10 @@ class ConversationManager:
         reply = await self.llm.chat(messages, system_hint=self.system_prompt)
         meta = dict(getattr(self.llm, "last_meta", {}) or {})
 
-        if reply:
+        if reply and not sanitizer.is_no_reply(reply):
+            # A NO_REPLY is a decision to stay silent, not an utterance —
+            # recording it would feed literal "NO_REPLY" turns back as context
+            # and bias the model toward more of them.
             history.append(user_msg)
             history.append({"role": "assistant", "content": reply})
             max_msgs = self.history_turns * 2
@@ -88,7 +93,8 @@ class ConversationManager:
 
         reply = "".join(parts).strip()
         self.last_stream_meta = dict(getattr(self.llm, "last_meta", {}) or {})
-        if reply:
+        if reply and not sanitizer.is_no_reply(reply):
+            # See chat(): silent turns are not recorded as history.
             history.append(user_msg)
             history.append({"role": "assistant", "content": reply})
             max_msgs = self.history_turns * 2

@@ -93,6 +93,9 @@ class TurnState:
     # of the reply played, the cancelled turn's input is re-queued into the
     # next turn (coalescing) instead of being dropped.
     inflight_combined: str | None = None
+    # Image URLs of the in-flight turn — coalescing must restore them together
+    # with the text, or a re-queued "what's in this photo?" loses its photo.
+    inflight_images: list = field(default_factory=list)
     # True once the current turn actually EMITTED audio (audio.start sent).
     # audio_ids is set eagerly at stream start (for the audio.stop backup), so
     # it cannot distinguish "reply audible" from "still thinking".

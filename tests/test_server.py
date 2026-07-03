@@ -420,8 +420,12 @@ _MOCK_HISTORY = [
 
 def test_ws_history_frame_sent_on_connect():
     """When fetch_history returns messages, a 'history' frame is sent after hello
-    and the ConversationManager is seeded."""
-    _configure()
+    and the ConversationManager is seeded. The fetch only runs when a Hermes
+    session key is configured (without one it would probe a non-Hermes LLM
+    endpoint with a real HTTP call on every connect)."""
+    cfg = _configure()
+    srv.configure(dataclasses.replace(cfg, hermes_session_key_separate="agent:test:voice"),
+                  stt=srv.STT, tts=srv.TTS, conv=srv.CONV, bridge=None, ghost=srv.GHOST)
 
     async def run():
         mock = AsyncMock(return_value=list(_MOCK_HISTORY))
@@ -482,5 +486,27 @@ def test_ws_history_fetch_failure_does_not_break_connection():
                 ack, seen, _ = await _drain_until(ws, "ack")
                 assert ack is not None
                 await ws.close()
+
+    asyncio.run(run())
+
+
+def test_no_history_fetch_without_hermes_key():
+    """Regression: without a configured Hermes session key, connecting must NOT
+    call fetch_history at all — it would fire a real, authenticated HTTP request
+    against a non-Hermes LLM endpoint on every connect."""
+    _configure()   # Config.from_env() with no HERMES_SESSION_KEY_SEPARATE
+
+    async def run():
+        mock = AsyncMock(return_value=list(_MOCK_HISTORY))
+        with patch("plauder.server.fetch_history", mock):
+            async with TestClient(TestServer(srv.build_app())) as client:
+                ws = await client.ws_connect("/ws")
+                hello = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert hello["type"] == "hello"
+                await ws.send_json({"type": "ping"})
+                nxt = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert nxt["type"] == "ack"
+                await ws.close()
+        assert mock.await_count == 0
 
     asyncio.run(run())

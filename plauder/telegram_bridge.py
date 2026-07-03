@@ -43,6 +43,7 @@ class TelegramBridge:
         self._recent_broadcast_set: set[str] = set()
         self._broadcast_channels: list = []
         self._watcher_task: asyncio.Task | None = None
+        self._decrement_tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
 
     def begin_local_call(self) -> None:
@@ -53,7 +54,11 @@ class TelegramBridge:
             await asyncio.sleep(1.5)
             if self._local_call_depth > 0:
                 self._local_call_depth -= 1
-        asyncio.create_task(_delayed())
+        # Keep a reference: a bare create_task may be garbage-collected before
+        # it runs, permanently sticking _local_call_depth > 0 (muted inbox).
+        task = asyncio.create_task(_delayed())
+        self._decrement_tasks.add(task)
+        task.add_done_callback(self._decrement_tasks.discard)
 
     @property
     def in_local_call(self) -> bool:
@@ -216,6 +221,12 @@ class TelegramBridge:
                     f.seek(offset)
                     chunk = f.read()
                     offset = f.tell()
+                # A torn (partially flushed) last line must NOT be consumed —
+                # rewind the offset so it is re-read complete on the next tick.
+                if chunk and not chunk.endswith(b"\n"):
+                    cut = chunk.rfind(b"\n") + 1
+                    offset -= len(chunk) - cut
+                    chunk = chunk[:cut]
                 for raw in chunk.splitlines():
                     if not raw.strip():
                         continue

@@ -45,8 +45,20 @@ def load_dotenv(path: Path) -> None:
         key, _, val = line.partition("=")
         key = key.strip()
         val = val.strip()
-        if (len(val) >= 2) and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
-            val = val[1:-1]
+        if val[:1] in ('"', "'"):
+            # Quoted value: take the quoted content, drop anything after the
+            # closing quote (inline comment).
+            end = val.find(val[0], 1)
+            if end != -1:
+                val = val[1:end]
+        else:
+            # Unquoted: an inline comment starts at the first '#' that is
+            # preceded by whitespace (or starts the value). Without this,
+            # `FLAG=0   # comment` silently became the truthy "0   # comment".
+            for i, ch in enumerate(val):
+                if ch == "#" and (i == 0 or val[i - 1] in " \t"):
+                    val = val[:i].rstrip()
+                    break
         if key and key not in os.environ:
             os.environ[key] = val
 
@@ -186,7 +198,7 @@ class Config:
     stt_openai_api_key: str = ""
     stt_openai_model: str = "whisper-1"
     stt_openai_base_url: str | None = None
-    stt_language: str | None = "de"
+    stt_language: str | None = "en"    # from_env(): follows app_language
 
     # --- STT: faster_whisper (local) ---
     whisper_model: str = "large-v3-turbo"
@@ -240,11 +252,9 @@ class Config:
     llm_retry_timeout_on_idle: bool = True
 
     # --- Hermes memory binding (optional) ---
-    # Session keys for the two voice modes: "main" shares memory + history
-    # with the Telegram main session; "separate" uses an independent session.
-    hermes_session_key_main: str = ""
+    # Stable session key for the voice chat's own Hermes session (server-side
+    # memory/history via X-Hermes-Session-Id). Empty = no Hermes binding.
     hermes_session_key_separate: str = ""
-    hermes_session_id: str = ""
 
     # --- LLM: OpenClaw (legacy) ---
     openclaw_gateway_url: str = "http://localhost:8080"
@@ -309,10 +319,11 @@ class Config:
     speaker_threshold: float = 0.5      # cosine similarity; higher = stricter
     speaker_min_dur_s: float = 0.6      # segments shorter than this can't be verified
     # Mixed segments (owner speaks, then someone else keeps talking into the
-    # same segment): analyze ~1s windows, keep only the owner's spans and
-    # re-transcribe just those. Costs one extra STT call in the mixed case.
+    # same segment): score equal-length ~3 s blocks, cut sustained foreign
+    # regions (sentence-level policy) and re-transcribe the kept audio. Costs
+    # one extra STT call in the mixed case.
     speaker_trim: bool = True
-    # Log per-window scores for every gated segment (field calibration of the
+    # Log per-block scores for every gated segment (field calibration of the
     # thresholds against the real household voices).
     speaker_debug: bool = False
     # When set, every speaker-gated segment (and every enrollment take) is also
@@ -445,9 +456,7 @@ class Config:
             llm_retry_timeout_on_idle=env_flag("OPENCLAW_RETRY_TIMEOUT", True),
 
             # Hermes memory binding
-            hermes_session_key_main=_env("HERMES_SESSION_KEY_MAIN"),
             hermes_session_key_separate=_env("HERMES_SESSION_KEY_SEPARATE"),
-            hermes_session_id=_env("HERMES_SESSION_ID"),
 
             # LLM openclaw (legacy)
             openclaw_gateway_url=_first(_env("OPENCLAW_GATEWAY_URL"),
@@ -457,6 +466,8 @@ class Config:
             openclaw_user_id=_first(_env("OPENCLAW_USER_ID"), default="voice-user"),
 
             debounce_ms=_env_int("DEBOUNCE_MS", 1200),
+            debounce_ms_min=_env_int("DEBOUNCE_MS_MIN", 200),
+            debounce_ms_max=_env_int("DEBOUNCE_MS_MAX", 5000),
             tts_sentence_split=env_flag("TTS_SENTENCE_SPLIT", False),
             tts_sentence_gap_ms=_env_int("TTS_SENTENCE_GAP_MS", 120),
             tts_max_chars_per_chunk=_env_int("TTS_MAX_CHARS_PER_CHUNK", 220),

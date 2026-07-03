@@ -54,6 +54,13 @@ def _token_matches(tok: str, wake: str, fuzzy: bool, ratio: float) -> bool:
         return True
     if not fuzzy:
         return False
+    # Fuzzy matching tolerates MISHEARINGS of the wake word (Antonja,
+    # Anthonia) — not shorter NAMES that happen to share the stem: "Anton"
+    # scores 0.83 against "antonia" and would trigger the assistant whenever
+    # the household mentions an Anton. A heard token missing 2+ characters is
+    # a different word, not a mishearing.
+    if len(tok) < len(wake) - 1:
+        return False
     if len(tok) >= 4 and len(wake) >= 4 and tok[:4] == wake[:4] and _similar(tok, wake) >= ratio * 0.92:
         return True
     return _similar(tok, wake) >= ratio

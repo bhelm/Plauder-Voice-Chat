@@ -17,7 +17,10 @@ def _cfg(**env):
         for k in list(os.environ):
             if k.startswith(("STT_", "TTS_", "LLM_", "WHISPER_", "OMNIVOICE_",
                              "OPENAI_", "FIREWORKS_", "OPENCLAW_", "HOUSE_",
-                             "DEBOUNCE_", "AGENT_", "HOST", "PORT")):
+                             "DEBOUNCE_", "AGENT_", "HOST", "PORT",
+                             "APP_", "WAKE_", "HERMES_", "SPEAKER_",
+                             "BASE_PATH", "STREAMING", "SYSTEM_PROMPT",
+                             "SOUL_PATH", "VOICE_")):
                 del os.environ[k]
         os.environ.update(env)
         return Config.from_env()
@@ -229,3 +232,28 @@ def test_real_env_file_loads(tmp_path, monkeypatch):
     cfg = config.load_config()
     assert cfg.stt_backend in ("openai", "whisper_local")
     assert cfg.llm_backend in ("openai_compat", "openclaw")
+
+
+def test_load_dotenv_strips_inline_comments(tmp_path, monkeypatch):
+    """Regression: `cp .env.example .env` must work — the template uses inline
+    `# comments`, which previously became part of the value (flags like
+    `SPEAKER_DEBUG=0   # …` silently flipped to True)."""
+    from pathlib import Path
+    from plauder.config import load_dotenv
+    envf = tmp_path / ".env"
+    envf.write_text(
+        "PLAUDER_T1=0              # a comment\n"
+        "PLAUDER_T2=openai            # openai | whisper_local\n"
+        'PLAUDER_T3="quoted # not a comment" # real comment\n'
+        "PLAUDER_T4=http://x/#anchor\n",   # '#' not preceded by space → kept
+        encoding="utf-8")
+    for k in ("PLAUDER_T1", "PLAUDER_T2", "PLAUDER_T3", "PLAUDER_T4"):
+        monkeypatch.delenv(k, raising=False)
+    load_dotenv(Path(envf))
+    import os
+    assert os.environ["PLAUDER_T1"] == "0"
+    assert os.environ["PLAUDER_T2"] == "openai"
+    assert os.environ["PLAUDER_T3"] == "quoted # not a comment"
+    assert os.environ["PLAUDER_T4"] == "http://x/#anchor"
+    for k in ("PLAUDER_T1", "PLAUDER_T2", "PLAUDER_T3", "PLAUDER_T4"):
+        monkeypatch.delenv(k, raising=False)
