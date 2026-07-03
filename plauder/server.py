@@ -402,6 +402,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         start_evt["e2eMs"] = int((now - anchor) * 1000)
         start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
     state.audio_started = True   # reply is audible now (classic path)
+    state.client_playing = True
     await ws.send_json(start_evt)
     t_tts = time.time()
     try:
@@ -491,6 +492,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                     if not started["audio"]:
                         started["audio"] = True
                         state.audio_started = True   # reply is audible now
+                        state.client_playing = True
                         sr_box["sr"] = sr
                         now = time.time()
                         start_evt = {
@@ -804,6 +806,13 @@ async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False):
         for aid in list(state.audio_ids):
             await ws.send_json({"type": "audio.stop", "audioId": aid, "ts": time.time()})
         state.audio_ids.clear()
+    elif state.client_playing:
+        # All chunks were already SENT (audio_ids emptied at audio.end), but
+        # the client is still playing buffered audio. An owner barge-in /
+        # stop must silence that too — a bare audio.stop (no audioId) makes
+        # the client stop everything.
+        await ws.send_json({"type": "audio.stop", "ts": time.time()})
+    state.client_playing = False
 
 
 def _speaker_tag(text: str, speaker_info: dict | None) -> str:
@@ -1423,8 +1432,11 @@ def _maybe_spawn_speaker_barge(ws, state: TurnState, seg: dict):
         return
     if seg.get("spk_checks", 0) >= SPEAKER_BARGE_MAX_CHECKS:
         return
-    # Only worth checking early when there is something to interrupt.
-    in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
+    # Only worth checking early when there is something to interrupt — which
+    # includes audio the client is still PLAYING from its buffer long after
+    # all chunks were sent (fast TTS: audio_ids empties within ~1-2 s).
+    in_flight = ((state.agent_task and not state.agent_task.done())
+                 or bool(state.audio_ids) or state.client_playing)
     if not in_flight:
         return
     min_s = max(getattr(SPEAKER, "min_dur_s", 0.0), SPEAKER_BARGE_MIN_S)
@@ -1668,6 +1680,9 @@ async def ws_handler(request):
                 if t == "ping":
                     await ws.send_json({"type": "ack", "received": data, "ts": time.time()})
                 elif t == "playback.done":
+                    # Client finished playing its buffered reply audio → there
+                    # is nothing left to barge into.
+                    state.client_playing = False
                     # Wake word: reply fully spoken → (re)open the conversation
                     # window; only now does the idle timer run.
                     # Exception: the user closed the channel themselves in the
@@ -1713,7 +1728,8 @@ async def ws_handler(request):
                     elif CFG and state.wake_word_enabled and _wake_closed_active(state):
                         LOG.info("barge-in ignored (wake closed) from %s (reason=%s)", peer, reason)
                     else:
-                        in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
+                        in_flight = ((state.agent_task and not state.agent_task.done())
+                                     or bool(state.audio_ids) or state.client_playing)
                         if in_flight:
                             LOG.info("barge-in from %s (reason=%s)", peer, reason)
                             await _cancel_in_flight(state, ws)

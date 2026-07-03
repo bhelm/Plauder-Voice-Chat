@@ -100,6 +100,12 @@ class TurnState:
     # audio_ids is set eagerly at stream start (for the audio.stop backup), so
     # it cannot distinguish "reply audible" from "still thinking".
     audio_started: bool = False
+    # True while the CLIENT is (presumably) still playing reply audio: set at
+    # audio.start, cleared on playback.done / audio.stop. Crucial for barge-in:
+    # a fast TTS ships all chunks within ~1-2 s (audio_ids emptied at
+    # audio.end), while the client keeps PLAYING for many seconds — during
+    # that time the server would otherwise see "nothing to interrupt".
+    client_playing: bool = False
     # Voice lock, temporal continuity: full-verify score + time of the last
     # segment that STRICTLY matched the owner. Segments shortly after get a
     # relative bar (last_own − Δ) instead of the absolute threshold — the same

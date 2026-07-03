@@ -631,3 +631,60 @@ def test_speaker_dump_writes_wavs(tmp_path):
     # WAV header sanity: RIFF magic present.
     for p in (tmp_path / "dump").glob("*.wav"):
         assert p.read_bytes()[:4] == b"RIFF"
+
+
+def test_owner_barge_stops_client_buffered_playback():
+    """Regression (real field failure): a fast TTS ships ALL chunks within
+    ~1-2 s (audio.end sent, audio_ids emptied) while the client keeps PLAYING
+    its buffer for many more seconds. When the owner then speaks, the server
+    used to see "nothing to interrupt" — no early barge, no audio.stop, the
+    reply talked over the user. Now the server tracks client playback until
+    playback.done and stops it with a bare audio.stop."""
+    _configure_speaker(
+        stt_texts=["erzähl was langes", "stopp mal, neue frage"],
+        deltas=["Ein sehr langer Satz. "],
+        decisions=[True, True],
+    )
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _send_voice(ws, "s1")
+            # Reply fully generated + all chunks sent; NO playback.done sent —
+            # the client is still playing its buffer.
+            assert (await _drain_until(ws, "audio.end"))[0] is not None
+
+            # Owner speaks again → gate passes → buffered playback must stop.
+            await _send_voice(ws, "s2")
+            stop, seen = await _drain_until(ws, "audio.stop")
+            assert stop is not None, f"kein audio.stop trotz Owner-Barge: {seen}"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_playback_done_clears_barge_target():
+    """After playback.done nothing is playing — a later owner segment must NOT
+    emit a spurious audio.stop."""
+    _configure_speaker(
+        stt_texts=["frage eins", "frage zwei"],
+        deltas=["Antwort eins. ", "Antwort zwei. "],
+        decisions=[True, True],
+    )
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _send_voice(ws, "s1")
+            end1, _ = await _drain_until(ws, "audio.end")
+            await ws.send_json({"type": "playback.done", "turnId": end1["turnId"],
+                                "audioId": end1.get("audioId"), "ts": 0})
+            await _send_voice(ws, "s2")
+            reply, seen = await _drain_until(ws, "reply")
+            assert reply is not None
+            assert "audio.stop" not in seen, f"unnötiger audio.stop: {seen}"
+            await ws.close()
+
+    asyncio.run(run())
