@@ -109,6 +109,10 @@ WHISPER_LOCAL_FILES_ONLY=0  # 1 on air-gapped/GPU boxes with pre-downloaded mode
 
 ### Local TTS (OmniVoice)
 
+Two ways to run OmniVoice; pick one.
+
+**A) In-process backend** — simplest, GPU deps live in the app venv:
+
 ```bash
 .venv/bin/pip install omnivoice torch    # see k2-fsa/OmniVoice for details
 ```
@@ -119,6 +123,39 @@ TTS_BACKEND=omnivoice_local
 
 Heavy GPU dependencies are imported **only** when their backend is active — the
 cloud default never loads them.
+
+**B) OpenAI wrapper as a standalone service (recommended for a shared GPU box)** —
+run OmniVoice behind a small **OpenAI-compatible HTTP wrapper** on port 8880 and
+let the app talk to it as a plain cloud TTS. One warm model on one pinned GPU,
+decoupled from the app's env and restarts, and **reusable by other harnesses** —
+the same endpoint drives Hermes / OpenClaw or anything else that speaks OpenAI TTS.
+
+The wrapper (and **only** the wrapper — OmniVoice itself is a pip dependency it
+installs) lives in [`omnivoice-openai-wrapper/`](omnivoice-openai-wrapper/): the
+server, `textnorm.py`, pinned `requirements.txt`, systemd unit and a
+voice-bootstrap helper. Full walkthrough in
+[`omnivoice-openai-wrapper/README.md`](omnivoice-openai-wrapper/README.md).
+In short, on the GPU box:
+
+```bash
+cp -r omnivoice-openai-wrapper /opt/omnivoice-openai-wrapper && cd /opt/omnivoice-openai-wrapper
+python3.11 -m venv ../omnivoice-env
+../omnivoice-env/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+../omnivoice-env/bin/pip install -r requirements.txt
+# provide a voice: ref/ref.wav + matching ref/ref.txt (or run bootstrap_voice.py)
+sudo cp omnivoice.service /etc/systemd/system/ && sudo $EDITOR /etc/systemd/system/omnivoice.service
+sudo systemctl daemon-reload && sudo systemctl enable --now omnivoice
+```
+
+Then point the app (the app venv needs **no** GPU deps) at it:
+
+```bash
+TTS_BACKEND=openai
+TTS_OPENAI_BASE_URL=http://<gpu-box>:8880/v1
+TTS_OPENAI_MODEL=omnivoice
+TTS_OPENAI_VOICE=de_female
+TTS_OPENAI_SAMPLE_RATE=24000
+```
 
 ### Pointing the LLM at your own server
 

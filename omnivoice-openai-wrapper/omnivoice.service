@@ -1,0 +1,32 @@
+[Unit]
+# OmniVoice OpenAI-compatible TTS — drop-in for a Kokoro/OpenAI TTS endpoint on :8880.
+# Copy to /etc/systemd/system/omnivoice.service and edit the paths / GPU / voice
+# below, then:  systemctl daemon-reload && systemctl enable --now omnivoice
+Description=OmniVoice OpenAI-compatible TTS (:8880)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE ---------------------------------------------------------------
+# Directory holding omnivoice_openai_server.py, textnorm.py and ref/.
+WorkingDirectory=/opt/omnivoice-openai-wrapper
+# Pin to ONE GPU (index as seen by nvidia-smi).
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=HF_HOME=/root/.cache/huggingface
+# Voice-clone reference (a clean WAV + its exact transcript).
+Environment=OMNIVOICE_REF_WAV=/opt/omnivoice-openai-wrapper/ref/ref.wav
+Environment=OMNIVOICE_REF_TXT=/opt/omnivoice-openai-wrapper/ref/ref.txt
+Environment=OMNIVOICE_LANG=de
+Environment=OMNIVOICE_VOICE=de_female
+# Diffusion steps: lower = faster/rougher, higher = slower/smoother (16 is a good live default).
+Environment=OMNIVOICE_NUM_STEP=16
+# venv sits next to WorkingDirectory (see README): /opt/omnivoice-env
+ExecStart=/opt/omnivoice-env/bin/uvicorn omnivoice_openai_server:app --host 0.0.0.0 --port 8880
+# ------------------------------------------------------------------------------
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

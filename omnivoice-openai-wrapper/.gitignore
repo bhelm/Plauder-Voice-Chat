@@ -1,0 +1,8 @@
+# The actual voice-clone reference is a personal recording — keep it out of git.
+ref/ref.wav
+ref/ref.txt
+ref/cand_*.wav
+ref/*.bak.*
+out/
+*.log
+__pycache__/
