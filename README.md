@@ -34,6 +34,9 @@ backends** for STT, TTS and LLM. Via `.env` you can switch between cloud APIs
 
 ## Getting Started
 
+> Full walkthrough — including local backends, voice lock, systemd and reverse
+> proxy — in the **[installation guide](INSTALL.md)**. Below is the short version.
+
 ### Requirements
 
 - **Python 3.11** and a microphone-capable browser (Chrome/Edge/Firefox).
