@@ -62,6 +62,23 @@ def test_hallucination_filter_denylist_with_high_no_speech():
     assert not hf.is_hallucination("Das ist echt wichtig", no_speech_prob=0.99)
 
 
+def test_hallucination_filter_credit_roll_always():
+    # Credit-roll outros are filtered UNCONDITIONALLY (no no_speech_prob needed —
+    # cloud STT reports none) and as a substring so trailing years/channels hit.
+    hf = sanitizer.HallucinationFilter(enabled=True)
+    assert hf.is_hallucination("Untertitel des ZDF, 2020", no_speech_prob=None)
+    assert hf.is_hallucination("Untertitelung des ZDF für Funk, 2017")
+    assert hf.is_hallucination("Thanks for watching!", no_speech_prob=0.0)
+    assert hf.is_hallucination("Untertitel der Amara.org-Community")
+    # A genuine request that merely mentions subtitles must NOT be filtered.
+    assert not hf.is_hallucination("Mach mal die Untertitel an", no_speech_prob=None)
+
+
+def test_hallucination_filter_extra_substring_rule():
+    hf = sanitizer.HallucinationFilter(enabled=True, extra_phrases="brought to you by*")
+    assert hf.is_hallucination("Brought to you by ACME Corp", no_speech_prob=None)
+
+
 def test_hallucination_filter_disabled():
     hf = sanitizer.HallucinationFilter(enabled=False)
     assert not hf.is_hallucination("Thank you.", no_speech_prob=0.99)

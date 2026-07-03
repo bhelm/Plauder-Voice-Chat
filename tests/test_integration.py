@@ -69,6 +69,45 @@ def test_conversation_separate_keys_isolated():
     assert [m["content"] for m in msgs] == ["b-frage"]  # B doesn't know A
 
 
+def test_seed_history_fills_empty_key():
+    llm = _RecordingLLM()
+    conv = ConversationManager(llm, system_prompt="SYS", history_turns=20)
+    seed = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    conv.seed_history("u1", seed)
+    asyncio.run(conv.chat("new question", user_key="u1"))
+    msgs, _ = llm.received[0]
+    contents = [m["content"] for m in msgs]
+    assert "old question" in contents
+    assert "old answer" in contents
+    assert "new question" in contents
+
+
+def test_seed_history_skips_when_already_has_turns():
+    llm = _RecordingLLM()
+    conv = ConversationManager(llm, system_prompt="SYS")
+    asyncio.run(conv.chat("first", user_key="u1"))
+    conv.seed_history("u1", [{"role": "user", "content": "should not appear"}])
+    asyncio.run(conv.chat("second", user_key="u1"))
+    msgs, _ = llm.received[1]
+    contents = [m["content"] for m in msgs]
+    assert "should not appear" not in contents
+    assert "first" in contents
+
+
+def test_seed_history_respects_max_turns():
+    llm = _RecordingLLM()
+    conv = ConversationManager(llm, system_prompt="SYS", history_turns=2)
+    seed = [
+        {"role": "user", "content": f"q{i}"}
+        for i in range(10)
+    ]
+    conv.seed_history("u1", seed)
+    assert len(conv.history_for("u1")) == 4  # history_turns=2 → 2*2=4 msgs
+
+
 def test_conversation_image_builds_multimodal():
     llm = _RecordingLLM()
     conv = ConversationManager(llm, system_prompt="SYS")

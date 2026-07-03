@@ -12,6 +12,11 @@ uploads/
 house_data/
 *.log
 
+# Speaker lock: downloaded embedding models + the enrolled voice profile
+models/
+*.onnx
+speaker_profile.json
+
 # Backups / Editor / OS
 *_orig.py
 *.bak
@@ -25,3 +30,4 @@ speakers.json
 
 # Interne Diagnose-Notizen (enthalten Session-Keys/Chat-IDs)
 HERMES_MEMORY_NOTES.md
+spk-dump/

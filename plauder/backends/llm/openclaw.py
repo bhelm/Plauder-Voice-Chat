@@ -36,6 +36,17 @@ class OpenClawLLMBackend(OpenAICompatLLMBackend):
         self.token = token
         self.agent_id = agent_id
         self.user_id = user_id
+        # Default the (settable) Hermes session_key to the derived routing key, so
+        # the gateway routes correctly even when nothing overrides it. The gateway
+        # actually routes on the ``user`` body field — always the derived
+        # route_key (see _extra_body) — so a Hermes override of session_key only
+        # affects the X-Hermes-Session-Key header, not routing.
+        self.session_key = self.route_key
+
+    @property
+    def route_key(self) -> str:
+        """Derived agent/user routing key (the gateway's ``user`` field)."""
+        return f"agent:{self.agent_id}:openai-user:{self.user_id}"
 
     @classmethod
     def from_config(cls, cfg) -> "OpenClawLLMBackend":
@@ -49,10 +60,6 @@ class OpenClawLLMBackend(OpenAICompatLLMBackend):
             model=cfg.llm_model,
         )
 
-    @property
-    def session_key(self) -> str:
-        return f"agent:{self.agent_id}:openai-user:{self.user_id}"
-
     async def load(self) -> None:
         if not self.token:
             from ..base import BackendError
@@ -64,10 +71,10 @@ class OpenClawLLMBackend(OpenAICompatLLMBackend):
             "engine": "openclaw",
             "gateway": self.gateway_url,
             "agent_id": self.agent_id,
-            "session_key": self.session_key,
+            "session_key": self.route_key,
             "ready": self.loaded,
         }
 
     def _extra_body(self, *, stream: bool) -> dict:
         # The gateway routes by the OpenAI ``user`` field (no stream_options).
-        return {"user": self.session_key}
+        return {"user": self.route_key}

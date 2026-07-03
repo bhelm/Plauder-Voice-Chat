@@ -88,6 +88,23 @@ class TurnState:
     # contributing to the turn arrived at the server ("user is done speaking").
     # The time until the first playback is measured against this point.
     speech_end_ts: float = 0.0
+    # Combined input text of the turn currently being processed (set by
+    # _run_turn for its lifetime). If the owner keeps speaking BEFORE any audio
+    # of the reply played, the cancelled turn's input is re-queued into the
+    # next turn (coalescing) instead of being dropped.
+    inflight_combined: str | None = None
+    # True once the current turn actually EMITTED audio (audio.start sent).
+    # audio_ids is set eagerly at stream start (for the audio.stop backup), so
+    # it cannot distinguish "reply audible" from "still thinking".
+    audio_started: bool = False
+    # Voice lock, temporal continuity: full-verify score + time of the last
+    # segment that STRICTLY matched the owner. Segments shortly after get a
+    # relative bar (last_own − Δ) instead of the absolute threshold — the same
+    # voice trailing on scores slightly lower (sentence tails after an
+    # owner-watch split, longer utterances), while foreign voices stay far
+    # below. Preserved across turns (deliberately not cleared by reset()).
+    speaker_last_own: float = 0.0
+    speaker_last_own_ts: float = 0.0
     # Hermes session ID for the voice session (deterministic from the session
     # key so it survives reconnects; rotated on explicit /new).
     hermes_session_id_separate: str = field(default_factory=_stable_session_id)

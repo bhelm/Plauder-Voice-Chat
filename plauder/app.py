@@ -83,7 +83,20 @@ async def init_backends(cfg: Config):
 
     conv = ConversationManager(llm, system_prompt=cfg.resolved_voice_system(),
                                history_turns=cfg.llm_history_turns)
-    return stt, tts, conv
+
+    # Speaker lock (voice gate). Optional; fail-open: any load problem disables
+    # the gate rather than blocking the mic.
+    speaker = None
+    if cfg.speaker_lock_enabled:
+        from .speaker_verify import SpeakerVerifier
+        speaker = SpeakerVerifier.from_config(cfg)
+        try:
+            speaker.load()
+        except Exception as exc:
+            LOG.warning("Speaker lock disabled (load failed): %s", exc)
+            speaker = None
+
+    return stt, tts, conv, speaker
 
 
 async def main():
@@ -102,14 +115,17 @@ async def main():
                  cfg.house_speaker_id, cfg.house_wake_word, cfg.house_auth)
 
     try:
-        stt, tts, conv = await init_backends(cfg)
+        stt, tts, conv, speaker = await init_backends(cfg)
     except Exception:
         LOG.exception("Backend initialization failed")
         sys.exit(3)
 
     bridge = None  # Telegram bridge is legacy/optional; off by default.
 
-    server.configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge)
+    server.configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge, speaker=speaker)
+    if speaker is not None:
+        LOG.info("🔒 Speaker lock active (enrolled=%s, threshold=%.2f)",
+                 speaker.has_profile(), speaker.threshold)
 
     LOG.info("STT-Backend: %s · %s", cfg.stt_backend, stt.describe())
     LOG.info("TTS-Backend: %s · %s", cfg.tts_backend, tts.describe())

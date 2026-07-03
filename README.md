@@ -20,6 +20,10 @@ backends** for STT, TTS and LLM. Via `.env` you can switch between cloud APIs
 - 🔔 **Wake word** — selectable input mode (alongside VAD & push-to-talk): the AI
   only reacts to "Antonia …", everything else is discarded; with a conversation window
   for follow-up questions. Off by default at startup, toggleable in the UI.
+- 🔒 **Voice lock** — optional speaker verification: enroll your voice from the UI,
+  and only *your* voice is transcribed — other people and background voices (TV,
+  kids) are dropped before the LLM. Works with any STT backend; needs
+  `sherpa-onnx` + a small CAM++/WeSpeaker ONNX model (see [Voice lock](#voice-lock)).
 - 🔀 **Pluggable backends** — STT/TTS/LLM each selectable independently via `.env`,
   cloud or local/GPU, any combination allowed.
 - 🗣️ **Turn-taking & barge-in** — debounce/coalescing, interrupting stops
@@ -217,6 +221,54 @@ configure the matching:
 | `WAKE_WORD_FUZZY` | `1` | Tolerate mishearings |
 | `WAKE_WORD_ANYWHERE` | `0` | `1` = wake word anywhere instead of only at the start |
 | `WAKE_WORD_RATIO` | `0.78` | Fuzzy threshold (higher = stricter) |
+
+---
+
+## Voice lock
+
+Speaker **verification** so the chat only listens to one enrolled voice. This is
+separate from the wake word and from STT: every committed voice segment is turned
+into a speaker embedding and compared (cosine similarity) against the enrolled
+owner profile. A mismatch is dropped as `transcript.ignored` (`speaker_mismatch`)
+**before** it reaches the wake gate or the LLM, and it does not interrupt a running
+reply. It is language-independent, so Whisper keeps doing the German ASR.
+
+**Mixed segments are trimmed:** when a segment ≥ 2 s mixes the owner with other
+voices speaking right before/after (sequential — e.g. the kids keep talking into
+your sentence), the gate analyzes ~1 s windows, keeps only the owner's spans and
+re-transcribes just those (one extra STT call in the mixed case). Simultaneous
+overlapping speech cannot be separated this way — that would need neural
+target-speaker extraction. Kill switch: `SPEAKER_TRIM=0`.
+
+**Barge-in follows the lock too:** while the lock is engaged the client does not
+stop playback on VAD speech (any voice would trigger that). Playback is only
+*ducked* while the server verifies the speaker on the live input stream
+(~1 s of audio); a confirmed owner voice cancels the reply (`audio.stop`), a
+foreign voice lets it keep playing at full volume. The stop button and
+push-to-talk always interrupt (deliberate user actions).
+
+**Setup** (optional, off by default):
+
+1. `pip install sherpa-onnx` (bundles the kaldi-fbank the model expects; no torch).
+2. Download a speaker-embedding model, e.g.
+   `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` (multilingual, ~28 MB) from
+   the [sherpa-onnx speaker models](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recognition-models).
+3. In `.env`: `SPEAKER_LOCK_ENABLED=1` and `SPEAKER_MODEL_PATH=/abs/path/model.onnx`.
+4. Start the server, open the UI → **Voice lock** card → **Learn my voice**
+   (records ~6 s; add another sample if recognition is unreliable). The profile is
+   written to `SPEAKER_PROFILE_PATH` and reused across restarts.
+
+Until a profile is enrolled the gate stays open (fail-open), and any load problem
+(missing model/dep) simply disables it rather than blocking the mic.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPEAKER_LOCK_ENABLED` | `0` | Enable the voice gate |
+| `SPEAKER_MODEL_PATH` | — | Absolute path to the CAM++/WeSpeaker ONNX model |
+| `SPEAKER_PROFILE_PATH` | `./speaker_profile.json` | Where the enrolled profile is stored |
+| `SPEAKER_THRESHOLD` | `0.5` | Cosine similarity to accept (higher = stricter) |
+| `SPEAKER_MIN_DUR_S` | `0.6` | Segments shorter than this can't be verified → dropped |
+| `SPEAKER_PROVIDER` | `cpu` | onnxruntime provider: `cpu` \| `cuda` |
 
 ---
 

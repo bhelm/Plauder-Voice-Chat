@@ -30,6 +30,21 @@ def pcm_bytes_to_float32_array(pcm_bytes: bytes) -> np.ndarray:
     return np.frombuffer(pcm_bytes, dtype=np.float32)
 
 
+def crop_f32_spans(pcm_bytes: bytes, sample_rate: int, spans) -> bytes:
+    """Cut ``[(start_s, end_s), …]`` spans out of a float32 mono buffer and
+    concatenate them (speaker-lock trimming of mixed-voice segments)."""
+    samples = pcm_bytes_to_float32_array(pcm_bytes)
+    parts = []
+    for s, e in spans:
+        a = max(0, int(s * sample_rate))
+        b = min(samples.shape[0], int(e * sample_rate))
+        if b > a:
+            parts.append(samples[a:b])
+    if not parts:
+        return b""
+    return np.concatenate(parts).astype(np.float32).tobytes()
+
+
 def float32_to_pcm16_bytes(samples):
     """Clip float32 samples to [-1, 1] and pack them as little-endian int16 PCM bytes."""
     clipped = np.clip(samples, -1.0, 1.0)

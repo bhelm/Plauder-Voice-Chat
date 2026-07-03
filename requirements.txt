@@ -20,4 +20,7 @@ pytest>=7.0,<9
 #   pip install faster-whisper
 # TTS_BACKEND=omnivoice_local:
 #   pip install omnivoice torch   (see the k2-fsa/OmniVoice setup)
-# These packages are imported ONLY when the corresponding backend is active.
+# SPEAKER_LOCK_ENABLED=1 (voice gate — only the enrolled owner voice is heard):
+#   pip install sherpa-onnx   (bundles the kaldi-fbank the CAM++ model expects;
+#   no torch needed) + a speaker-embedding model, see .env.example SPEAKER_MODEL_PATH.
+# These packages are imported ONLY when the corresponding backend/feature is active.

@@ -44,7 +44,7 @@ def _restore_server_state():
 
     saved_globals = {
         name: getattr(srv, name)
-        for name in ("CFG", "STT", "TTS", "CONV", "BRIDGE", "GHOST")
+        for name in ("CFG", "STT", "TTS", "CONV", "BRIDGE", "GHOST", "SPEAKER")
     }
     saved_guard = srv.WAKE_CLOSE_GUARD_S
     try:

@@ -25,6 +25,16 @@ class ConversationManager:
     def history_for(self, user_key: str) -> list[dict]:
         return self._history.setdefault(user_key, [])
 
+    def seed_history(self, user_key: str, messages: list[dict]) -> None:
+        """Pre-fill the local history from an external source (e.g. Hermes
+        backend) — but only when the local history for this key is still empty.
+        Respects ``history_turns`` to cap the seeded context window."""
+        if self._history.get(user_key):
+            return  # already has local turns → don't overwrite
+        max_msgs = self.history_turns * 2
+        trimmed = messages[-max_msgs:] if len(messages) > max_msgs else list(messages)
+        self._history[user_key] = trimmed
+
     @staticmethod
     def _build_user_message(user_text: str, image_urls=None) -> dict:
         if image_urls:

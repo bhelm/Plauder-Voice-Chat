@@ -204,6 +204,84 @@
       box-shadow: 0 0 2px var(--err);
     }
 
+    /* ===== Voice lock (speaker verification) — collapsible section with its
+       own accent. Layout (summary/body/chevron) comes from .acc; only the
+       accent colors and inner widgets live here. .acc.vlock outranks the
+       later-defined .acc base rule. ===== */
+    .acc.vlock {
+      border-color: rgba(167,139,250,.35);
+      background:
+        radial-gradient(120% 140% at 100% 0%, rgba(167,139,250,.14), transparent 60%),
+        var(--panel-2);
+    }
+    .acc.vlock.locked { border-color: rgba(74,222,128,.45); }
+    .vlock > summary:hover { background: rgba(167,139,250,.08); }
+    .vlock > summary::after { margin-left: 8px; }
+    .vlock-head { gap: 10px; }
+    .vlock-badge {
+      width: 36px; height: 36px; flex-shrink: 0; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center; font-size: 18px;
+      background: var(--panel); border: 1px solid var(--border);
+      transition: box-shadow .25s, border-color .25s, background .25s;
+    }
+    .vlock.locked .vlock-badge {
+      border-color: rgba(74,222,128,.5);
+      background: rgba(74,222,128,.10);
+      box-shadow: 0 0 0 4px rgba(74,222,128,.10);
+    }
+    .vlock-title { font-weight: 700; font-size: 14px; }
+    .vlock-sub { font-size: 11px; color: var(--muted); margin-top: 1px; font-weight: 400; }
+    .vlock-chip {
+      margin-left: auto; font-size: 11px; font-weight: 600; padding: 3px 9px;
+      border-radius: 999px; border: 1px solid var(--border);
+      color: var(--muted); background: var(--panel);
+    }
+    .vlock.locked .vlock-chip { color: var(--ok); border-color: rgba(74,222,128,.5); }
+    /* Live match meter (score vs threshold marker) */
+    .vlock-meter {
+      position: relative; height: 12px; border-radius: 6px; background: var(--bg);
+      border: 1px solid var(--border); overflow: hidden; margin: 4px 0;
+    }
+    .vlock-meter-bar {
+      height: 100%; width: 0%; background: linear-gradient(to right, var(--err), var(--warn), var(--ok));
+      transition: width .25s ease;
+    }
+    .vlock-meter-mark {
+      position: absolute; top: -2px; bottom: -2px; width: 2px; left: 50%;
+      background: var(--text); box-shadow: 0 0 2px rgba(0,0,0,.6);
+    }
+    .vlock-metric { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+    .vlock-metric b { color: var(--text); font-variant-numeric: tabular-nums; }
+    /* Enroll button + recording progress */
+    .vlock-enroll {
+      position: relative; width: 100%; overflow: hidden;
+      border: 1px solid rgba(167,139,250,.5);
+      background: linear-gradient(180deg, rgba(167,139,250,.16), rgba(167,139,250,.06));
+      color: var(--text); font-weight: 600;
+    }
+    .vlock-enroll:disabled { opacity: 1; cursor: default; }
+    .vlock-enroll .vlock-prog {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+      background: rgba(167,139,250,.28); transition: width .12s linear; z-index: 0;
+    }
+    .vlock-enroll .vlock-rec-dot {
+      display: none; width: 9px; height: 9px; border-radius: 50%;
+      background: var(--err); box-shadow: 0 0 0 0 rgba(248,113,113,.6);
+      animation: vlockPulse 1s infinite;
+    }
+    .vlock-enroll.recording .vlock-rec-dot { display: inline-block; }
+    .vlock-enroll > span { position: relative; z-index: 1; }
+    @keyframes vlockPulse {
+      0% { box-shadow: 0 0 0 0 rgba(248,113,113,.55); }
+      70% { box-shadow: 0 0 0 7px rgba(248,113,113,0); }
+      100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+    }
+    .vlock-forget {
+      background: none; border: none; color: var(--muted); font-size: 11px;
+      text-decoration: underline; cursor: pointer; padding: 4px; margin-top: 2px;
+    }
+    .vlock-forget:hover { color: var(--err); }
+
     /* Slider Card */
     .slider-row { display: flex; align-items: center; gap: 10px; }
     .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
@@ -404,6 +482,30 @@
     .bubble.pending { opacity: 0.7; border: 1px dashed rgba(255,255,255,.15); }
     .bubble.partial { font-style: italic; opacity: 0.8; }
     .bubble.wake-ignored { opacity: 0.5; font-size: 0.85em; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.12); }
+    /* Voice lock: realtime segment feed. Each recognized segment shows up as a
+       colored chip — green = your voice (accepted), amber = mixed & trimmed,
+       red strikethrough = foreign voice (dropped). Chips live inside the
+       pending user bubble; rejected chips with no open turn get a minimal
+       borderless line of their own (.bubble.seg-feed). */
+    .seg-strip { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+    .seg-chip {
+      font-size: 10.5px; line-height: 1.5; padding: 1px 8px; border-radius: 999px;
+      border: 1px solid; max-width: 100%; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; cursor: default;
+    }
+    .seg-chip.own  { color: var(--ok);   border-color: rgba(74,222,128,.4);  background: rgba(74,222,128,.08); }
+    .seg-chip.trim { color: var(--warn); border-color: rgba(251,191,36,.4);  background: rgba(251,191,36,.08); }
+    .seg-chip.rej  { color: var(--err);  border-color: rgba(248,113,113,.3); background: rgba(248,113,113,.06);
+                     text-decoration: line-through; opacity: .85; }
+    .bubble.seg-feed { background: transparent; border: none; padding: 2px 0; box-shadow: none; }
+    /* Coalesced turn: its input moved into the next bubble → dim the old one. */
+    .bubble.superseded { opacity: .45; }
+    /* Foreign speech INSIDE the transcript text: colored in place (struck,
+       reddish) instead of duplicating the sentence below the bubble. */
+    .seg-cut {
+      color: var(--err); opacity: .75;
+      text-decoration: line-through; text-decoration-thickness: 1px;
+    }
     .bubble.wake-armed { color: var(--ok); }
     .bubble.silent { opacity: 0.65; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.18); }
     .bubble.discarded {
@@ -537,18 +639,53 @@
       opacity: 0; visibility: hidden; transition: opacity .2s; z-index: 40;
     }
     .drawer-overlay.open { opacity: 1; visibility: visible; }
+    /* The DRAWER ITSELF is the scroll container (simple, battle-tested block
+       scrolling — no flex-height chains that can silently stop scrolling and
+       clip the content on some browsers/viewports). */
     .drawer {
-      position: fixed; top: 0; right: 0; height: 100%;
+      position: fixed; top: 0; right: 0;
+      height: 100%; height: 100dvh;   /* dvh: mobile URL bar must not hide the bottom */
       width: 380px; max-width: 92vw;
       background: var(--panel); border-left: 1px solid var(--border);
       transform: translateX(100%); transition: transform .25s ease;
-      z-index: 50; overflow-y: auto; padding: 18px;
-      display: flex; flex-direction: column; gap: 14px;
+      z-index: 50; overflow-y: auto; overflow-x: hidden; padding: 18px;
+      overscroll-behavior: contain;
     }
     .drawer.open { transform: translateX(0); }
-    .drawer-head { display: flex; align-items: center; justify-content: space-between; }
+    .drawer-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding-bottom: 10px; margin-bottom: 12px; border-bottom: 1px solid var(--border);
+    }
     .drawer-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
     .close-btn { width: 36px; height: 36px; padding: 0; border-radius: 10px; font-size: 16px; }
+    .drawer-body {
+      display: flex; flex-direction: column; gap: 10px;
+      /* Last section must clear the home-indicator / browser chrome on mobile. */
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+    }
+    /* Collapsible section (native <details>) */
+    .acc {
+      border: 1px solid var(--border); border-radius: 12px;
+      background: var(--panel-2); overflow: hidden;
+    }
+    .acc > summary {
+      list-style: none; cursor: pointer; user-select: none;
+      padding: 12px 14px; font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .acc > summary::-webkit-details-marker { display: none; }
+    .acc > summary::after {
+      content: '▸'; margin-left: auto; color: var(--muted);
+      transition: transform .2s ease; flex-shrink: 0;
+    }
+    .acc[open] > summary::after { transform: rotate(90deg); }
+    .acc[open] > summary { border-bottom: 1px solid var(--border); }
+    .acc > summary:hover { background: var(--panel); }
+    .acc-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 14px; }
+    /* Cards nested in an accordion drop their own chrome (the section is the
+       frame); consecutive cards get a hairline divider instead. */
+    .acc-body .card { border: none; background: none; padding: 0; margin: 0; border-radius: 0; }
+    .acc-body .card + .card { border-top: 1px solid var(--border); padding-top: 14px; }
 
     /* Mic button signals "running – click to stop" (⏹) during processing. */
     .mic-btn.busy { cursor: pointer; }
@@ -563,7 +700,7 @@
         overflow: hidden; flex: 0 0 auto;
         transition: width .25s ease, padding .25s ease;
       }
-      .drawer.open { width: 360px; padding: 18px; overflow-y: auto; }
+      .drawer.open { width: 360px; padding: 18px; overflow-y: auto; overflow-x: hidden; }
       .drawer-overlay { display: none !important; }
       .close-btn { display: none; }   /* docked: close via ☰ */
     }
@@ -624,7 +761,12 @@
         <button id="closeSettingsBtn" class="close-btn" data-i18n-title="close.title" title="Close">✕</button>
       </div>
 
-      <!-- Eingabe-Modus: VAD / Wake-Word / Push-to-Talk -->
+      <!-- Scrollable body: head stays put, everything below scrolls. Grouped
+           into collapsible sections so the drawer never overflows. -->
+      <div class="drawer-body">
+
+      <!-- Input mode: THE core switch — always visible at the very top,
+           deliberately not inside a collapse. -->
       <div class="card">
         <div class="label" data-i18n="settings.input_mode">Input mode</div>
         <div class="input-mode-row">
@@ -646,82 +788,148 @@
         </div>
       </div>
 
-      <!-- VAD-Empfindlichkeit: Schwelle + Live-Sprach-Pegel -->
-    <div class="card" id="vadThreshCard">
-      <div class="label" data-i18n="settings.vad_sensitivity">VAD sensitivity</div>
-      <div class="slider-row">
-        <input id="vadThreshold" type="range" min="0.1" max="0.95" step="0.05" value="0.6" />
-        <span id="vadThresholdLabel" class="num">0.60</span>
-      </div>
-      <div class="vad-prob" data-i18n-title="vad.live_title" title="Live speech level of the VAD">
-        <div id="vadProbBar" class="vad-prob-bar"></div>
-        <div id="vadProbMark" class="vad-prob-mark"></div>
-      </div>
-      <div data-i18n-html="settings.vad_sensitivity_help" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
-        Lower = more sensitive (reacts to quiet/short sounds). Higher = you have to
-        speak more clearly. To test, speak: if the green level stays <b>below</b> the
-        red line while only background noise/TTS is playing, and shoots <b>above</b> it
-        when you speak — then the threshold is right.
-      </div>
-    </div>
+      <!-- Voice lock (speaker verification): collapsible section with its own
+           accent at the top. Hidden unless the server has a speaker model
+           loaded (hello.speakerLock). -->
+      <details class="acc vlock" id="voiceLockCard" style="display:none;" open data-sec="vlock">
+        <summary class="vlock-head">
+          <div class="vlock-badge" id="voiceLockBadge">🔓</div>
+          <div>
+            <div class="vlock-title" data-i18n="settings.voicelock">Voice lock</div>
+            <div class="vlock-sub" data-i18n="voicelock.tagline">Only your voice is heard</div>
+          </div>
+          <span class="vlock-chip" id="voiceLockChip"></span>
+        </summary>
+        <div class="acc-body">
+          <div data-i18n="voicelock.help" style="font-size: 11px; color: var(--muted);">
+            Only your enrolled voice is transcribed — other people and background voices are ignored.
+          </div>
 
-    <div class="card">
-      <div class="label" data-i18n="settings.speed">Speaking speed</div>
-      <div class="slider-row">
-        <input id="speed" type="range" min="0.7" max="3" step="0.05" value="0.95" />
-        <span id="speedLabel" class="num">0.95x</span>
-      </div>
-    </div>
+          <button id="enrollVoiceBtn" class="vlock-enroll">
+            <span class="vlock-prog" id="voiceLockProg"></span>
+            <span><span class="vlock-rec-dot"></span> <span id="enrollVoiceLabel" data-i18n="voicelock.enroll">🎙️ Learn my voice</span></span>
+          </button>
 
-    <div class="card">
-      <div class="label" data-i18n="settings.debounce">Thinking-pause tolerance</div>
-      <div class="slider-row">
-        <input id="debounce" type="range" min="400" max="5000" step="100" value="1200" />
-        <span id="debounceLabel" class="num">1.2s</span>
-      </div>
-      <div data-i18n="settings.debounce_help" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
-        How long may you pause within a sentence without the agent replying prematurely?
-        Affects both the browser VAD and the server debounce.
-      </div>
-    </div>
+          <!-- Live match meter: your last spoken segment's similarity vs the accept
+               threshold (marker). Speak to tune. -->
+          <div id="voiceLockTuner" style="display:none;">
+            <div class="vlock-metric">
+              <span data-i18n="voicelock.lastmatch">Last voice match</span>
+              <b id="voiceLockScore">–</b>
+            </div>
+            <div class="vlock-meter">
+              <div class="vlock-meter-bar" id="voiceLockMeterBar"></div>
+              <div class="vlock-meter-mark" id="voiceLockMeterMark"></div>
+            </div>
+            <div class="slider-row" style="margin-top:8px;">
+              <input id="voiceLockThreshold" type="range" min="0.2" max="0.9" step="0.02" value="0.5" />
+              <span id="voiceLockThresholdLabel" class="num">0.50</span>
+            </div>
+            <div data-i18n="voicelock.threshold_help" style="font-size:11px;color:var(--muted);margin-top:4px;">
+              Strictness: your match must land <b>right</b> of the marker to pass. Higher = stricter.
+            </div>
+          </div>
 
-    <div class="card">
-      <div class="label" data-i18n="settings.microphone">Microphone</div>
-      <select id="micSelect" style="width:100%;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit;cursor:pointer;outline:none;">
-        <option value="" data-i18n="settings.microphone_default">System default</option>
-      </select>
-    </div>
+          <div style="text-align:center;margin-top:-6px;">
+            <button id="forgetVoiceBtn" class="vlock-forget" data-i18n="voicelock.forget" style="display:none;">Forget voice</button>
+          </div>
+        </div>
+      </details>
 
-    <div class="card">
-      <div class="label" data-i18n="settings.volume">Volume</div>
-      <div class="slider-row">
-        <input id="volume" type="range" min="0" max="100" value="80" />
-        <span id="volumeLabel" class="num">80%</span>
-      </div>
-      <div data-i18n="settings.cue_volume_help" style="font-size: 11px; color: var(--muted); margin-top: 8px;">
-        Wake tones (pling/plong) · 0 = off
-      </div>
-      <div class="slider-row">
-        <input id="cueVolume" type="range" min="0" max="100" value="70" />
-        <span id="cueVolumeLabel" class="num">70%</span>
-      </div>
-    </div>
+      <!-- ── Section: Detection & timing ────────────────────────────── -->
+      <details class="acc" open data-sec="detection">
+        <summary>🎚️ <span data-i18n="settings.sec_detection">Detection &amp; timing</span></summary>
+        <div class="acc-body">
+          <div class="card" id="vadThreshCard">
+            <div class="label" data-i18n="settings.vad_sensitivity">VAD sensitivity</div>
+            <div class="slider-row">
+              <input id="vadThreshold" type="range" min="0.1" max="0.95" step="0.05" value="0.6" />
+              <span id="vadThresholdLabel" class="num">0.60</span>
+            </div>
+            <div class="vad-prob" data-i18n-title="vad.live_title" title="Live speech level of the VAD">
+              <div id="vadProbBar" class="vad-prob-bar"></div>
+              <div id="vadProbMark" class="vad-prob-mark"></div>
+            </div>
+            <div data-i18n-html="settings.vad_sensitivity_help" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+              Lower = more sensitive (reacts to quiet/short sounds). Higher = you have to
+              speak more clearly. To test, speak: if the green level stays <b>below</b> the
+              red line while only background noise/TTS is playing, and shoots <b>above</b> it
+              when you speak — then the threshold is right.
+            </div>
+          </div>
 
-    <div class="card">
-      <div class="label" data-i18n="settings.connection">Connection / session</div>
-      <div class="row" style="margin-bottom:8px;">
-        <button id="pingBtn" data-i18n="action.ping">Ping</button>
-        <button id="reconnectBtn" data-i18n="action.reconnect">Reconnect</button>
-      </div>
-      <div class="row">
-        <button id="newSessionBtn" data-i18n="action.new_session" data-i18n-title="action.new_session_title" title="Discard the previous conversation history and continue in a fresh LLM session">🆕 New session</button>
-      </div>
-    </div>
+          <div class="card">
+            <div class="label" data-i18n="settings.debounce">Thinking-pause tolerance</div>
+            <div class="slider-row">
+              <input id="debounce" type="range" min="400" max="5000" step="100" value="1200" />
+              <span id="debounceLabel" class="num">1.2s</span>
+            </div>
+            <div data-i18n="settings.debounce_help" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+              How long may you pause within a sentence without the agent replying prematurely?
+              Affects both the browser VAD and the server debounce.
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- ── Section: Audio ─────────────────────────────────────────── -->
+      <details class="acc" data-sec="audio">
+        <summary>🔊 <span data-i18n="settings.sec_audio">Audio &amp; microphone</span></summary>
+        <div class="acc-body">
+          <div class="card">
+            <div class="label" data-i18n="settings.speed">Speaking speed</div>
+            <div class="slider-row">
+              <input id="speed" type="range" min="0.7" max="3" step="0.05" value="0.95" />
+              <span id="speedLabel" class="num">0.95x</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="label" data-i18n="settings.volume">Volume</div>
+            <div class="slider-row">
+              <input id="volume" type="range" min="0" max="100" value="80" />
+              <span id="volumeLabel" class="num">80%</span>
+            </div>
+            <div data-i18n="settings.cue_volume_help" style="font-size: 11px; color: var(--muted); margin-top: 8px;">
+              Wake tones (pling/plong) · 0 = off
+            </div>
+            <div class="slider-row">
+              <input id="cueVolume" type="range" min="0" max="100" value="70" />
+              <span id="cueVolumeLabel" class="num">70%</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="label" data-i18n="settings.microphone">Microphone</div>
+            <select id="micSelect" style="width:100%;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit;cursor:pointer;outline:none;">
+              <option value="" data-i18n="settings.microphone_default">System default</option>
+            </select>
+          </div>
+        </div>
+      </details>
+
+      <!-- ── Section: Session ───────────────────────────────────────── -->
+      <details class="acc" data-sec="session">
+        <summary>🔌 <span data-i18n="settings.connection">Connection / session</span></summary>
+        <div class="acc-body">
+          <div class="card">
+            <div class="row" style="margin-bottom:8px;">
+              <button id="pingBtn" data-i18n="action.ping">Ping</button>
+              <button id="reconnectBtn" data-i18n="action.reconnect">Reconnect</button>
+            </div>
+            <div class="row">
+              <button id="newSessionBtn" data-i18n="action.new_session" data-i18n-title="action.new_session_title" title="Discard the previous conversation history and continue in a fresh LLM session">🆕 New session</button>
+            </div>
+          </div>
+        </div>
+      </details>
 
       <div class="footer-note" id="footerNote" data-i18n-html="footer.note">
         Speak → pause → the agent replies.<br />
         Speak again while the agent is thinking → its reply is discarded.
       </div>
+
+      </div><!-- /.drawer-body -->
     </aside>
   </div>
 
@@ -796,6 +1004,8 @@
         "composer.hint": "Text does not open the voice flow – the mic keeps running in parallel. Add images via 📎, drag &amp; drop or Ctrl+V.",
         // Settings drawer
         "settings.heading": "⚙️ Settings",
+        "settings.sec_detection": "Detection & timing",
+        "settings.sec_audio": "Audio & microphone",
         "close.title": "Close",
         "settings.input_mode": "Input mode",
         "mode.vad": "VAD (auto)",
@@ -864,6 +1074,7 @@
         "hint.wake": "Wake word: start the mic and speak with “{word}, …”. Follow-up questions shortly after go through without the wake word.",
         // Turn / agent bubble meta
         "turn.meta": "Turn {id}",
+        "turn.coalesced": "Turn {id} · merged into the next message",
         "turn.collecting": "Turn {id} · collecting ({s}s pause tolerance)",
         "turn.listening": "Turn {id} · listening …",
         "turn.discarded": "Turn {id} · discarded (follow-up speech detected)",
@@ -886,6 +1097,30 @@
         "sys.new_session_requested": "✍️  Requesting new session …",
         "wake.ignored_count": "🔇 ignored (no wake word) · {count}×",
         "wake.ignored_text": "🔇 “{text}” — ignored (no wake word)",
+        "wake.ignored_speaker": "🔇 “{text}” — ignored (not your voice)",
+        "wake.ignored_speaker_count": "🔇 ignored (not your voice) · {count}×",
+        // Voice lock: realtime segment chips
+        "seg.own_title": "Your voice — accepted (match score)",
+        "seg.trimmed_title": "Mixed segment — foreign parts removed. Original: “{full}”",
+        "seg.rej_title": "Foreign voice — dropped (score {score})",
+        // Voice lock (speaker verification)
+        "settings.voicelock": "Voice lock",
+        "voicelock.tagline": "Only your voice is heard",
+        "voicelock.help": "Only your enrolled voice is transcribed — other people and background voices are ignored. They can't interrupt a reply either: while someone speaks, playback is briefly lowered until the voice is verified (~1 s); only yours stops it. Record a few seconds of your voice; add another sample if recognition is unreliable.",
+        "voicelock.enroll": "🎙️ Learn my voice",
+        "voicelock.enroll_again": "🎙️ Add another sample",
+        "voicelock.forget": "Forget my voice",
+        "voicelock.status_none": "Open — every voice is heard.",
+        "voicelock.status_enrolled": "Locked · {count} sample(s).",
+        "voicelock.chip_open": "OPEN",
+        "voicelock.chip_locked": "LOCKED",
+        "voicelock.lastmatch": "Last voice match",
+        "voicelock.threshold_help": "Strictness: your match must land <b>right</b> of the marker to pass. Higher = stricter.",
+        "voicelock.recording": "Recording… keep talking ({pct}%)",
+        "voicelock.saved": "✅ Voice sample saved.",
+        "voicelock.too_short": "Too short — speak for a few seconds.",
+        "voicelock.unavailable": "Speaker model not loaded on the server.",
+        "voicelock.error": "Enrollment failed: {err}",
         // Speaker button
         "speaker.tip": "Click: play / pause · Hold: from the start",
         "speaker.no_audio": "No audio (e.g. after reloading the page)",
@@ -940,6 +1175,8 @@
         "composer.hint": "Text öffnet den Voice-Flow nicht – Mikro läuft parallel weiter. Bilder per 📎, Drag&amp;Drop oder Strg+V einfügen.",
         // Settings drawer
         "settings.heading": "⚙️ Einstellungen",
+        "settings.sec_detection": "Erkennung & Timing",
+        "settings.sec_audio": "Audio & Mikrofon",
         "close.title": "Schließen",
         "settings.input_mode": "Eingabe-Modus",
         "mode.vad": "VAD (auto)",
@@ -1008,6 +1245,7 @@
         "hint.wake": 'Wake-Word: Mikro starten und mit „{word}, …" sprechen. Folgefragen kurz danach gehen ohne Wake-Word durch.',
         // Turn / agent bubble meta
         "turn.meta": "Turn {id}",
+        "turn.coalesced": "Turn {id} · in die nächste Nachricht übernommen",
         "turn.collecting": "Turn {id} · sammelt ({s}s Pause-Toleranz)",
         "turn.listening": "Turn {id} · höre zu …",
         "turn.discarded": "Turn {id} · verworfen (Folgesprache erkannt)",
@@ -1030,6 +1268,30 @@
         "sys.new_session_requested": "✍️  Neue Session angefordert …",
         "wake.ignored_count": "🔇 ignoriert (kein Wake-Word) · {count}×",
         "wake.ignored_text": '🔇 „{text}" — ignoriert (kein Wake-Word)',
+        "wake.ignored_speaker": '🔇 „{text}" — ignoriert (nicht deine Stimme)',
+        "wake.ignored_speaker_count": "🔇 ignoriert (nicht deine Stimme) · {count}×",
+        // Voice lock: Echtzeit-Segment-Chips
+        "seg.own_title": "Deine Stimme — übernommen (Match-Score)",
+        "seg.trimmed_title": "Gemischtes Segment — fremde Teile entfernt. Original: „{full}\"",
+        "seg.rej_title": "Fremde Stimme — verworfen (Score {score})",
+        // Voice lock (Sprecher-Verifikation)
+        "settings.voicelock": "Stimmensperre",
+        "voicelock.tagline": "Nur deine Stimme wird gehört",
+        "voicelock.help": "Nur deine eingelernte Stimme wird transkribiert — andere Personen und Hintergrundstimmen werden ignoriert. Sie können eine Antwort auch nicht unterbrechen: Spricht jemand, wird die Wiedergabe kurz leiser, bis die Stimme geprüft ist (~1 s); nur deine stoppt sie. Nimm ein paar Sekunden deiner Stimme auf; füge eine weitere Probe hinzu, falls die Erkennung unzuverlässig ist.",
+        "voicelock.enroll": "🎙️ Meine Stimme lernen",
+        "voicelock.enroll_again": "🎙️ Weitere Probe hinzufügen",
+        "voicelock.forget": "Stimme vergessen",
+        "voicelock.status_none": "Offen — jede Stimme wird gehört.",
+        "voicelock.status_enrolled": "Gesperrt · {count} Probe(n).",
+        "voicelock.chip_open": "OFFEN",
+        "voicelock.chip_locked": "GESPERRT",
+        "voicelock.lastmatch": "Letzte Stimm-Übereinstimmung",
+        "voicelock.threshold_help": "Strenge: deine Übereinstimmung muss <b>rechts</b> der Markierung liegen. Höher = strenger.",
+        "voicelock.recording": "Aufnahme… weiter sprechen ({pct}%)",
+        "voicelock.saved": "✅ Stimmprobe gespeichert.",
+        "voicelock.too_short": "Zu kurz — sprich ein paar Sekunden.",
+        "voicelock.unavailable": "Sprecher-Modell auf dem Server nicht geladen.",
+        "voicelock.error": "Einlernen fehlgeschlagen: {err}",
         // Speaker button
         "speaker.tip": "Klick: Abspielen / Pause · Gedrückt halten: von vorn",
         "speaker.no_audio": "Kein Audio (z.B. nach Neuladen der Seite)",
@@ -1169,6 +1431,19 @@
     const speedLabel    = document.getElementById('speedLabel');
     const debounce      = document.getElementById('debounce');
     const debounceLabel = document.getElementById('debounceLabel');
+    const voiceLockCard   = document.getElementById('voiceLockCard');
+    const voiceLockBadge  = document.getElementById('voiceLockBadge');
+    const voiceLockChip   = document.getElementById('voiceLockChip');
+    const enrollVoiceBtn  = document.getElementById('enrollVoiceBtn');
+    const enrollVoiceLabel = document.getElementById('enrollVoiceLabel');
+    const voiceLockProg   = document.getElementById('voiceLockProg');
+    const forgetVoiceBtn  = document.getElementById('forgetVoiceBtn');
+    const voiceLockTuner  = document.getElementById('voiceLockTuner');
+    const voiceLockScore  = document.getElementById('voiceLockScore');
+    const voiceLockMeterBar  = document.getElementById('voiceLockMeterBar');
+    const voiceLockMeterMark = document.getElementById('voiceLockMeterMark');
+    const voiceLockThreshold = document.getElementById('voiceLockThreshold');
+    const voiceLockThresholdLabel = document.getElementById('voiceLockThresholdLabel');
 
     /* ===== Persistent UI settings (survive a reload) =====
        Mode, VAD threshold, wake-cue volume and panel state are already
@@ -1514,21 +1789,69 @@
       }
       chatLog.scrollTop = chatLog.scrollHeight;
     }
+    /* Voice lock: realtime segment feed — every recognized segment becomes a
+       colored chip (green ✓ = your voice, amber ✂️ = mixed & trimmed, red
+       strikethrough = foreign voice, dropped). Chips attach to the pending
+       user bubble of the turn; dropped segments without an open turn get a
+       minimal borderless feed line instead of a chat message. */
+    let _lastSegFeed = null;
+    function segStripFor(el) {
+      let strip = el.querySelector(':scope > .seg-strip');
+      if (!strip) {
+        strip = document.createElement('div');
+        strip.className = 'seg-strip';
+        const meta = el.querySelector(':scope > .meta');
+        el.insertBefore(strip, meta || null);
+      }
+      return strip;
+    }
+    function addSegChip(turnId, kind, label, title) {
+      let host = turnId ? turnUserBubble.get(turnId) : null;
+      if (!host && kind === 'rej') {
+        // No open turn → reuse/append a minimal feed line at the chat end.
+        if (_lastSegFeed && _lastSegFeed.parentNode && chatLog.lastElementChild === _lastSegFeed) {
+          host = _lastSegFeed;
+        } else {
+          host = document.createElement('div');
+          host.className = 'bubble seg-feed';
+          chatLog.appendChild(host);
+          _lastSegFeed = host;
+        }
+      }
+      if (!host) return;
+      const chip = document.createElement('span');
+      chip.className = 'seg-chip ' + kind;
+      chip.textContent = label;
+      if (title) chip.title = title;
+      segStripFor(host).appendChild(chip);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
     // Wake word: show a discarded segment subtly. Directly consecutive
     // ignores are counted in ONE bubble so background chatter doesn't spam.
     let _lastIgnoredBubble = null;
     let _lastIgnoredCount = 0;
-    function showIgnoredBubble(text) {
+    let _lastIgnoredReason = null;
+    function showIgnoredBubble(text, reason) {
       const txt = (text || '').trim();
+      // Coalesce repeats only within the same reason (don't merge a
+      // speaker-mismatch into a preceding no-wake-word bubble).
       if (_lastIgnoredBubble && _lastIgnoredBubble.parentNode &&
-          chatLog.lastElementChild === _lastIgnoredBubble) {
+          chatLog.lastElementChild === _lastIgnoredBubble &&
+          _lastIgnoredReason === reason) {
         _lastIgnoredCount += 1;
+        // Reason-specific count text — a speaker_mismatch must not be
+        // summarised as "(no wake word)" (confusing in plain VAD mode).
+        const countKey = reason === 'speaker_mismatch'
+          ? 'wake.ignored_speaker_count' : 'wake.ignored_count';
         _lastIgnoredBubble.firstChild.nodeValue =
-          t('wake.ignored_count', { count: _lastIgnoredCount });
+          t(countKey, { count: _lastIgnoredCount });
         return;
       }
       _lastIgnoredCount = 1;
-      _lastIgnoredBubble = addBubble('wake-ignored', t('wake.ignored_text', { text: txt }));
+      _lastIgnoredReason = reason;
+      const key = reason === 'speaker_mismatch' ? 'wake.ignored_speaker' : 'wake.ignored_text';
+      _lastIgnoredBubble = addBubble('wake-ignored', t(key, { text: txt }));
     }
 
     /* ===== Status indicators ===== */
@@ -1623,24 +1946,102 @@
     let lastSpeechStartTs = null;
     let pendingBargeIn = false;
 
+    // Voice HTML of a coalesced (merged-away) turn, waiting to be prepended to
+    // the NEXT turn's bubble — the visual continuation of the same thought.
+    let _coalesceCarry = null;
     function getOrCreateUserBubble(turnId) {
       let el = turnUserBubble.get(turnId);
       if (!el) {
         el = addBubble('user pending collecting', '…', t('turn.meta', { id: turnId.substr(0,4) }));
         turnUserBubble.set(turnId, el);
+        if (_coalesceCarry && _coalesceCarry.length) {
+          turnVoiceHtml.set(turnId, _coalesceCarry.concat(turnVoiceHtml.get(turnId) || []));
+          _coalesceCarry = null;
+        }
       }
       return el;
     }
+
+    /* Voice lock: foreign speech is colored IN PLACE inside the transcript
+       text (struck red) instead of duplicating the sentence below the bubble.
+       Per turn we keep an HTML snippet per segment (kept text plain, cut parts
+       wrapped in .seg-cut); the bubble renders the joined snippets. */
+    const turnVoiceHtml = new Map();   // turnId -> [htmlSnippet, ...]
+    function escHtml(s) {
+      return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    }
+    // Word-level LCS diff between a fuller base text (server fullText before a
+    // trim, or the last live partial) and the FINAL kept text. Output = the
+    // final text verbatim, with base-only runs (the vanished speech) struck in
+    // place. minCutRun filters ordinary Whisper revisions: runs shorter than
+    // that are dropped silently instead of being shown as "cut".
+    function diffKeptHtml(fullText, keptText, minCutRun) {
+      minCutRun = minCutRun || 1;
+      const norm = w => w.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+      const F = String(fullText).split(/\s+/).filter(Boolean);
+      const K = String(keptText).split(/\s+/).filter(Boolean);
+      const fn = F.map(norm), kn = K.map(norm);
+      const n = fn.length, m = kn.length;
+      const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+      for (let i = n - 1; i >= 0; i--)
+        for (let j = m - 1; j >= 0; j--)
+          dp[i][j] = fn[i] === kn[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      const out = []; let cutRun = [];
+      const flushCut = () => {
+        if (cutRun.length >= minCutRun) {
+          out.push(`<span class="seg-cut">${escHtml(cutRun.join(' '))}</span>`);
+        }
+        cutRun = [];
+      };
+      let i = 0, j = 0;
+      while (i < n && j < m) {
+        if (fn[i] === kn[j]) { flushCut(); out.push(escHtml(K[j])); i++; j++; }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) { cutRun.push(F[i]); i++; }
+        else { flushCut(); out.push(escHtml(K[j])); j++; }  // revision → final wins
+      }
+      while (i < n) { cutRun.push(F[i]); i++; }
+      flushCut();
+      while (j < m) { out.push(escHtml(K[j])); j++; }
+      return out.join(' ');
+    }
+    // Last live partial per segment — the base for the "vanished speech" diff:
+    // Whisper's final pass often DROPS foreign speech it transcribed in a
+    // partial (the user watches it disappear). Diffing final vs last partial
+    // keeps those vanished blocks visible, struck red.
+    const segPartialText = new Map();
+    function pushVoiceHtml(turnId, html) {
+      if (!turnId) return;
+      const arr = turnVoiceHtml.get(turnId) || [];
+      arr.push(html);
+      turnVoiceHtml.set(turnId, arr);
+    }
+    // Sets the bubble's text area: colored voice HTML when we have it,
+    // otherwise plain text (the original text-node invariant).
+    function setBubbleText(el, turnId, plainText, partialSuffix) {
+      const arr = turnVoiceHtml.get(turnId);
+      let box = el.querySelector(':scope > .vtext');
+      if (arr && arr.length) {
+        if (!box) {
+          box = document.createElement('span');
+          box.className = 'vtext';
+          el.replaceChild(box, el.firstChild);
+        }
+        box.innerHTML = arr.join(' ') + (partialSuffix ? ' ' + escHtml(partialSuffix) + ' …' : '');
+        return;
+      }
+      if (box) box.textContent = plainText;
+      else el.firstChild.nodeValue = plainText;
+    }
     function updateUserBubble(turnId, text, debounceMs) {
       const el = getOrCreateUserBubble(turnId);
-      el.firstChild.nodeValue = text || '…';
+      setBubbleText(el, turnId, text || '…');
       el.classList.add('collecting');
       el.classList.remove('pending');
       if (debounceMs) setMeta(el, t('turn.collecting', { id: turnId.substr(0,4), s: (debounceMs/1000).toFixed(1) }));
     }
     function commitUserBubble(turnId, text) {
       const el = getOrCreateUserBubble(turnId);
-      el.firstChild.nodeValue = text;
+      setBubbleText(el, turnId, text);
       el.classList.remove('pending','collecting','partial');
       setMeta(el, t('turn.meta', { id: turnId.substr(0,4) }));
     }
@@ -1648,7 +2049,9 @@
     function showPartialUserBubble(turnId, text) {
       if (!text) return;
       const el = getOrCreateUserBubble(turnId);
-      el.firstChild.nodeValue = text + ' …';
+      const arr = turnVoiceHtml.get(turnId);
+      if (arr && arr.length) setBubbleText(el, turnId, '', text);
+      else setBubbleText(el, turnId, text + ' …');
       el.classList.add('collecting', 'partial');
       el.classList.remove('pending');
       setMeta(el, t('turn.listening', { id: turnId.substr(0,4) }));
@@ -1735,6 +2138,9 @@
     let serverStreaming = false;   // server streams LLM→TTS as PCM chunks (A1+A2)
     let streamInputEnabled = false; // server accepts streamed input frames (B1)
     let serverWake = { available: false, enabled: false }; // wake-word info (from hello)
+    let serverSpeaker = { available: false, enrolled: false, count: 0 }; // voice-lock (from hello)
+    let enrolling = false;
+    const ENROLL_SECONDS = 6;
     let helloSeen = false;               // preselect start mode only on the first hello
 
     /* ===== Acoustic wake-word feedback =====
@@ -1836,7 +2242,7 @@
       // speaker button (otherwise incoming chunks would unintentionally
       // restart it).
       if (playbackCtx.state === 'suspended' && !playbackUserPaused) { try { playbackCtx.resume(); } catch (_) {} }
-      if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
+      if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100 * duckFactor;
       return playbackCtx;
     }
 
@@ -1892,6 +2298,7 @@
       const sr = streamPlayer.sampleRate;
       streamPlayer = null;
       if (currentTurnId === turnId) { currentTurnId = null; currentAudioId = null; }
+      setDuck(false);        // playback over → release a possible voice-lock duck
       // Played to the end normally → cache the complete audio of this turn (replay).
       if (chunks.length) {
         try { cacheTts(turnId, URL.createObjectURL(pcmChunksToWavBlob(chunks, sr))); } catch (_) {}
@@ -1916,6 +2323,7 @@
     }
 
     function stopStreamPlayback() {
+      setDuck(false);
       if (!streamPlayer) return;
       const sp = streamPlayer;
       streamPlayer = null;            // detach first, so onended does nothing anymore
@@ -1928,6 +2336,26 @@
 
     function anyAudioPlaying() {
       return !!currentAudioEl || !!streamPlayer;
+    }
+
+    /* Voice lock: while the server checks WHO is speaking, playback is only
+       DUCKED (lowered), not stopped. Owner confirmed → server sends audio.stop;
+       foreign voice → transcript.ignored restores the volume. A safety timer
+       guarantees the duck can never get stuck. */
+    let duckFactor = 1.0;
+    let duckTimer = null;
+    function applyPlaybackVolume() {
+      const vol = parseInt(volume.value, 10) / 100;
+      if (playbackGain) playbackGain.gain.value = vol * duckFactor;
+      if (currentAudioEl) currentAudioEl.volume = Math.min(1, vol * duckFactor);
+    }
+    function setDuck(on) {
+      const f = on ? 0.2 : 1.0;
+      if (duckTimer) { clearTimeout(duckTimer); duckTimer = null; }
+      if (on) duckTimer = setTimeout(() => setDuck(false), 5000);
+      if (duckFactor === f) return;
+      duckFactor = f;
+      applyPlaybackVolume();
     }
     // Active audio IDs per turn, so we can stop them all on discardTurn.
     const turnAudioIds = new Map(); // turnId -> Set<audioId>
@@ -2018,6 +2446,7 @@
     }
 
     function stopCurrentAudio() {
+      setDuck(false);
       if (currentAudioEl) {
         try { currentAudioEl.pause(); } catch(_) {}
         // Do NOT revoke the URL: it belongs to the replay cache.
@@ -2284,7 +2713,17 @@
     // In wake mode with a CLOSED window the speech is not directed at Antonia
     // gerichtet → KEIN Barge-In (sie darf zu Ende denken/sprechen). In VAD/PTT
     // and while the wake window is open, barge-in is allowed.
-    function bargeInAllowed() { return !(inputMode === 'wake' && !wakeWindowActive); }
+    // Voice lock engaged (enrolled): NO local barge-in on VAD speech at all —
+    // any voice would trigger it. Playback is only DUCKED (setDuck) while the
+    // server verifies the speaker; a confirmed owner voice then interrupts via
+    // the server (audio.stop), a foreign voice restores the volume.
+    function voiceLockEngaged() {
+      return !!(serverSpeaker && serverSpeaker.available && serverSpeaker.enrolled);
+    }
+    function bargeInAllowed() {
+      if (voiceLockEngaged()) return false;
+      return !(inputMode === 'wake' && !wakeWindowActive);
+    }
     // Alexa/one-shot mode (from the server via hello.wakeWord.mode): after every
     // reply the window closes; every command needs the wake word again.
     function wakeOneshot() { return !!(serverWake && serverWake.mode === 'alexa'); }
@@ -2388,6 +2827,8 @@
           serverStreaming = !!m.streaming;
           streamInputEnabled = !!m.streamInput;
           serverWake = m.wakeWord || { available: false, enabled: false };
+          if (m.speakerLock) serverSpeaker = m.speakerLock;
+          updateVoiceLockUi();
           addBubble('sys', `🟢 ${m.msg}`);
           // On the first hello, set the start mode: the user's remembered choice
           // (localStorage) takes precedence, otherwise the server default (wakeWord.enabled).
@@ -2425,20 +2866,96 @@
           newSessionBtn.disabled = false;
           addBubble('sys', t('sys.new_session_active', { key: (m.sessionKey || '').slice(-12) }));
           break;
+        case 'history':
+          // Backend-loaded conversation history (cross-device).
+          // Replaces localStorage transcript when available.
+          if (m.messages && m.messages.length) {
+            clearTranscript();
+            chatLog.innerHTML = '';
+            addBubble('sys', t('sys.previous_session'));
+            for (const msg of m.messages) {
+              if (msg.role === 'assistant') {
+                const el = document.createElement('div');
+                el.className = 'bubble agent';
+                const md = document.createElement('div'); md.className = 'md';
+                md.innerHTML = renderMarkdown(msg.content || '');
+                el.appendChild(md);
+                chatLog.appendChild(el);
+                persistMsg('agent', msg.content);
+              } else if (msg.role === 'user') {
+                addBubble('user', msg.content || '');
+                persistMsg('user', msg.content);
+              }
+            }
+            chatLog.scrollTop = chatLog.scrollHeight;
+          }
+          break;
         case 'segment.received':
           // Optional: level tick in the UI
           break;
         case 'transcript.partial':
           // B2: interim transcript while still speaking → live into the
           // User-Bubble (provisorisch). Wird vom finalen transcript/turn.pending
-          // overwritten.
+          // overwritten. Remember it per segment: speech that vanishes in the
+          // final pass is rendered struck-red from this base.
+          if (m.segmentId && m.text) segPartialText.set(m.segmentId, m.text);
           showPartialUserBubble(m.turnId, m.text);
           if (micActive) setMicUi('collecting');
           break;
         case 'transcript.ignored':
-          // Wake word: segment was not directed at the AI → discarded.
-          showIgnoredBubble(m.text);
+          // Segment discarded: no wake word, or (speaker lock) not the owner voice.
+          if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: rejected voice
+          setDuck(false);   // foreign voice → playback back to full volume
+          if (m.reason === 'speaker_mismatch') {
+            // Foreign voice: struck red IN the transcript flow — no duplicated
+            // sentence line below the bubble.
+            const cutHtml = `<span class="seg-cut" title="${t('seg.rej_title', {
+              score: (typeof m.speakerScore === 'number' ? m.speakerScore.toFixed(2) : '?') })}">${escHtml(m.text || '')}</span>`;
+            if (turnUserBubble.has(m.turnId)) {
+              pushVoiceHtml(m.turnId, cutHtml);
+              setBubbleText(turnUserBubble.get(m.turnId), m.turnId, '');
+            } else {
+              // No open turn: minimal red line (the text appears exactly once).
+              if (_lastSegFeed && _lastSegFeed.parentNode && chatLog.lastElementChild === _lastSegFeed) {
+                const box = _lastSegFeed.querySelector('.vtext-feed');
+                if (box) box.insertAdjacentHTML('beforeend', ' ' + cutHtml);
+              } else {
+                const line = document.createElement('div');
+                line.className = 'bubble seg-feed';
+                line.innerHTML = `<span class="vtext-feed" style="font-size:12px;">${cutHtml}</span>`;
+                chatLog.appendChild(line);
+                _lastSegFeed = line;
+              }
+              chatLog.scrollTop = chatLog.scrollHeight;
+            }
+          } else {
+            showIgnoredBubble(m.text, m.reason);
+          }
+          if (m.segmentId) segPartialText.delete(m.segmentId);
           if (micActive) setMicUi('listening');
+          break;
+        case 'speaker.enroll.ack':
+          if (m.ok) {
+            serverSpeaker.available = true;
+            serverSpeaker.enrolled = true;
+            serverSpeaker.count = m.count || (serverSpeaker.count + 1);
+            updateVoiceLockUi();
+            addBubble('sys', t('voicelock.saved'));
+          } else if (m.error === 'too_short') {
+            updateVoiceLockUi();
+            addBubble('err', t('voicelock.too_short'));
+          } else if (m.error === 'unavailable') {
+            addBubble('err', t('voicelock.unavailable'));
+          } else {
+            updateVoiceLockUi();
+            addBubble('err', t('voicelock.error', { err: m.error || '?' }));
+          }
+          break;
+        case 'speaker.status':
+          serverSpeaker.available = !!m.available;
+          serverSpeaker.enrolled = !!m.enrolled;
+          serverSpeaker.count = m.count || 0;
+          updateVoiceLockUi();
           break;
         case 'wake.detected':
           // Wake word detected (possibly already in the partial) → chime + mic turns red/active.
@@ -2475,6 +2992,29 @@
           // We write the text directly into the pending user bubble
           // (overwritten by turn.pending below, but for edge cases)
           lastLatency.textContent = `${m.sttMs}ms`;
+          if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: owner accepted
+          // Voice lock: inline coloring — vanished speech stays visible, struck
+          // red in place. Base for the diff: the server's pre-trim full text,
+          // or (when Whisper's final pass silently dropped speech a partial had
+          // shown) the last live partial. Server-confirmed trims strike from
+          // 1 word; partial-based diffs only strike runs ≥ 3 words so ordinary
+          // Whisper revisions don't masquerade as cuts.
+          if (m.text && typeof m.speakerScore === 'number') {
+            let html;
+            if (m.speakerTrimmed && m.speakerFullText) {
+              html = diffKeptHtml(m.speakerFullText, m.text, 1);
+            } else {
+              const partialBase = m.segmentId ? segPartialText.get(m.segmentId) : null;
+              html = partialBase ? diffKeptHtml(partialBase, m.text, 3) : escHtml(m.text);
+            }
+            pushVoiceHtml(m.turnId, html);
+            const kind = m.speakerTrimmed ? 'trim' : 'own';
+            const label = (m.speakerTrimmed ? '✂️ ' : '✓ ') + m.speakerScore.toFixed(2);
+            addSegChip(m.turnId, kind, label,
+                       m.speakerTrimmed ? t('seg.trimmed_title', { full: m.speakerFullText || '' })
+                                        : t('seg.own_title'));
+          }
+          if (m.segmentId) segPartialText.delete(m.segmentId);
           if (!m.text) {
             // ignore — turn.pending does not arrive
           }
@@ -2484,7 +3024,19 @@
           if (micActive) setMicUi('collecting');
           break;
         case 'turn.discarded':
-          discardTurn(m.turnId);
+          if (m.coalesced) {
+            // Coalesced: the owner kept speaking before any audio played — the
+            // turn continues in the NEXT bubble. Merge VISUALLY: carry the
+            // colored voice HTML over and drop the old bubbles entirely.
+            _coalesceCarry = (turnVoiceHtml.get(m.turnId) || []).slice();
+            const ub = turnUserBubble.get(m.turnId);
+            if (ub) { ub.remove(); turnUserBubble.delete(m.turnId); }
+            turnVoiceHtml.delete(m.turnId);
+            const ab = turnAgentBubble.get(m.turnId);
+            if (ab) { ab.remove(); turnAgentBubble.delete(m.turnId); }
+          } else {
+            discardTurn(m.turnId);
+          }
           // Also stop the audio of the discarded turn if it is currently playing.
           stopAudioForTurn(m.turnId);
           setAgentBusy(false);
@@ -2500,13 +3052,21 @@
               // For mixed: the voice text was merged into m.text by the server.
               // Re-set the bubble text so the voice part is visible.
               if (m.source === 'mixed' && m.text) {
-                // Find the text node (last text node) and replace it
-                let txtNode = null;
-                for (const n of el.childNodes) {
-                  if (n.nodeType === Node.TEXT_NODE) txtNode = n;
+                const vbox = el.querySelector(':scope > .vtext');
+                if (vbox) {
+                  // Bubble was rendered with colored voice HTML → replace it
+                  // with the server-merged plain text (typed part included).
+                  turnVoiceHtml.delete(m.turnId);
+                  vbox.textContent = m.text;
+                } else {
+                  // Find the text node (last text node) and replace it
+                  let txtNode = null;
+                  for (const n of el.childNodes) {
+                    if (n.nodeType === Node.TEXT_NODE) txtNode = n;
+                  }
+                  if (txtNode) txtNode.nodeValue = m.text;
+                  else el.appendChild(document.createTextNode(m.text));
                 }
-                if (txtNode) txtNode.nodeValue = m.text;
-                else el.appendChild(document.createTextNode(m.text));
               }
               const tag = m.source === 'mixed' ? t('source.voice_text') : t('source.text');
               setMeta(el, t('turn.committed', { id: m.turnId.substr(0,4), tag }) + (m.imageCount ? t('turn.image_suffix', { n: m.imageCount }) : ''));
@@ -2649,13 +3209,15 @@
     /* ===== Settings senden ===== */
     function sendSettings() {
       if (!ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({
+      const s = {
         type: 'settings',
         speed: parseFloat(speed.value),
         debounceMs: parseInt(debounce.value, 10),
         wakeWordEnabled: (inputMode === 'wake'),
         hermesMode: hermesMode,
-      }));
+      };
+      if (speakerThreshold != null) s.speakerThreshold = speakerThreshold;
+      ws.send(JSON.stringify(s));
     }
 
     pingBtn.addEventListener('click', () => {
@@ -2688,6 +3250,9 @@
       // Optimistically clear the UI — the final ACK comes via session.reset.ack.
       chatLog.innerHTML = '';
       turnUserBubble.clear();
+      turnVoiceHtml.clear();
+      segPartialText.clear();
+      _coalesceCarry = null;
       turnAgentBubble.clear();
       pendingTextLocalTurnIds.length = 0;
       clearTranscript();   // gespeichertes Transkript verwerfen → Reload startet frisch
@@ -2696,8 +3261,7 @@
 
     volume.addEventListener('input', () => {
       volumeLabel.textContent = volume.value + '%';
-      if (currentAudioEl) currentAudioEl.volume = parseInt(volume.value, 10) / 100;
-      if (playbackGain) playbackGain.gain.value = parseInt(volume.value, 10) / 100;
+      applyPlaybackVolume();   // respects a possible voice-lock duck
     });
     volume.addEventListener('change', () => { saveSetting('volume', volume.value); });
 
@@ -2725,6 +3289,17 @@
     settingsBtn.addEventListener('click', toggleSettings);
     closeSettingsBtn.addEventListener('click', closeSettings);
     drawerOverlay.addEventListener('click', closeSettings);
+    // Collapsible settings sections: remember open/closed across reloads
+    // (the HTML `open` attribute is only the first-visit default).
+    document.querySelectorAll('details.acc[data-sec]').forEach((d) => {
+      const key = 'accOpen:' + d.dataset.sec;
+      const saved = localStorage.getItem(key);
+      if (saved === '1') d.open = true;
+      else if (saved === '0') d.open = false;
+      d.addEventListener('toggle', () => {
+        try { localStorage.setItem(key, d.open ? '1' : '0'); } catch (_) {}
+      });
+    });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && settingsDrawer.classList.contains('open')) closeSettings();
     });
@@ -2946,6 +3521,7 @@
         try {
           const tap = audioCtx.createScriptProcessor(2048, 1, 1);
           tap.onaudioprocess = (ev) => {
+            if (enrolling) return;   // enrollment owns the binary channel
             const ch = ev.inputBuffer.getChannelData(0);
             const ds = downsampleTo16k(ch, audioCtx.sampleRate);
             // Maintain the ring buffer (always).
@@ -3006,6 +3582,10 @@
             // Safety net: in case the frame path does not kick in. In wake mode
             // with a closed window, do NOT abort (speech not directed at Antonia).
             if (bargeInAllowed()) bargeInStop('vad-speech');
+            // Voice lock: don't stop — duck the playback while the server
+            // verifies the speaker. Owner → server stops it; foreign → restore.
+            else if (voiceLockEngaged() && anyAudioPlaying()
+                     && !(inputMode === 'wake' && !wakeWindowActive)) setDuck(true);
             // B1: start input streaming (frames now flow live).
             if (streamInputActive()) {
               segmentCounter += 1;
@@ -3034,6 +3614,7 @@
           },
           onVADMisfire: () => {
             // Speech too short → no segment. Discard the running input stream.
+            setDuck(false);   // voice lock: release the duck, nothing to verify
             if (inputStreaming) abortInputStream();
             vadStreamSegId = null;
             if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
@@ -3055,7 +3636,7 @@
       }
     }
 
-    function sendSegment(segmentId, float32) {
+    function sendSegment(segmentId, float32, opts) {
       if (!ws || ws.readyState !== 1) {
         addBubble('err', t('err.ws_not_connected_segment'));
         return;
@@ -3072,6 +3653,9 @@
         speechStartTs: lastSpeechStartTs,
         clientNow: Date.now(),
         bargeIn: pendingBargeIn,
+        // PTT = deliberate button press → the speaker lock trims but never
+        // hard-rejects these segments.
+        ptt: !!(opts && opts.ptt),
       }));
       ws.send(f32ToBytes(float32));
       // Consumed -> reset so the next segment gets fresh values
@@ -3082,7 +3666,15 @@
 
     async function stopMic(silent = false) {
       micActive = false;
-      if (inputStreaming) abortInputStream();
+      if (inputStreaming) {
+        // A user-initiated stop WHILE speech is streaming (spoke, then hit the
+        // mic button before the VAD's silence timeout fired): flush the
+        // utterance so it still gets transcribed + submitted, instead of
+        // silently discarding it. On a silent restart (slider / device change)
+        // a half-segment would be noise, so there we still abort.
+        if (!silent && vadStreamSegId) commitInputStream(vadStreamSegId);
+        else abortInputStream();
+      }
       vadStreamSegId = null;
       try { if (vad) await vad.destroy(); } catch (_) {}
       vad = null;
@@ -3129,6 +3721,129 @@
       if (meterRaf) cancelAnimationFrame(meterRaf);
       meterRaf = null;
     }
+
+    /* ===== Voice lock (speaker enrollment + live tuning) =====
+       Records a few seconds of the owner's voice and streams it to the server,
+       which folds it into the enrolled profile. Self-contained capture (its own
+       getUserMedia + ScriptProcessor) so it does not disturb a running VAD.
+       The tuner shows each spoken segment's similarity vs the accept threshold,
+       which the user can drag live (persisted + pushed to the server). */
+    const VLOCK_MIN = 0.2, VLOCK_MAX = 0.9;   // meter/threshold mapping range
+    let speakerThreshold = (() => {
+      const v = parseFloat(localStorage.getItem('speakerThreshold') || '');
+      return Number.isFinite(v) && v >= VLOCK_MIN && v <= VLOCK_MAX ? v : null;
+    })();
+
+    function vlockPct(score) {
+      return Math.max(0, Math.min(100, ((score - VLOCK_MIN) / (VLOCK_MAX - VLOCK_MIN)) * 100));
+    }
+    function positionVoiceLockMark() {
+      const thr = speakerThreshold != null ? speakerThreshold : (serverSpeaker.threshold || 0.5);
+      if (voiceLockMeterMark) voiceLockMeterMark.style.left = vlockPct(thr) + '%';
+    }
+    function showVoiceMatch(score) {
+      if (!voiceLockTuner || score == null) return;
+      voiceLockScore.textContent = score.toFixed(2);
+      voiceLockScore.style.color = score >= (speakerThreshold != null ? speakerThreshold : (serverSpeaker.threshold || 0.5))
+        ? 'var(--ok)' : 'var(--err)';
+      voiceLockMeterBar.style.width = vlockPct(score) + '%';
+    }
+
+    function updateVoiceLockUi() {
+      if (!voiceLockCard) return;
+      voiceLockCard.style.display = serverSpeaker.available ? '' : 'none';
+      if (!serverSpeaker.available) return;
+      const enrolled = !!serverSpeaker.enrolled;
+      voiceLockCard.classList.toggle('locked', enrolled);
+      voiceLockBadge.textContent = enrolled ? '🔒' : '🔓';
+      // Chip shows the sample count so a successful "add another sample" is
+      // visibly reflected (LOCKED · 3).
+      voiceLockChip.textContent = enrolled
+        ? `${t('voicelock.chip_locked')}${serverSpeaker.count ? ' · ' + serverSpeaker.count : ''}`
+        : t('voicelock.chip_open');
+      enrollVoiceLabel.textContent = t(enrolled ? 'voicelock.enroll_again' : 'voicelock.enroll');
+      forgetVoiceBtn.style.display = enrolled ? '' : 'none';
+      voiceLockTuner.style.display = enrolled ? '' : 'none';
+      // Initialise the threshold slider from the stored value or the server default.
+      if (voiceLockThreshold) {
+        const thr = speakerThreshold != null ? speakerThreshold : (serverSpeaker.threshold || 0.5);
+        voiceLockThreshold.value = String(thr);
+        voiceLockThresholdLabel.textContent = thr.toFixed(2);
+        positionVoiceLockMark();
+      }
+    }
+
+    if (voiceLockThreshold) {
+      voiceLockThreshold.addEventListener('input', () => {
+        speakerThreshold = parseFloat(voiceLockThreshold.value);
+        voiceLockThresholdLabel.textContent = speakerThreshold.toFixed(2);
+        positionVoiceLockMark();
+      });
+      voiceLockThreshold.addEventListener('change', () => {
+        localStorage.setItem('speakerThreshold', String(speakerThreshold));
+        sendSettings();   // push the new strictness to the server (runtime)
+      });
+    }
+
+    async function enrollRecord() {
+      if (enrolling) return;
+      if (!serverSpeaker.available) { addBubble('err', t('voicelock.unavailable')); return; }
+      if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
+      enrolling = true;
+      enrollVoiceBtn.disabled = true;
+      enrollVoiceBtn.classList.add('recording');
+      // Pause the running VAD pipeline: its input tap would otherwise stream
+      // VAD-segment frames in parallel with the enrollment frames — the server
+      // can't tell them apart on the binary channel (garbled enrollment take).
+      if (inputStreaming) abortInputStream();
+      if (vad && micActive) { try { vad.pause(); } catch (_) {} }
+      let ctx = null, stream = null, tap = null, sink = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = ctx.createMediaStreamSource(stream);
+        tap = ctx.createScriptProcessor(2048, 1, 1);
+        ws.send(JSON.stringify({ type: 'speaker.enroll.start' }));
+        const target = 16000 * ENROLL_SECONDS;
+        let sent = 0;
+        await new Promise((resolve) => {
+          tap.onaudioprocess = (ev) => {
+            if (sent >= target) return;
+            const ds = downsampleTo16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
+            try { ws.send(f32ToBytes(ds)); } catch (_) {}
+            sent += ds.length;
+            const pct = Math.min(100, Math.round((sent / target) * 100));
+            if (voiceLockProg) voiceLockProg.style.width = pct + '%';
+            enrollVoiceLabel.textContent = t('voicelock.recording', { pct });
+            if (sent >= target) resolve();
+          };
+          src.connect(tap);
+          sink = ctx.createGain(); sink.gain.value = 0;
+          tap.connect(sink).connect(ctx.destination);
+        });
+        ws.send(JSON.stringify({ type: 'speaker.enroll.commit' }));
+        // Result comes back as 'speaker.enroll.ack' → handled in the WS switch.
+      } catch (e) {
+        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'speaker.enroll.abort' })); } catch (_) {}
+        addBubble('err', t('voicelock.error', { err: (e && e.message) || e }));
+      } finally {
+        try { if (tap) tap.disconnect(); } catch (_) {}
+        try { if (sink) sink.disconnect(); } catch (_) {}
+        try { if (stream) stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
+        try { if (ctx) await ctx.close(); } catch (_) {}
+        enrolling = false;
+        enrollVoiceBtn.disabled = false;
+        enrollVoiceBtn.classList.remove('recording');
+        if (voiceLockProg) voiceLockProg.style.width = '0%';
+        if (vad && micActive) { try { vad.start(); } catch (_) {} }
+        updateVoiceLockUi();
+      }
+    }
+
+    if (enrollVoiceBtn) enrollVoiceBtn.addEventListener('click', enrollRecord);
+    if (forgetVoiceBtn) forgetVoiceBtn.addEventListener('click', () => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'speaker.enroll.clear' }));
+    });
 
     /* ===== Push-to-Talk =====
        In PTT mode no VAD runs. Instead:
@@ -3277,7 +3992,7 @@
         for (const b of captured) { out.set(b, off); off += b.length; }
         segmentCounter += 1;
         segCount.textContent = String(segmentCounter);
-        sendSegment(String(segmentCounter), out);
+        sendSegment(String(segmentCounter), out, { ptt: true });
         setMicUi('thinking');
       };
       pttPostRollFramesLeft = PTT_POSTROLL_FRAMES;

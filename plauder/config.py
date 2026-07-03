@@ -101,7 +101,16 @@ _DEFAULT_VOICE_HINTS = {
         "• NO markdown, no bullet points, no code blocks, do not read out URLs "
         "– describe them briefly in words.\n"
         "• Short, natural, spoken sentences. English as default.\n"
-        "• Be as concise as possible."
+        "• Be as concise as possible.\n"
+        "• The user's input comes from speech recognition and may contain "
+        "errors – do not take the transcript too literally; interpret it by "
+        "meaning and ask briefly if something is unclear.\n"
+        "• You may use nonverbal tags sparingly to sound alive; they are "
+        "spoken by the voice: [laughter], [sigh], [confirmation-en], "
+        "[surprise-wa], [dissatisfaction-hnn]. German forms like *lacht*, "
+        "*seufzt*, *brummt*, *staunt* also work.\n"
+        "• For real laughter, write [laughter] immediately followed by a "
+        "spelled-out laugh, e.g.: [laughter] Hahaha!"
     ),
     "de": (
         "\n\n---\n"
@@ -112,7 +121,16 @@ _DEFAULT_VOICE_HINTS = {
         "• KEIN Markdown, keine Aufzählungszeichen, keine Code-Blöcke, keine URLs "
         "vorlesen – beschreibe sie kurz in Worten.\n"
         "• Kurze, natürliche, gesprochene Sätze. Deutsch als Default.\n"
-        "• Halte dich so knapp wie möglich."
+        "• Halte dich so knapp wie möglich.\n"
+        "• Die Eingaben des Nutzers stammen aus einer Spracherkennung und "
+        "können Fehler enthalten – nimm das Transkript nicht immer wörtlich, "
+        "verstehe es sinngemäß und frag kurz nach, wenn etwas unklar ist.\n"
+        "• Du darfst sparsam Nonverbal-Tags nutzen, um lebendig zu klingen; "
+        "sie werden von der Stimme vorgelesen: [laughter], [sigh], "
+        "[confirmation-en], [surprise-wa], [dissatisfaction-hnn]. Deutsche "
+        "Formen wie *lacht*, *seufzt*, *brummt*, *staunt* funktionieren auch.\n"
+        "• Für echtes Lachen schreibe [laughter] direkt gefolgt von einem "
+        "ausgeschriebenen Lachen, z.B.: [laughter] Hahaha!"
     ),
 }
 
@@ -279,6 +297,31 @@ class Config:
     house_wake_word: bool = False
     house_auth: bool = False
 
+    # --- Speaker lock (voice gate) ---
+    # Self-contained speaker-VERIFICATION gate (not House-Mode identification):
+    # only segments whose voice matches the enrolled owner profile are
+    # transcribed; everything else is dropped (transcript.ignored). Enrollment
+    # happens from the UI. Needs a sherpa-onnx speaker-embedding model
+    # (CAM++/WeSpeaker); silently disabled if the model/dep/profile is missing.
+    speaker_lock_enabled: bool = False
+    speaker_model_path: str = ""
+    speaker_profile_path: str = ""
+    speaker_threshold: float = 0.5      # cosine similarity; higher = stricter
+    speaker_min_dur_s: float = 0.6      # segments shorter than this can't be verified
+    # Mixed segments (owner speaks, then someone else keeps talking into the
+    # same segment): analyze ~1s windows, keep only the owner's spans and
+    # re-transcribe just those. Costs one extra STT call in the mixed case.
+    speaker_trim: bool = True
+    # Log per-window scores for every gated segment (field calibration of the
+    # thresholds against the real household voices).
+    speaker_debug: bool = False
+    # When set, every speaker-gated segment (and every enrollment take) is also
+    # written as a 16-bit WAV into this directory, filename carrying decision +
+    # score — real audio for replaying gate decisions offline. Newest ~200 kept.
+    speaker_dump_dir: str = ""
+    speaker_provider: str = "cpu"       # onnxruntime provider: cpu | cuda
+    speaker_num_threads: int = 1
+
     # --- Voice persona (optional) ---
     # Optional persona prepended to the terse voice hint. Empty = no persona
     # (only "be concise, no markdown/emoji"). Source: SOUL.md file (soul_path)
@@ -437,6 +480,20 @@ class Config:
             house_speaker_id=env_flag("HOUSE_SPEAKER_ID", house_mode),
             house_wake_word=env_flag("HOUSE_WAKE_WORD", house_mode),
             house_auth=env_flag("HOUSE_AUTH", house_mode),
+
+            speaker_lock_enabled=env_flag("SPEAKER_LOCK_ENABLED", False),
+            speaker_model_path=_env("SPEAKER_MODEL_PATH"),
+            speaker_profile_path=_first(
+                _env("SPEAKER_PROFILE_PATH"),
+                default=str(Path(__file__).resolve().parent.parent / "speaker_profile.json"),
+            ),
+            speaker_threshold=_env_float("SPEAKER_THRESHOLD", 0.5),
+            speaker_min_dur_s=_env_float("SPEAKER_MIN_DUR_S", 0.6),
+            speaker_trim=env_flag("SPEAKER_TRIM", True),
+            speaker_debug=env_flag("SPEAKER_DEBUG", False),
+            speaker_dump_dir=_env("SPEAKER_DUMP_DIR"),
+            speaker_provider=_first(_env("SPEAKER_PROVIDER"), default="cpu").lower(),
+            speaker_num_threads=_env_int("SPEAKER_NUM_THREADS", 1),
 
             voice_mode_system=voice_mode_system,
 

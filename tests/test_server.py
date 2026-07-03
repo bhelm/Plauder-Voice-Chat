@@ -1,6 +1,7 @@
 """HTTP routes, /healthz and WebSocket handler — with mock backends."""
 import asyncio
 import dataclasses
+from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -406,5 +407,80 @@ def test_cancel_connection_tasks_cancels_everything():
             except asyncio.CancelledError:
                 pass
             assert task.cancelled()
+
+    asyncio.run(run())
+
+
+# --- Hermes backend history loading ----------------------------------------
+_MOCK_HISTORY = [
+    {"role": "user", "content": "Hallo"},
+    {"role": "assistant", "content": "Hi, wie geht es dir?"},
+]
+
+
+def test_ws_history_frame_sent_on_connect():
+    """When fetch_history returns messages, a 'history' frame is sent after hello
+    and the ConversationManager is seeded."""
+    _configure()
+
+    async def run():
+        mock = AsyncMock(return_value=list(_MOCK_HISTORY))
+        with patch("plauder.server.fetch_history", mock):
+            async with TestClient(TestServer(srv.build_app())) as client:
+                ws = await client.ws_connect("/ws")
+                hello = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert hello["type"] == "hello"
+                hist = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert hist["type"] == "history"
+                assert len(hist["messages"]) == 2
+                assert hist["messages"][0]["role"] == "user"
+                assert hist["messages"][1]["content"] == "Hi, wie geht es dir?"
+                # ConversationManager should have been seeded.
+                user_key = hello["agent"]["user_id"]
+                local = srv.CONV.history_for(user_key)
+                assert len(local) == 2
+                assert local[0]["content"] == "Hallo"
+                await ws.close()
+
+    asyncio.run(run())
+
+
+def test_ws_no_history_frame_when_empty():
+    """When fetch_history returns [], no history frame is sent."""
+    _configure()
+
+    async def run():
+        mock = AsyncMock(return_value=[])
+        with patch("plauder.server.fetch_history", mock):
+            async with TestClient(TestServer(srv.build_app())) as client:
+                ws = await client.ws_connect("/ws")
+                hello = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert hello["type"] == "hello"
+                # Send a ping and check we get ack, not history.
+                await ws.send_json({"type": "ping"})
+                ack, seen, _ = await _drain_until(ws, "ack")
+                assert ack is not None
+                assert "history" not in seen
+                await ws.close()
+
+    asyncio.run(run())
+
+
+def test_ws_history_fetch_failure_does_not_break_connection():
+    """If fetch_history raises, the WS connection still works."""
+    _configure()
+
+    async def run():
+        mock = AsyncMock(side_effect=RuntimeError("network down"))
+        with patch("plauder.server.fetch_history", mock):
+            async with TestClient(TestServer(srv.build_app())) as client:
+                ws = await client.ws_connect("/ws")
+                hello = await asyncio.wait_for(ws.receive_json(), timeout=3)
+                assert hello["type"] == "hello"
+                # Connection should still be functional.
+                await ws.send_json({"type": "ping"})
+                ack, seen, _ = await _drain_until(ws, "ack")
+                assert ack is not None
+                await ws.close()
 
     asyncio.run(run())

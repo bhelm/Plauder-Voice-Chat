@@ -166,24 +166,39 @@ def normalize_ghost(text: str) -> str:
 
 _GHOST_PHRASES_BASE = {
     "thank you", "thank you.", "thanks", "thank you very much",
-    "thanks for watching", "thanks for watching!",
-    "thank you for watching", "thank you for watching!",
-    "please subscribe", "like and subscribe",
     "see you next time", "see you in the next video",
     "bye", "bye bye", "goodbye", "you",
     "vielen dank", "danke", "dankeschön", "danke schön",
-    "vielen dank fürs zuschauen", "vielen dank fürs zuschauen!",
     "danke fürs zuschauen", "bis zum nächsten mal",
-    "untertitel von", "untertitel im auftrag des zdf",
-    "untertitelung des zdf", "untertitelung des zdf, 2020",
-    "untertitel der amara.org-community", "amara.org",
     "tschüss", "auf wiedersehen",
 }
 
+# Credit-roll / channel-outro hallucinations. Whisper emits these on silence or
+# low-level background noise (TV, YouTube playing nearby). They NEVER occur as
+# genuine speech directed at a voice assistant, so they are filtered
+# UNCONDITIONALLY (no no_speech_prob / duration corroboration needed — important
+# because cloud STT backends do not report no_speech_prob at all). Matched as a
+# substring of the normalized transcript so trailing years / channel names still
+# hit ("Untertitel des ZDF, 2020", "Untertitelung des ZDF für Funk, 2017").
+_GHOST_ALWAYS_SUBSTR_BASE = (
+    "untertitel des zdf", "untertitelung des zdf", "untertitel von",
+    "untertitel im auftrag", "untertitel der amara", "amara.org",
+    "thanks for watching", "thank you for watching",
+    "please subscribe", "like and subscribe", "subtitles by",
+    "vielen dank fürs zuschauen", "danke fürs zuschauen und",
+)
+
 
 class HallucinationFilter:
-    """Discards Whisper ghost phrases. Conservative: denylist hit AND
-    (no_speech_prob high [OR optionally short audio duration]).
+    """Discards Whisper ghost phrases. Two tiers:
+
+    * Credit-roll / outro phrases (``_GHOST_ALWAYS_SUBSTR_BASE``) are filtered
+      UNCONDITIONALLY — matched as a substring so trailing years/channel names
+      still hit. These never occur as genuine speech, and cloud STT backends
+      report no ``no_speech_prob``, so gating them would disable the filter.
+    * Ambiguous short phrases (``_GHOST_PHRASES_BASE``: "danke", "bye", …) stay
+      conservative: exact denylist hit AND (no_speech_prob high OR short audio).
+
     Built from Config so it stays testable.
     """
 
@@ -195,12 +210,21 @@ class HallucinationFilter:
         self.use_duration = use_duration
         self.max_dur_s = max_dur_s
         phrases = {normalize_ghost(p) for p in _GHOST_PHRASES_BASE if p.strip()}
+        always = [normalize_ghost(p) for p in _GHOST_ALWAYS_SUBSTR_BASE if p.strip()]
         if extra_phrases:
+            # An extra phrase ending in "*" is an unconditional substring rule;
+            # otherwise it joins the conservative exact-match denylist.
             for p in extra_phrases.split("|"):
-                n = normalize_ghost(p)
-                if n:
-                    phrases.add(n)
+                if p.strip().endswith("*"):
+                    n = normalize_ghost(p.strip()[:-1])
+                    if n:
+                        always.append(n)
+                else:
+                    n = normalize_ghost(p)
+                    if n:
+                        phrases.add(n)
         self.phrases = phrases
+        self.always_substr = [a for a in always if a]
 
     @classmethod
     def from_config(cls, cfg) -> "HallucinationFilter":
@@ -216,7 +240,13 @@ class HallucinationFilter:
         if not self.enabled:
             return False
         norm = normalize_ghost(text)
-        if not norm or norm not in self.phrases:
+        if not norm:
+            return False
+        # Tier 1: credit-roll phrases → always ghost, no corroboration needed.
+        if any(sub in norm for sub in self.always_substr):
+            return True
+        # Tier 2: ambiguous short phrases → need a corroborating signal.
+        if norm not in self.phrases:
             return False
         nsp = no_speech_prob if isinstance(no_speech_prob, (int, float)) else None
         high_no_speech = (nsp is not None) and (nsp > self.no_speech_prob_threshold)
