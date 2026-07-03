@@ -168,6 +168,10 @@ def is_no_reply_prefix(text: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Whisper hallucination filter ("Thank you" ghosts)
 # --------------------------------------------------------------------------- #
+# Sentence boundary for the embedded-ghost pruning (strip_ghost_sentences).
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
 def normalize_ghost(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"^[\s\.\,\!\?…\-—–\"'»«„“”]+", "", t)
@@ -249,6 +253,34 @@ class HallucinationFilter:
             max_dur_s=cfg.stt_ghost_max_dur_s,
             extra_phrases=cfg.stt_ghost_extra_phrases,
         )
+
+    def strip_ghost_sentences(self, text: str) -> str:
+        """Prune ghost phrases that appear as STANDALONE SENTENCES inside an
+        otherwise genuine transcript — Whisper loves to append "Vielen Dank."
+        at a trailing pause mid-segment ("… reingeredet. Vielen Dank. Okay,
+        und …"). Whole-utterance ghosts are ``is_hallucination``'s job; here a
+        sentence is only dropped on an EXACT (normalized) denylist match, so
+        genuine sentences that merely contain a phrase survive. Single-sentence
+        texts are left alone (that decision needs the corroborating signals)."""
+        if not self.enabled or not text:
+            return text
+        parts = _SENT_SPLIT_RE.split(text.strip())
+        if len(parts) < 2:
+            return text
+        exact = self.phrases
+
+        def _ghost(p: str) -> bool:
+            n = normalize_ghost(p)
+            if n in exact:
+                return True
+            # Credit-roll phrases match as sentence PREFIX — the trailing
+            # year/channel varies ("Untertitelung des ZDF, 2020").
+            return any(n.startswith(sub) for sub in self.always_substr)
+
+        kept = [p for p in parts if not _ghost(p)]
+        if not kept or len(kept) == len(parts):
+            return text
+        return " ".join(kept)
 
     def is_hallucination(self, text: str, *, no_speech_prob=None, duration_s=None) -> bool:
         if not self.enabled:

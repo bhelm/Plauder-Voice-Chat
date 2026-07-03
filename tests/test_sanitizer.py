@@ -102,3 +102,30 @@ def test_hallucination_filter_from_config():
         stt_ghost_extra_phrases = "mein extra geist"
     hf = sanitizer.HallucinationFilter.from_config(_Cfg())
     assert "mein extra geist" in hf.phrases
+
+
+def test_strip_ghost_sentences_embedded():
+    """Whisper appends ghost phrases as standalone sentences at mid-segment
+    pauses — prune them without touching the genuine rest."""
+    hf = sanitizer.HallucinationFilter(enabled=True)
+    assert hf.strip_ghost_sentences(
+        "Okay, jetzt habe ich mal reingeredet. Vielen Dank. Okay, und jetzt rede ich weiter."
+    ) == "Okay, jetzt habe ich mal reingeredet. Okay, und jetzt rede ich weiter."
+    # Credit-roll variants with trailing year match as sentence prefix.
+    assert hf.strip_ghost_sentences(
+        "Das war mein Satz. Untertitelung des ZDF, 2020"
+    ) == "Das war mein Satz."
+    assert hf.strip_ghost_sentences(
+        "Bis später dann. Tschüss. Also wie gesagt, morgen klappt."
+    ) == "Bis später dann. Also wie gesagt, morgen klappt."
+    # A genuine sentence CONTAINING a phrase survives (exact match only).
+    assert hf.strip_ghost_sentences(
+        "Ich wollte dir vielen Dank sagen. Das war nett."
+    ) == "Ich wollte dir vielen Dank sagen. Das war nett."
+    # Single-sentence texts are left to the whole-utterance check.
+    assert hf.strip_ghost_sentences("Vielen Dank.") == "Vielen Dank."
+    # All-ghost multi-sentence → unchanged here (whole-utterance path decides).
+    assert hf.strip_ghost_sentences("Vielen Dank. Tschüss.") == "Vielen Dank. Tschüss."
+    # Disabled filter → no-op.
+    hf_off = sanitizer.HallucinationFilter(enabled=False)
+    assert hf_off.strip_ghost_sentences("A. Vielen Dank. B.") == "A. Vielen Dank. B."

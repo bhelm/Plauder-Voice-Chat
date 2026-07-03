@@ -941,7 +941,15 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         return
     LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
 
-    # Hallucination filter
+    # Hallucination filter — embedded first: a ghost sentence Whisper appended
+    # at a mid-segment pause ("… reingeredet. Vielen Dank. Okay …") is pruned
+    # without dropping the genuine rest.
+    if text and GHOST:
+        _stripped = GHOST.strip_ghost_sentences(text)
+        if _stripped != text:
+            LOG.info("ghost sentence stripped seg=%s %r → %r",
+                     segment_id, text[:80], _stripped[:80])
+            text = _stripped
     if text and GHOST and GHOST.is_hallucination(
             text, no_speech_prob=no_speech_prob, duration_s=duration_s):
         LOG.info("ghost filtered seg=%s text=%r", segment_id, text)
@@ -1059,6 +1067,8 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                     t2, no_speech_prob=getattr(STT, "last_no_speech_prob", None),
                     duration_s=span_total):
                 t2 = ""
+            if t2 and GHOST:
+                t2 = GHOST.strip_ghost_sentences(t2)
             return t2
 
         async def _trim_foreign(best_hint):
