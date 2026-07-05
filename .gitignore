@@ -11,6 +11,9 @@ __pycache__/
 uploads/
 house_data/
 *.log
+# Persistierte Hermes-Session-ID (rotiert bei "New session")
+.hermes_session_id
+.hermes_session_id.tmp
 
 # Speaker lock: downloaded embedding models + the enrolled voice profile
 models/

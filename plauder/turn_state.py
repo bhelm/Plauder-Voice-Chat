@@ -8,22 +8,67 @@ off in ONE LLM call.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
+
+LOG = logging.getLogger("voice-chat")
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Hex session IDs only (uuid4().hex or a sha256 digest) — anything else in the
+# state file is ignored rather than sent as an X-Hermes-Session-Id header.
+_HEX_ID = re.compile(r"[0-9a-f]{32,64}")
 
 
-def _stable_session_id() -> str:
-    """Derive a deterministic session ID from HERMES_SESSION_KEY_SEPARATE.
+def _session_state_path() -> Path:
+    """File persisting the rotated Hermes session ID (see rotate_hermes_session_id)."""
+    override = os.environ.get("HERMES_SESSION_STATE_PATH", "")
+    return Path(override) if override else _PROJECT_ROOT / ".hermes_session_id"
 
-    Uses SHA-256 of the key so the voice session ID is stable across reconnects
-    (same key → same ID → Hermes loads the previous turn history). Falls back to
-    a random UUID if the env var is not set.
+
+def current_hermes_session_id() -> str:
+    """The active Hermes session ID, shared by every connection.
+
+    Default is a deterministic SHA-256 of HERMES_SESSION_KEY_SEPARATE, so the
+    voice session is stable across reconnects/devices (same key → same ID →
+    Hermes loads the previous turn history). After a "new session" reset the
+    rotated ID persisted by rotate_hermes_session_id() wins over the derived
+    default — otherwise every reconnect/reload would snap back to the pre-reset
+    conversation. Falls back to a random per-connection UUID when no key is
+    configured (non-Hermes backends ignore the session headers anyway).
     """
     key = os.environ.get("HERMES_SESSION_KEY_SEPARATE", "")
     if not key:
         return uuid.uuid4().hex
+    try:
+        sid = _session_state_path().read_text(encoding="utf-8").strip()
+        if _HEX_ID.fullmatch(sid):
+            return sid
+    except OSError:
+        pass
     return hashlib.sha256(key.encode()).hexdigest()
+
+
+def rotate_hermes_session_id() -> str:
+    """Mint a fresh Hermes session ID and persist it as the active one.
+
+    Written atomically (tmp + replace) so a crash can't leave a torn ID. A
+    write failure is non-fatal: the new ID still applies to the resetting
+    connection, it just won't survive a reconnect.
+    """
+    sid = uuid.uuid4().hex
+    if os.environ.get("HERMES_SESSION_KEY_SEPARATE", ""):
+        path = _session_state_path()
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(sid, encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            LOG.warning("could not persist rotated Hermes session id: %s", exc)
+    return sid
 
 # VAD frames ≈ 32 ms per frame at 16 kHz/512 samples (silero-vad-web).
 VAD_FRAME_MS = 32
@@ -116,7 +161,7 @@ class TurnState:
     speaker_last_own_ts: float = 0.0
     # Hermes session ID for the voice session (deterministic from the session
     # key so it survives reconnects; rotated on explicit /new).
-    hermes_session_id_separate: str = field(default_factory=_stable_session_id)
+    hermes_session_id_separate: str = field(default_factory=current_hermes_session_id)
 
     def has_pending(self) -> bool:
         return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)

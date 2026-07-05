@@ -281,6 +281,29 @@
       text-decoration: underline; cursor: pointer; padding: 4px; margin-top: 2px;
     }
     .vlock-forget:hover { color: var(--err); }
+    /* Temporary on/off of the whole gate (profile is kept). */
+    .vlock-toggle {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      margin: 8px 0 10px; font-size: 13px; font-weight: 600;
+    }
+    .vlock.locked.paused { border-color: rgba(167,139,250,.35); }
+    .vlock.paused .vlock-badge { border-color: var(--border); background: var(--panel); box-shadow: none; }
+    .vlock.paused .vlock-chip { color: var(--warn); border-color: rgba(251,191,36,.5); }
+    /* Generic slide toggle */
+    .switch { position: relative; display: inline-flex; flex-shrink: 0; cursor: pointer; }
+    .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch-track {
+      width: 40px; height: 22px; border-radius: 999px; background: var(--panel);
+      border: 1px solid var(--border); transition: background .2s, border-color .2s;
+      display: inline-block;
+    }
+    .switch-thumb {
+      position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+      border-radius: 50%; background: var(--muted); transition: transform .2s, background .2s;
+    }
+    .switch input:checked + .switch-track { background: rgba(74,222,128,.25); border-color: rgba(74,222,128,.55); }
+    .switch input:checked + .switch-track .switch-thumb { transform: translateX(18px); background: var(--ok); }
+    .switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     /* Slider Card */
     .slider-row { display: flex; align-items: center; gap: 10px; }
@@ -633,6 +656,25 @@
     .quickstat strong { font-variant-numeric: tabular-nums; color: var(--accent); font-size: 16px; }
     .quickstat .qs-sub { opacity: .55; font-size: 11px; }
 
+    /* === Confirm modal (session reset) === */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 60;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px;
+      padding: 18px 20px; max-width: 360px; width: 100%;
+      box-shadow: 0 12px 40px rgba(0,0,0,.5);
+    }
+    .modal-title { font-weight: 700; font-size: 15px; margin-bottom: 8px; }
+    .modal-text { font-size: 13px; color: var(--muted); line-height: 1.45; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+    .modal-actions .confirm {
+      border-color: rgba(122,162,255,.6); background: rgba(122,162,255,.15);
+      color: var(--accent); font-weight: 600;
+    }
+
     /* === Settings drawer === */
     .drawer-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,.55);
@@ -735,6 +777,13 @@
       <span class="status-pill" data-i18n-title="vad.pill_title" title="Voice Activity Detection (browser VAD)">
         <span id="vadDot" class="dot"></span><span class="lbl" id="vadStatus" data-i18n="vad.label">VAD</span>
       </span>
+      <button id="newSessionBtn" class="burger" data-i18n-title="action.new_session_title" title="Discard the previous conversation history and continue in a fresh LLM session">
+        <!-- "New chat" compose icon: open circle + pencil (the usual AI-chat glyph) -->
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3a9 9 0 1 0 9 9" />
+          <path d="M18.375 2.625a2.12 2.12 0 0 1 3 3L13 14l-4 1 1-4Z" />
+        </svg>
+      </button>
       <button id="settingsBtn" class="burger" data-i18n-title="settings.title" title="Settings">☰</button>
     </div>
   </header>
@@ -803,6 +852,16 @@
         <div class="acc-body">
           <div data-i18n="voicelock.help" style="font-size: 11px; color: var(--muted);">
             Only your enrolled voice is transcribed — other people and background voices are ignored.
+          </div>
+
+          <!-- Temporary on/off. Only meaningful once a profile exists, so it is
+               shown by updateVoiceLockUi() only when enrolled. -->
+          <div class="vlock-toggle" id="voiceLockToggleRow" style="display:none;">
+            <span data-i18n="voicelock.active_label">Voice lock active</span>
+            <label class="switch">
+              <input type="checkbox" id="voiceLockToggle" checked />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </label>
           </div>
 
           <button id="enrollVoiceBtn" class="vlock-enroll">
@@ -908,22 +967,6 @@
         </div>
       </details>
 
-      <!-- ── Section: Session ───────────────────────────────────────── -->
-      <details class="acc" data-sec="session">
-        <summary>🔌 <span data-i18n="settings.connection">Connection / session</span></summary>
-        <div class="acc-body">
-          <div class="card">
-            <div class="row" style="margin-bottom:8px;">
-              <button id="pingBtn" data-i18n="action.ping">Ping</button>
-              <button id="reconnectBtn" data-i18n="action.reconnect">Reconnect</button>
-            </div>
-            <div class="row">
-              <button id="newSessionBtn" data-i18n="action.new_session" data-i18n-title="action.new_session_title" title="Discard the previous conversation history and continue in a fresh LLM session">🆕 New session</button>
-            </div>
-          </div>
-        </div>
-      </details>
-
       <div class="footer-note" id="footerNote" data-i18n-html="footer.note">
         Speak → pause → the agent replies.<br />
         Speak again while the agent is thinking → its reply is discarded.
@@ -935,6 +978,18 @@
 
   <!-- Backdrop nur im modalen (schmalen) Modus sichtbar -->
   <div id="drawerOverlay" class="drawer-overlay"></div>
+
+  <!-- Confirm modal: new session (discard conversation history) -->
+  <div id="newSessionModal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="newSessionModalTitle">
+      <div class="modal-title" id="newSessionModalTitle" data-i18n="modal.new_session_title">Start a new session?</div>
+      <div class="modal-text" data-i18n="modal.new_session_text">The conversation history is discarded on all connected devices and Antonia forgets the current context.</div>
+      <div class="modal-actions">
+        <button id="newSessionCancel" data-i18n="modal.cancel">Cancel</button>
+        <button id="newSessionConfirm" class="confirm" data-i18n="modal.new_session_ok">New session</button>
+      </div>
+    </div>
+  </div>
 
   <footer>
     <span id="micStatus" class="mic-status" data-i18n="mic.idle">Mic not active</span>
@@ -1022,11 +1077,11 @@
         "settings.microphone_fallback": "Microphone {n}",
         "settings.volume": "Volume",
         "settings.cue_volume_help": "Wake tones (pling/plong) · 0 = off",
-        "settings.connection": "Connection / session",
-        "action.ping": "Ping",
-        "action.reconnect": "Reconnect",
-        "action.new_session": "🆕 New session",
         "action.new_session_title": "Discard the previous conversation history and continue in a fresh LLM session",
+        "modal.new_session_title": "Start a new session?",
+        "modal.new_session_text": "The conversation history is discarded on all connected devices and Antonia forgets the current context.",
+        "modal.new_session_ok": "New session",
+        "modal.cancel": "Cancel",
         "footer.note": "Speak → pause → the agent replies.<br />Speak again while the agent is thinking → its reply is discarded.",
         // Footer stats
         "stats.answer": "Reply",
@@ -1095,6 +1150,7 @@
         "sys.wake_window_ended": "🔇 Wake window ended",
         "sys.agent_listening": "🟢 {name} is listening …",
         "sys.new_session_requested": "✍️  Requesting new session …",
+        "sys.new_session_remote": "🆕 New session started on another device",
         "wake.ignored_count": "🔇 ignored (no wake word) · {count}×",
         "wake.ignored_text": "🔇 “{text}” — ignored (no wake word)",
         "wake.ignored_closed": "🔇 “{text}” — ignored (channel closed)",
@@ -1115,6 +1171,8 @@
         "voicelock.status_enrolled": "Locked · {count} sample(s).",
         "voicelock.chip_open": "OPEN",
         "voicelock.chip_locked": "LOCKED",
+        "voicelock.chip_paused": "PAUSED",
+        "voicelock.active_label": "Voice lock active",
         "voicelock.lastmatch": "Last voice match",
         "voicelock.threshold_help": "Strictness: your match must land <b>right</b> of the marker to pass. Higher = stricter.",
         "voicelock.recording": "Recording… keep talking ({pct}%)",
@@ -1194,11 +1252,11 @@
         "settings.microphone_fallback": "Mikrofon {n}",
         "settings.volume": "Lautstärke",
         "settings.cue_volume_help": "Wake-Töne (Pling/Plong) · 0 = aus",
-        "settings.connection": "Verbindung / Session",
-        "action.ping": "Ping",
-        "action.reconnect": "Reconnect",
-        "action.new_session": "🆕 Neue Session",
         "action.new_session_title": "Bisherigen Gesprächsverlauf verwerfen und in einer frischen LLM-Session weitermachen",
+        "modal.new_session_title": "Neue Session starten?",
+        "modal.new_session_text": "Der Gesprächsverlauf wird auf allen verbundenen Geräten verworfen und Antonia vergisst den aktuellen Kontext.",
+        "modal.new_session_ok": "Neue Session",
+        "modal.cancel": "Abbrechen",
         "footer.note": "Sprich → Pause → der Agent antwortet.<br />Sprich nochmal während der Agent denkt → sein Reply wird verworfen.",
         // Footer stats
         "stats.answer": "Antwort",
@@ -1267,6 +1325,7 @@
         "sys.wake_window_ended": "🔇 Wake-Fenster beendet",
         "sys.agent_listening": "🟢 {name} hört zu …",
         "sys.new_session_requested": "✍️  Neue Session angefordert …",
+        "sys.new_session_remote": "🆕 Neue Session von einem anderen Gerät gestartet",
         "wake.ignored_count": "🔇 ignoriert (kein Wake-Word) · {count}×",
         "wake.ignored_text": '🔇 „{text}" — ignoriert (kein Wake-Word)',
         "wake.ignored_closed": '🔇 „{text}" — ignoriert (Kanal geschlossen)',
@@ -1287,6 +1346,8 @@
         "voicelock.status_enrolled": "Gesperrt · {count} Probe(n).",
         "voicelock.chip_open": "OFFEN",
         "voicelock.chip_locked": "GESPERRT",
+        "voicelock.chip_paused": "PAUSIERT",
+        "voicelock.active_label": "Stimmensperre aktiv",
         "voicelock.lastmatch": "Letzte Stimm-Übereinstimmung",
         "voicelock.threshold_help": "Strenge: deine Übereinstimmung muss <b>rechts</b> der Markierung liegen. Höher = strenger.",
         "voicelock.recording": "Aufnahme… weiter sprechen ({pct}%)",
@@ -1418,8 +1479,6 @@
       lastTts.textContent = (statTtsFirst != null)
         ? `${statTtsFirst}ms / ${fmtMs(statTtsTotal)}` : fmtMs(statTtsTotal);
     }
-    const pingBtn       = document.getElementById('pingBtn');
-    const reconnectBtn  = document.getElementById('reconnectBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const micBtn        = document.getElementById('micBtn');
     const stopBtn       = document.getElementById('stopBtn');
@@ -1446,6 +1505,8 @@
     const voiceLockMeterMark = document.getElementById('voiceLockMeterMark');
     const voiceLockThreshold = document.getElementById('voiceLockThreshold');
     const voiceLockThresholdLabel = document.getElementById('voiceLockThresholdLabel');
+    const voiceLockToggleRow = document.getElementById('voiceLockToggleRow');
+    const voiceLockToggle    = document.getElementById('voiceLockToggle');
 
     /* ===== Persistent UI settings (survive a reload) =====
        Mode, VAD threshold, wake-cue volume and panel state are already
@@ -1862,7 +1923,6 @@
     function setWs(state, label) {
       wsDot.className = 'dot ' + state;
       wsStatus.textContent = label;
-      pingBtn.disabled = state !== 'ok';
     }
     function setVad(state, label) {
       vadDot.className = 'dot ' + state;
@@ -2176,6 +2236,9 @@
     let streamInputEnabled = false; // server accepts streamed input frames (B1)
     let serverWake = { available: false, enabled: false }; // wake-word info (from hello)
     let serverSpeaker = { available: false, enrolled: false, count: 0 }; // voice-lock (from hello)
+    // Runtime on/off for the voice lock (persisted). Re-asserted to the server
+    // on every (re)connect via sendSettings(); default on.
+    let speakerLockOn = localStorage.getItem('speakerLockOn') !== '0';
     let enrolling = false;
     const ENROLL_SECONDS = 6;
     let helloSeen = false;               // preselect start mode only on the first hello
@@ -2755,7 +2818,7 @@
     // server verifies the speaker; a confirmed owner voice then interrupts via
     // the server (audio.stop), a foreign voice restores the volume.
     function voiceLockEngaged() {
-      return !!(serverSpeaker && serverSpeaker.available && serverSpeaker.enrolled);
+      return !!(serverSpeaker && serverSpeaker.available && serverSpeaker.enrolled && speakerLockOn);
     }
     function bargeInAllowed() {
       if (voiceLockEngaged()) return false;
@@ -2788,9 +2851,12 @@
     }
 
     /* ===== WebSocket ===== */
+    // Auto-reconnect: no manual Reconnect button — a watchdog re-opens the
+    // socket every RECONNECT_MS whenever it is closed. connect() is idempotent
+    // (returns while CONNECTING/OPEN), so the watchdog is safe to fire freely.
     let ws = null;
     let reconnectTimer = null;
-    let reconnectDelay = 1000;
+    const RECONNECT_MS = 10000;
 
     function connect() {
       if (ws && ws.readyState <= 1) return;
@@ -2801,13 +2867,11 @@
       catch (err) {
         setWs('err', t('status.error'));
         addBubble('err', t('err.ws', { err: err.message || err }));
-        scheduleReconnect();
         return;
       }
       ws.binaryType = 'arraybuffer';
 
       ws.addEventListener('open', () => {
-        reconnectDelay = 1000;
         setWs('ok', t('status.connected'));
         // Initial-Settings senden
         sendSettings();
@@ -2839,18 +2903,17 @@
 
       ws.addEventListener('close', (ev) => {
         setWs('err', t('status.disconnected', { code: ev.code }));
-        scheduleReconnect();
         if (typeof refreshSendButton === 'function') refreshSendButton();
       });
       ws.addEventListener('error', () => setWs('err', t('status.error')));
     }
-    function scheduleReconnect() {
+    // Periodic watchdog: reconnect if the socket is closed/closing (readyState
+    // 2/3) or was never created. Started once at boot, runs for the page's life.
+    function startReconnectWatchdog() {
       if (reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        reconnectDelay = Math.min(reconnectDelay * 2, 10000);
-        connect();
-      }, reconnectDelay);
+      reconnectTimer = setInterval(() => {
+        if (!ws || ws.readyState > 1) connect();
+      }, RECONNECT_MS);
     }
 
     function handleMessage(m) {
@@ -2902,6 +2965,33 @@
         case 'session.reset.ack':
           newSessionBtn.disabled = false;
           addBubble('sys', t('sys.new_session_active', { key: (m.sessionKey || '').slice(-12) }));
+          break;
+        case 'chat.remote': {
+          // Another device of the shared session sent/received this message —
+          // mirror it so every device shows the same conversation.
+          if (m.role === 'assistant') {
+            const el = document.createElement('div');
+            el.className = 'bubble agent';
+            const md = document.createElement('div'); md.className = 'md';
+            md.innerHTML = renderMarkdown(m.text || '');
+            el.appendChild(md);
+            chatLog.appendChild(el);
+            chatLog.scrollTop = chatLog.scrollHeight;
+            persistMsg('agent', m.text);
+          } else {
+            let txt = m.text || '';
+            if (m.imageCount) txt = (txt ? txt + ' · ' : '') + '📷'.repeat(Math.min(m.imageCount, 3));
+            addBubble('user', txt);
+            persistMsg('user', txt);
+          }
+          break;
+        }
+        case 'session.reset.remote':
+          // "New session" was clicked on another device — the shared session
+          // is reset for everyone, so clear this UI too.
+          stopCurrentAudio();
+          clearChatUi();
+          addBubble('sys', t('sys.new_session_remote'));
           break;
         case 'history':
           // Backend-loaded conversation history (cross-device).
@@ -3284,28 +3374,35 @@
         hermesMode: hermesMode,
       };
       if (speakerThreshold != null) s.speakerThreshold = speakerThreshold;
+      s.speakerLockEnabled = speakerLockOn;
       ws.send(JSON.stringify(s));
     }
 
-    pingBtn.addEventListener('click', () => {
-      if (!ws || ws.readyState !== 1) return;
-      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-    });
-    reconnectBtn.addEventListener('click', () => {
-      // Cleanly detach the old socket so its close listener does not
-      // later trigger another reconnect (race: two parallel ws).
-      if (ws) {
-        try { ws.onclose = null; ws.onerror = null; ws.onmessage = null; ws.onopen = null; } catch(_) {}
-        try { ws.close(); } catch(_) {}
-        ws = null;
-      }
-      reconnectDelay = 500;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      connect();
-    });
+    /* New session: header icon → confirm modal → session.reset. */
+    const newSessionModal   = document.getElementById('newSessionModal');
+    const newSessionCancel  = document.getElementById('newSessionCancel');
+    const newSessionConfirm = document.getElementById('newSessionConfirm');
+    function closeNewSessionModal() { newSessionModal.hidden = true; }
     newSessionBtn.addEventListener('click', () => {
+      if (!ws || ws.readyState !== 1) {
+        addBubble('err', t('err.not_connected_session'));
+        return;
+      }
+      newSessionModal.hidden = false;
+      newSessionConfirm.focus();
+    });
+    newSessionCancel.addEventListener('click', closeNewSessionModal);
+    // Click on the backdrop (not the dialog itself) also cancels.
+    newSessionModal.addEventListener('click', (e) => {
+      if (e.target === newSessionModal) closeNewSessionModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !newSessionModal.hidden) closeNewSessionModal();
+    });
+    newSessionConfirm.addEventListener('click', () => {
       // Discards the LLM session on OpenClaw — a fresh session_user suffix
       // leads to a new agent:<id>:openai-user:<random> session key.
+      closeNewSessionModal();
       if (!ws || ws.readyState !== 1) {
         addBubble('err', t('err.not_connected_session'));
         return;
@@ -3315,6 +3412,11 @@
       newSessionBtn.disabled = true;
       ws.send(JSON.stringify({ type: 'session.reset', ts: Date.now() }));
       // Optimistically clear the UI — the final ACK comes via session.reset.ack.
+      clearChatUi();
+      addBubble('sys', t('sys.new_session_requested'));
+    });
+    function clearChatUi() {
+      // Full chat wipe for a session reset (local click or remote device).
       chatLog.innerHTML = '';
       turnUserBubble.clear();
       turnVoiceHtml.clear();
@@ -3326,8 +3428,7 @@
       turnAgentBubble.clear();
       pendingTextLocalTurnIds.length = 0;
       clearTranscript();   // gespeichertes Transkript verwerfen → Reload startet frisch
-      addBubble('sys', t('sys.new_session_requested'));
-    });
+    }
 
     volume.addEventListener('input', () => {
       volumeLabel.textContent = volume.value + '%';
@@ -3651,7 +3752,10 @@
             if (inputMode === 'wake' && wakeWindowActive) cancelWakeWindowTimer();
             // Safety net: in case the frame path does not kick in. In wake mode
             // with a closed window, do NOT abort (speech not directed at Antonia).
-            if (bargeInAllowed()) bargeInStop('vad-speech');
+            // Only when audio is actually PLAYING: while Antonia merely thinks,
+            // the abort is deferred to the server (post-STT + ghost filter), so
+            // a hallucinated noise segment cannot kill the pending answer.
+            if (bargeInAllowed() && anyAudioPlaying()) bargeInStop('vad-speech');
             // Voice lock: don't stop — duck the playback while the server
             // verifies the speaker. Owner → server stops it; foreign → restore.
             else if (voiceLockEngaged() && anyAudioPlaying()
@@ -3827,16 +3931,24 @@
       voiceLockCard.style.display = serverSpeaker.available ? '' : 'none';
       if (!serverSpeaker.available) return;
       const enrolled = !!serverSpeaker.enrolled;
+      // Enrolled but toggled off = "paused": profile kept, gate not filtering.
+      const paused = enrolled && !speakerLockOn;
       voiceLockCard.classList.toggle('locked', enrolled);
-      voiceLockBadge.textContent = enrolled ? '🔒' : '🔓';
+      voiceLockCard.classList.toggle('paused', paused);
+      voiceLockBadge.textContent = (enrolled && !paused) ? '🔒' : '🔓';
       // Chip shows the sample count so a successful "add another sample" is
-      // visibly reflected (LOCKED · 3).
-      voiceLockChip.textContent = enrolled
-        ? `${t('voicelock.chip_locked')}${serverSpeaker.count ? ' · ' + serverSpeaker.count : ''}`
-        : t('voicelock.chip_open');
+      // visibly reflected (LOCKED · 3); PAUSED when temporarily disabled.
+      voiceLockChip.textContent = paused
+        ? t('voicelock.chip_paused')
+        : (enrolled
+            ? `${t('voicelock.chip_locked')}${serverSpeaker.count ? ' · ' + serverSpeaker.count : ''}`
+            : t('voicelock.chip_open'));
       enrollVoiceLabel.textContent = t(enrolled ? 'voicelock.enroll_again' : 'voicelock.enroll');
       forgetVoiceBtn.style.display = enrolled ? '' : 'none';
       voiceLockTuner.style.display = enrolled ? '' : 'none';
+      // The on/off toggle only makes sense once a profile exists.
+      if (voiceLockToggleRow) voiceLockToggleRow.style.display = enrolled ? '' : 'none';
+      if (voiceLockToggle) voiceLockToggle.checked = speakerLockOn;
       // Initialise the threshold slider from the stored value or the server default.
       if (voiceLockThreshold) {
         const thr = speakerThreshold != null ? speakerThreshold : (serverSpeaker.threshold || 0.5);
@@ -3855,6 +3967,15 @@
       voiceLockThreshold.addEventListener('change', () => {
         localStorage.setItem('speakerThreshold', String(speakerThreshold));
         sendSettings();   // push the new strictness to the server (runtime)
+      });
+    }
+
+    if (voiceLockToggle) {
+      voiceLockToggle.addEventListener('change', () => {
+        speakerLockOn = voiceLockToggle.checked;
+        localStorage.setItem('speakerLockOn', speakerLockOn ? '1' : '0');
+        sendSettings();        // push on/off to the server gate
+        updateVoiceLockUi();   // reflect paused/locked visuals
       });
     }
 
@@ -4573,6 +4694,7 @@
     debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
     restoreTranscript();   // vorherige Sitzung anzeigen (Kontext lebt serverseitig weiter)
     connect();
+    startReconnectWatchdog();   // auto-reconnect every 10 s while disconnected
   </script>
 </body>
 </html>

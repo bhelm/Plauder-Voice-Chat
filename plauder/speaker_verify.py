@@ -140,6 +140,11 @@ class SpeakerVerifier:
         self.provider = provider
         self.num_threads = num_threads
         self.sample_rate = sample_rate
+        # Runtime kill-switch, toggled live from the UI (process-wide on the
+        # shared verifier; fine for a single-owner setup, like ``threshold``).
+        # When False the gate goes fully fail-open (``active()`` returns False)
+        # WITHOUT forgetting the enrolled profile — a temporary "let everyone in".
+        self.enabled = True
         self._extractor = None
         # Enrolled profile: running SUM of embeddings + count (so extra takes can
         # be folded in with a correct mean). The normalized mean is the reference.
@@ -224,9 +229,10 @@ class SpeakerVerifier:
         return float(np.dot(_l2_normalize(self._sum), emb))
 
     def active(self) -> bool:
-        """Gate is live only when the model loaded AND a profile exists. Without a
-        profile the gate stays open (fail-open) so the user can still enroll."""
-        return self.loaded and self.has_profile()
+        """Gate is live only when the model loaded AND a profile exists AND the
+        runtime toggle is on. Without a profile the gate stays open (fail-open)
+        so the user can still enroll; ``enabled=False`` opens it on purpose."""
+        return self.loaded and self.has_profile() and self.enabled
 
     # -- embedding --------------------------------------------------------- #
     def _samples(self, pcm) -> np.ndarray:

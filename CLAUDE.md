@@ -47,11 +47,13 @@ The browser client is a single hand-written file, `static/index.html` (~4500 lin
 of inline JS — no build step). After editing its JS, syntax-check by extracting the
 `<script>` blocks and running `node --check`; it cannot be unit-tested here.
 
-Restarting the running server: **do not** `pkill -f "start.sh"` or
-`pkill -f server.py` — the pattern matches the shell running the command and kills
-it (exit 144). Kill by explicit PID (`pgrep -f 'server\.py'` → `kill -9 <pid>` plus
-its `start.sh` parent), confirm port 8319 is free, then
-`nohup ./start.sh > /tmp/voice.log 2>&1 &`. The server does not auto-reload.
+Restarting the running server: it is managed by systemd
+(`voice-chat.service`, `Restart=always`) — use `systemctl restart voice-chat`;
+logs via `journalctl -u voice-chat`. Do **not** `pkill -f "start.sh"` /
+`pkill -f server.py` (the pattern matches the shell running the command and kills
+it, exit 144), and do not start `./start.sh` by hand while the unit is active —
+the port is taken and systemd would race a manual instance. The server does not
+auto-reload.
 
 ## Architecture
 
@@ -124,7 +126,12 @@ JSON event frames over WS (`hello`, `transcript`/`transcript.partial`/
 `transcript.ignored`, `turn.pending`/`turn.commit`, `reply`/`reply.delta`,
 `audio.start`/`audio.end`,
 `wake.armed`/`wake.detected`/`wake.window`/`wake.closed`, …) plus
-two binary framings:
+two binary framings. **Cross-device sync:** all browsers share ONE session
+(`WS_CLIENTS` registry in server.py); committed user inputs and final replies
+are mirrored to the other connections as `chat.remote`, and a `session.reset`
+rotates the persisted Hermes session ID (`.hermes_session_id`, read fresh by
+`_apply_hermes_headers` before every LLM call), cancels the peers' in-flight
+turns and clears their UIs via `session.reset.remote`.
 `VCT1` = full WAV (classic path), `VCT2` = streamed PCM chunk (`audio.py` defines
 both; the client parses them in `static/index.html`). `hello` advertises
 capabilities (`streaming`, `streamInput`, `sttPartial`, `wakeWord`) so the client

@@ -37,7 +37,8 @@ from .images import _resolve_image_urls
 from .session import ConversationManager
 from .speaker_verify import foreign_regions
 from .telegram_bridge import TelegramBridge
-from .turn_state import TurnState, vad_params_for_debounce
+from .turn_state import (TurnState, current_hermes_session_id,
+                         rotate_hermes_session_id, vad_params_for_debounce)
 
 LOG = logging.getLogger("voice-chat")
 
@@ -145,9 +146,43 @@ def _apply_hermes_headers(state: TurnState) -> None:
         return
     llm = CONV.llm
     llm.session_key = _hermes_session_key_for_mode("separate")
+    # Re-read the ACTIVE session ID from the persistent store on every call: a
+    # "new session" reset on any device must apply to every connection's next
+    # turn immediately, not only after its reconnect. Without a configured
+    # Hermes key there is no shared store — keep the per-connection ID.
+    if CFG and CFG.hermes_session_key_separate:
+        state.hermes_session_id_separate = current_hermes_session_id()
     llm.session_id = state.hermes_session_id_separate
     LOG.debug("hermes headers: key=%s sid=%s",
               llm.session_key, llm.session_id[:12] if llm.session_id else "")
+
+
+# ============================================================================ #
+# Cross-device sync
+# ============================================================================ #
+# All connected browsers (ws → TurnState). The voice session is shared across
+# devices (one Hermes session), so committed messages and "new session" resets
+# are mirrored to every other connection to keep all UIs on the same state.
+WS_CLIENTS: dict = {}
+
+# Fire-and-forget broadcast tasks (kept referenced so they aren't GC'd).
+_SYNC_TASKS: set = set()
+
+
+async def _broadcast_peers(origin_ws, payload: dict) -> None:
+    """Best-effort fan-out to every OTHER connected browser."""
+    for peer_ws in [w for w in WS_CLIENTS if w is not origin_ws]:
+        try:
+            await peer_ws.send_json(payload)
+        except Exception:
+            pass  # a dying socket is cleaned up by its own handler
+
+
+def _broadcast_peers_bg(origin_ws, payload: dict) -> None:
+    """Like _broadcast_peers, but off the latency-critical turn path."""
+    task = asyncio.create_task(_broadcast_peers(origin_ws, payload))
+    _SYNC_TASKS.add(task)
+    task.add_done_callback(_SYNC_TASKS.discard)
 
 
 # ============================================================================ #
@@ -303,6 +338,12 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         "segmentIds": segment_ids, "source": source,
         "imageCount": len(resolved_imgs), "ts": time.time(),
     })
+    # Mirror the committed user input to other connected devices.
+    if combined or resolved_imgs:
+        _broadcast_peers_bg(ws, {
+            "type": "chat.remote", "role": "user", "text": combined,
+            "imageCount": len(resolved_imgs), "ts": time.time(),
+        })
 
     # Telegram mirroring of the user input.
     if BRIDGE and BRIDGE.enabled:
@@ -384,6 +425,8 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         "finishReason": meta_agent.get("finish_reason"),
         "usage": meta_agent.get("usage"), "ts": time.time(),
     })
+    _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
+                             "text": reply_text, "ts": time.time()})
 
     if BRIDGE and BRIDGE.enabled and cleaned:
         BRIDGE.remember_self_sent(reply_text)
@@ -643,6 +686,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
             "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
             "streamed": True, "ts": time.time()})
+        _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
+                                 "text": full_reply, "ts": time.time()})
 
         if BRIDGE and BRIDGE.enabled and cleaned_full:
             BRIDGE.remember_self_sent(full_reply)
@@ -915,14 +960,14 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         "samples": num_samples, "durationS": round(duration_s, 3), "ts": t0,
     })
 
-    # With the wake word OR the speaker lock active, a running turn is NOT
-    # cancelled immediately — only once the segment passes the gate (otherwise
-    # foreign chatter / a child's voice would interrupt Antonia mid-sentence
-    # even though it isn't the owner / isn't directed at her).
+    # A running turn is NOT cancelled up-front. Gated modes (wake word /
+    # speaker lock) cancel only once the segment passes their gate; the plain
+    # VAD path cancels right after the ghost filter below. Rationale: a
+    # Whisper hallucination (mic noise → "Untertitelung des ZDF") must not
+    # kill a thinking turn, and the extra STT latency is inaudible — audible
+    # playback is already stopped client-side at VAD onset (bargeInStop).
     wake_gating = bool(CFG and getattr(state, "wake_word_enabled", False))
     speaker_gating = SPEAKER is not None and SPEAKER.active()
-    if not (wake_gating or speaker_gating):
-        await _coalesce_cancel(state, ws)
 
     # STT
     try:
@@ -934,9 +979,9 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         LOG.exception("STT failed for segment %s", segment_id)
         await ws.send_json({"type": "transcript.error", "segmentId": segment_id,
                             "turnId": state.turn_id, "error": str(exc), "ts": time.time()})
-        # The up-front _coalesce_cancel may have killed the ticking debounce —
-        # without a resume, already-committed (coalesced) input would be
-        # stranded forever (every other drop path resumes too).
+        # Nothing was cancelled yet (the barge-in is deferred past the ghost
+        # filter), but resume defensively like every other drop path — the
+        # guards inside make it a no-op while a timer ticks / a turn runs.
         _resume_debounce(ws, state)
         return
     LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
@@ -960,6 +1005,13 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         })
         _resume_debounce(ws, state)
         return
+
+    # Plain-VAD barge-in — deferred to HERE (past STT + ghost filter) so that
+    # hallucinated noise segments above can no longer cancel a running turn.
+    # Empty transcripts drop before pending/dispatch anyway. The gated modes
+    # cancel later still, once their gate passes.
+    if text and not (wake_gating or speaker_gating):
+        await _coalesce_cancel(state, ws)
 
     # --- Speaker lock (voice gate). Hard lock: only the enrolled owner voice is
     # transcribed; any other voice is dropped here, before the wake gate / LLM.
@@ -1606,6 +1658,7 @@ async def ws_handler(request):
 
     if BRIDGE is not None:
         BRIDGE.register_broadcast(ws)
+    WS_CLIENTS[ws] = state
 
     await ws.send_json({
         "type": "hello", "stage": STAGE,
@@ -1643,6 +1696,8 @@ async def ws_handler(request):
             "enrolled": bool(SPEAKER is not None and SPEAKER.has_profile()),
             "count": (SPEAKER._count if SPEAKER is not None else 0),
             "threshold": (SPEAKER.threshold if SPEAKER is not None else 0),
+            # Runtime toggle state (the client re-asserts its own on connect).
+            "enabled": bool(SPEAKER is not None and getattr(SPEAKER, "enabled", True)),
         },
         "turn": {
             "debounce_ms": state.debounce_ms,
@@ -1917,8 +1972,10 @@ async def ws_handler(request):
                         CONV.reset(new_user)
                     # Rotate the Hermes session ID so X-Hermes-Session-Id
                     # points to a fresh conversation thread (new voice session).
-                    import uuid as _uuid
-                    state.hermes_session_id_separate = _uuid.uuid4().hex
+                    # Persisted server-side: without that, every reconnect /
+                    # page reload would re-derive the stable pre-reset ID and
+                    # silently continue the OLD Hermes session.
+                    state.hermes_session_id_separate = rotate_hermes_session_id()
                     LOG.info("session reset for %s: user=%s", peer, new_user)
                     await ws.send_json({
                         "type": "session.reset.ack", "sessionUser": new_user,
@@ -1926,6 +1983,21 @@ async def ws_handler(request):
                         "hermesMode": "separate",
                         "sharedWithTelegram": False, "ts": time.time(),
                     })
+                    # The session is shared across devices → the reset applies
+                    # everywhere at once: cancel other connections' in-flight
+                    # turns, move them onto the fresh CONV user key + session
+                    # ID and tell their UIs to clear.
+                    for peer_ws, peer_state in list(WS_CLIENTS.items()):
+                        if peer_ws is ws:
+                            continue
+                        try:
+                            await _cancel_in_flight(peer_state, peer_ws)
+                        except Exception:
+                            LOG.exception("peer cancel on session reset failed (ignored)")
+                        peer_state.session_user = new_user
+                        peer_state.hermes_session_id_separate = state.hermes_session_id_separate
+                    await _broadcast_peers(ws, {"type": "session.reset.remote",
+                                                "ts": time.time()})
                 elif t == "settings":
                     if "speed" in data:
                         try:
@@ -1951,6 +2023,9 @@ async def ws_handler(request):
                             SPEAKER.threshold = max(0.2, min(0.95, float(data["speakerThreshold"])))
                         except (TypeError, ValueError):
                             pass
+                    if "speakerLockEnabled" in data and SPEAKER is not None:
+                        # Temporary on/off of the whole voice-lock gate (profile kept).
+                        SPEAKER.enabled = bool(data["speakerLockEnabled"])
                     # hermesMode from client is ignored (fixed to 'separate').
                     vad_params = vad_params_for_debounce(state.debounce_ms)
                     LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s",
@@ -1961,6 +2036,7 @@ async def ws_handler(request):
                         "wakeWordEnabled": state.wake_word_enabled,
                         "hermesMode": "separate",
                         "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),
+                        "speakerLockEnabled": (SPEAKER.enabled if SPEAKER is not None else None),
                         "vad": vad_params, "ts": time.time(),
                     })
                 else:
@@ -1995,6 +2071,7 @@ async def ws_handler(request):
     finally:
         if BRIDGE is not None:
             BRIDGE.unregister_broadcast(ws)
+        WS_CLIENTS.pop(ws, None)
         _cancel_connection_tasks(state)
         LOG.info("ws close: %s", peer)
         if not ws.closed:

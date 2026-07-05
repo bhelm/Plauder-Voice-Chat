@@ -510,3 +510,38 @@ def test_no_history_fetch_without_hermes_key():
         assert mock.await_count == 0
 
     asyncio.run(run())
+
+
+def test_ws_cross_device_sync():
+    """Committed messages and session resets are mirrored to every other
+    connected device, so all UIs show the same shared-session state."""
+    _configure(reply="Antwort an alle.")
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            a = await client.ws_connect("/ws")
+            b = await client.ws_connect("/ws")
+            await a.receive_json()  # hello
+            await b.receive_json()  # hello
+
+            # A talks → B sees the committed user text and the final reply.
+            await a.send_json({"type": "text.message", "text": "Hi"})
+            user_remote, _, _ = await _drain_until(b, "chat.remote")
+            assert user_remote is not None
+            assert user_remote["role"] == "user" and user_remote["text"] == "Hi"
+            reply_remote, _, _ = await _drain_until(b, "chat.remote")
+            assert reply_remote is not None
+            assert reply_remote["role"] == "assistant"
+            assert reply_remote["text"] == "Antwort an alle."
+
+            # A resets → B's UI is told to clear.
+            await a.send_json({"type": "session.reset"})
+            ack, _, _ = await _drain_until(a, "session.reset.ack")
+            assert ack is not None
+            remote, _, _ = await _drain_until(b, "session.reset.remote")
+            assert remote is not None
+
+            await a.close()
+            await b.close()
+
+    asyncio.run(run())
