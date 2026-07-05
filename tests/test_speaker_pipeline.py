@@ -440,6 +440,58 @@ def test_continuity_accepts_own_tail_after_owner_watch_split():
     asyncio.run(run())
 
 
+def test_trim_vetoed_when_region_rescore_says_owner():
+    """Field regression: the relative block rule flags the owner's own tail
+    as foreign, but the contiguous re-score of that region (score_region)
+    still looks like the owner → the cut is vetoed, full text kept, no
+    re-STT."""
+    _configure_speaker(stt_texts=["mein ganzer satz bleibt"], deltas=["Ok!"],
+                       decisions=[(True, 0.6)])
+    # Tail blocks fall below both the relative bar and the abs floor (thr 0.5)…
+    srv.SPEAKER.blocks = [(0.0, 3.0, 0.70), (1.5, 4.5, 0.30), (3.0, 6.0, 0.28)]
+    # …but re-scored as ONE contiguous region the tail is clearly the owner.
+    srv.SPEAKER.region_scores = [0.55]
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await ws.send_json({"type": "segment.start", "segmentId": "s1"})
+            await ws.send_bytes(b"\x00" * (16000 * 4 * 6))
+            tr, seen = await _drain_until(ws, "transcript")
+            assert tr is not None and tr["text"] == "mein ganzer satz bleibt", seen
+            assert not tr.get("speakerTrimmed"), seen
+            assert srv.STT.calls == 1, "veto must not trigger a re-STT"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_trim_skipped_when_blocks_clear_abs_floor():
+    """Blocks above the full-segment threshold are owner by definition — one
+    outlier-good block must not push them under the relative bar (the exact
+    false-trim pattern from the field session)."""
+    _configure_speaker(stt_texts=["alles meins, auch das ende"], deltas=["Ok!"],
+                       decisions=[(True, 0.6)])
+    # Best block 0.70 → relative bar would be 0.55; the tail (0.51/0.52) is
+    # above the abs floor (threshold 0.5) → protected, nothing foreign.
+    srv.SPEAKER.blocks = [(0.0, 3.0, 0.70), (1.5, 4.5, 0.52), (3.0, 6.0, 0.51)]
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await ws.send_json({"type": "segment.start", "segmentId": "s1"})
+            await ws.send_bytes(b"\x00" * (16000 * 4 * 6))
+            tr, seen = await _drain_until(ws, "transcript")
+            assert tr is not None and tr["text"] == "alles meins, auch das ende", seen
+            assert not tr.get("speakerTrimmed"), seen
+            assert srv.STT.calls == 1
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_block_refine_uncuts_own_trailing_speech():
     """Windows propose cutting the tail, but the block-level second opinion
     scores the tail close to the kept block → un-cut, full text kept, no

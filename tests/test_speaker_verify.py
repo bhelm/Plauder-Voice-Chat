@@ -173,6 +173,48 @@ def test_foreign_regions_sentence_policy():
     assert foreign == []
 
 
+def test_foreign_regions_abs_floor_protects_owner_blocks():
+    """Field regression: one outlier-good block (0.65) pushed the relative bar
+    to 0.50 and the owner's own tail blocks (0.45–0.48, ABOVE the full-segment
+    threshold 0.4) were cut. With abs_floor they are protected."""
+    from plauder.speaker_verify import foreign_regions
+    blocks = [(0.0, 3.0, 0.65), (1.5, 4.5, 0.48), (3.0, 6.0, 0.45)]
+    # Without the floor the relative rule cuts the tail…
+    foreign, _ = foreign_regions(blocks, 6.0, delta=0.15, min_region_s=2.5)
+    assert foreign == [(3.0, 6.0)]
+    # …with the floor the ≥ 0.4 blocks are owner, nothing is cut.
+    foreign, keep = foreign_regions(blocks, 6.0, delta=0.15, min_region_s=2.5,
+                                    abs_floor=0.4)
+    assert foreign == [] and keep == [(0.0, 6.0)]
+    # A genuinely foreign tail (far below the floor) is still cut.
+    blocks = [(0.0, 3.0, 0.65), (1.5, 4.5, 0.20), (3.0, 6.0, 0.15)]
+    foreign, keep = foreign_regions(blocks, 6.0, delta=0.15, min_region_s=2.5,
+                                    abs_floor=0.4)
+    assert foreign == [(3.0, 6.0)] and keep == [(0.0, 3.0)]
+
+
+def test_keep_regions_complements_foreign():
+    from plauder.speaker_verify import keep_regions
+    assert keep_regions([], 6.0) == [(0.0, 6.0)]
+    assert keep_regions([(2.0, 4.0)], 6.0) == [(0.0, 2.0), (4.0, 6.0)]
+    assert keep_regions([(0.0, 3.0)], 6.0) == [(3.0, 6.0)]
+
+
+def test_analyze_blocks_skips_silence_dominated_tail(tmp_path):
+    """The block over the VAD tail padding (mostly silence) must be skipped —
+    its embedding is garbage and used to seed a bogus foreign region at the
+    end of every segment."""
+    sv = _mk(tmp_path)
+    sv.enroll(_OWNER)
+    # 3.5 s owner speech + 2.5 s trailing silence.
+    seg = np.concatenate([np.full(int(SR * 3.5), 0.5, np.float32),
+                          np.zeros(int(SR * 2.5), np.float32)])
+    blocks = sv.analyze_blocks(seg, SR)
+    assert blocks, "voiced blocks must survive"
+    # The 3.0–6.0 s block is ~83 % silence → dropped from the analysis.
+    assert all(s < 3.0 for s, _e, _sc in blocks), blocks
+
+
 def test_crop_f32_spans():
     from plauder import audio as audio_utils
     seg = np.concatenate([np.full(SR, 0.5, np.float32),

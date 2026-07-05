@@ -66,18 +66,26 @@ class WindowAnalysis:
 
 
 def foreign_regions(blocks, total_s: float, *, delta: float = 0.15,
-                    min_region_s: float = 2.5) -> tuple:
+                    min_region_s: float = 2.5,
+                    abs_floor: float | None = None) -> tuple:
     """Derive (foreign_regions, keep_regions) from equal-length block scores.
 
     A time cell counts as foreign only when EVERY block covering it scores
     below (best block − delta) — conservative: one owner-ish covering block
-    protects the cell. Foreign regions shorter than ``min_region_s`` are
-    dropped (sentence-level policy: single words/short dips are never cut).
+    protects the cell. ``abs_floor`` adds an ABSOLUTE guard on top of the
+    relative rule: a block scoring ≥ abs_floor is owner no matter how good
+    the segment's best block is (3 s blocks behave like full segments, so the
+    full-segment threshold applies — one outlier-good block must not push
+    ordinary owner blocks below the relative bar). Foreign regions shorter
+    than ``min_region_s`` are dropped (sentence-level policy: single
+    words/short dips are never cut).
     """
     if not blocks:
         return [], [(0.0, total_s)]
     best = max(sc for _, _, sc in blocks)
     bar = best - delta
+    if abs_floor is not None:
+        bar = min(bar, abs_floor)
     edges = sorted({0.0, total_s} | {round(b[0], 3) for b in blocks}
                    | {round(b[1], 3) for b in blocks})
     regions: list = []
@@ -91,15 +99,22 @@ def foreign_regions(blocks, total_s: float, *, delta: float = 0.15,
         elif is_foreign:
             regions.append([a, b])
     regions = [(a, b) for a, b in regions if b - a >= min_region_s]
+    return regions, keep_regions(regions, total_s)
+
+
+def keep_regions(foreign, total_s: float) -> list:
+    """Complement of ``foreign`` regions over [0, total_s] (the croppable
+    owner spans). Split out so callers can rebuild the keep list after
+    vetoing individual foreign regions."""
     keep: list = []
     prev = 0.0
-    for a, b in regions:
+    for a, b in foreign:
         if a - prev > 0.05:
             keep.append((prev, a))
         prev = b
     if total_s - prev > 0.05:
         keep.append((prev, total_s))
-    return regions, keep
+    return keep
 
 
 def spans_from_windows(windows, bar: float, total_s: float, *,
@@ -297,7 +312,8 @@ class SpeakerVerifier:
     # -- equal-length block scoring (foreign-sentence detection) ------------ #
     def analyze_blocks(self, pcm, sample_rate: int | None = None, *,
                        block_s: float = 3.0, hop_s: float = 1.5,
-                       silence_rms: float = 0.005) -> list:
+                       silence_rms: float = 0.005,
+                       min_voiced_frac: float = 0.5) -> list:
         """Score EQUAL-LENGTH ~3 s blocks on a fixed grid against the profile.
 
         The model is heavily length-sensitive (same voice: 1.2 s → ~0.3,
@@ -305,7 +321,11 @@ class SpeakerVerifier:
         THE SAME LENGTH. Foreign-speech detection therefore compares each block
         against the best block of the same segment — never against thresholds
         calibrated on other lengths. Returns [(start_s, end_s, score), …] for
-        voiced blocks (near-silent blocks are skipped)."""
+        voiced blocks. Blocks dominated by silence (voiced fraction below
+        ``min_voiced_frac``, measured on 50 ms frames) are skipped entirely:
+        their embeddings are garbage. Field data showed the block over the
+        VAD tail padding reliably scores ~0.15 for the OWNER and used to seed
+        a bogus foreign region at the end of every segment."""
         if not self.active():
             return []
         sr = sample_rate or self.sample_rate
@@ -319,11 +339,16 @@ class SpeakerVerifier:
         starts = list(range(0, max(1, n - blk + 1), hop))
         if starts and starts[-1] + blk < n:
             starts.append(n - blk)
+        frame = max(1, int(sr * 0.05))
         out = []
         for st in starts:
             w = samples[st:st + blk]
-            rms = float(np.sqrt(np.mean(w * w))) if w.size else 0.0
-            if rms < silence_rms:
+            if not w.size:
+                continue
+            nf = max(1, w.shape[0] // frame)
+            f = w[:nf * frame].reshape(nf, -1)
+            voiced = int(np.count_nonzero(np.sqrt(np.mean(f * f, axis=1)) >= silence_rms))
+            if voiced / nf < min_voiced_frac:
                 continue
             emb = self.embed(w, sr)
             out.append((st / sr, (st + blk) / sr, float(np.dot(ref, emb))))

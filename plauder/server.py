@@ -35,7 +35,7 @@ from .config import SAMPLE_RATE, Config
 from .hermes_history import fetch_history
 from .images import _resolve_image_urls
 from .session import ConversationManager
-from .speaker_verify import foreign_regions
+from .speaker_verify import foreign_regions, keep_regions
 from .telegram_bridge import TelegramBridge
 from .turn_state import (TurnState, current_hermes_session_id,
                          rotate_hermes_session_id, vad_params_for_debounce)
@@ -1129,9 +1129,29 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             nonlocal text, speaker_score, speaker_trimmed, speaker_full_text
             foreign, keep = foreign_regions(
                 blocks, duration_s, delta=SPEAKER_BLOCK_DELTA,
-                min_region_s=SPEAKER_TRIM_MIN_FOREIGN_S)
+                min_region_s=SPEAKER_TRIM_MIN_FOREIGN_S,
+                abs_floor=SPEAKER.threshold)
             if not foreign or not keep:
                 return False
+            # Second opinion before cutting: re-embed each candidate region as
+            # ONE contiguous piece (contiguous multi-second audio behaves like
+            # a full segment, unlike the noisy grid blocks). A region that
+            # still scores like the owner is vetoed — field sessions showed
+            # the relative rule cutting the owner's own sentences.
+            confirmed = []
+            for a, b in foreign:
+                sc = await asyncio.to_thread(
+                    SPEAKER.score_region, pcm_bytes, SAMPLE_RATE, a, b)
+                if sc >= SPEAKER.threshold:
+                    LOG.info("speaker: trim veto seg=%s region=%.1f-%.1f "
+                             "score=%.3f (owner)", segment_id, a, b, sc)
+                else:
+                    confirmed.append((a, b))
+            if not confirmed:
+                return False
+            if len(confirmed) < len(foreign):
+                foreign = confirmed
+                keep = keep_regions(foreign, duration_s)
             keep_total = sum(e - s for s, e in keep)
             if keep_total < SPEAKER.min_dur_s:
                 return False
