@@ -2306,6 +2306,41 @@
     /* ===== Server capabilities (from hello) ===== */
     let serverStreaming = false;   // server streams LLM→TTS as PCM chunks (A1+A2)
     let streamInputEnabled = false; // server accepts streamed input frames (B1)
+    let serverAudioCaps = { opusIn: false, opusOut: false }; // opus codec (from hello.audio)
+
+    /* ===== Opus audio compression (WebCodecs) =====
+       When the browser has WebCodecs opus support AND the server advertises it
+       (hello.audio), the raw links are compressed transparently:
+       - uplink: mic f32 frames → AudioEncoder(opus @16k, ~24 kbit/s) → framed
+         packets (0x4F + u16 len + packet) instead of raw f32 (~512 kbit/s);
+       - downlink: VCT3 opus chunks → AudioDecoder → the same gapless stream
+         player as raw VCT2 PCM (~48 instead of ~384 kbit/s).
+       No UI: it is strictly better when available; negotiation is automatic
+       and everything falls back to the raw paths otherwise. */
+    const opusSupport = { enc: false, dec: false };
+    (async () => {
+      try {
+        if (window.AudioEncoder && AudioEncoder.isConfigSupported) {
+          const r = await AudioEncoder.isConfigSupported({
+            codec: 'opus', sampleRate: 16000, numberOfChannels: 1, bitrate: 24000 });
+          opusSupport.enc = !!(r && r.supported);
+        }
+      } catch (_) {}
+      try {
+        if (window.AudioDecoder && AudioDecoder.isConfigSupported) {
+          const r = await AudioDecoder.isConfigSupported({
+            codec: 'opus', sampleRate: 24000, numberOfChannels: 1 });
+          opusSupport.dec = !!(r && r.supported);
+        }
+      } catch (_) {}
+      console.log('[opus] WebCodecs support: encode=' + opusSupport.enc
+        + ' decode=' + opusSupport.dec);
+      // Detection may resolve after the socket already said hello → re-announce
+      // the (now known) codec wish to the server.
+      if (helloSeen && ws && ws.readyState === 1) sendSettings();
+    })();
+    function opusUplinkActive()   { return opusSupport.enc && serverAudioCaps.opusIn; }
+    function opusDownlinkActive() { return opusSupport.dec && serverAudioCaps.opusOut; }
     let serverWake = { available: false, enabled: false }; // wake-word info (from hello)
     let serverSpeaker = { available: false, enrolled: false, count: 0 }; // voice-lock (from hello)
     // Runtime on/off for the voice lock (persisted). Re-asserted to the server
@@ -2418,10 +2453,11 @@
       return playbackCtx;
     }
 
-    function startStreamPlayback(turnId, audioId, sampleRate) {
-      // Hard-stop any running playback (a different turn).
+    function startStreamPlayback(turnId, audioId, sampleRate, codec) {
+      // Hard-stop any running playback (a different turn) — replays too.
       stopStreamPlayback();
       stopCurrentAudio();
+      stopReplaySource();
       playbackUserPaused = false;   // new playback → release a possibly paused ctx
       ensurePlaybackCtx();
       streamPlayer = {
@@ -2430,11 +2466,77 @@
         lead: 0.04,   // scheduling lead-in; grows after underruns (jitter buffer)
         chunks: [],   // collect PCM for the replay cache
         cachedSamples: 0,
+        decoder: null,       // opus downlink: WebCodecs AudioDecoder (VCT3)
+        decoderTs: 0,        // running packet timestamp (ordering only)
       };
+      if (codec === 'opus') {
+        try {
+          streamPlayer.decoder = makeDownlinkOpusDecoder(turnId, sampleRate || 24000);
+        } catch (e) {
+          // Should not happen (we only requested opus when supported); chunks
+          // of this turn would be undecodable — surface it once.
+          console.warn('[opus] downlink decoder init failed', e);
+        }
+      }
       currentTurnId = turnId;
       currentAudioId = audioId;
       if (micActive) setMicUi('playing');
       refreshSpeakerButtons();
+    }
+
+    // Opus downlink (VCT3): decoded AudioData is converted to int16 and fed
+    // into the SAME gapless scheduling as raw VCT2 chunks — barge-in stop,
+    // turn gating, jitter lead-in, replay cache and playback.done all reuse
+    // the existing path. WebCodecs guarantees output ordering.
+    function makeDownlinkOpusDecoder(turnId, sampleRate) {
+      const dec = new AudioDecoder({
+        output: (audioData) => {
+          try {
+            // Gate at decode-OUTPUT time: a barge-in may have stopped this
+            // stream while the decode was still in flight.
+            if (!streamPlayer || streamPlayer.turnId !== turnId) { audioData.close(); return; }
+            const n = audioData.numberOfFrames;
+            const f32 = new Float32Array(n);
+            audioData.copyTo(f32, { planeIndex: 0, format: 'f32-planar' });
+            // Some decoders output 48 kHz regardless of the configured rate —
+            // trust the decoded frame, not audio.start (before the 1st chunk).
+            if (audioData.sampleRate && streamPlayer.sampleRate !== audioData.sampleRate
+                && streamPlayer.nextTime === 0 && !streamPlayer.cachedSamples) {
+              streamPlayer.sampleRate = audioData.sampleRate;
+            }
+            audioData.close();
+            const int16 = new Int16Array(n);
+            for (let i = 0; i < n; i++) {
+              const v = Math.max(-1, Math.min(1, f32[i]));
+              int16[i] = v < 0 ? v * 32768 : v * 32767;
+            }
+            pushStreamChunk(turnId, int16);
+          } catch (_) { try { audioData.close(); } catch (_) {} }
+        },
+        error: (e) => console.warn('[opus] downlink decoder error', e),
+      });
+      dec.configure({ codec: 'opus', sampleRate, numberOfChannels: 1 });
+      return dec;
+    }
+
+    function feedOpusChunk(chunk) {
+      if (!streamPlayer || streamPlayer.turnId !== chunk.turnId) return;
+      const dec = streamPlayer.decoder;
+      if (!dec || dec.state !== 'configured') return;
+      for (const pkt of chunk.packets) {
+        try {
+          dec.decode(new EncodedAudioChunk({
+            type: 'key', timestamp: streamPlayer.decoderTs, data: pkt }));
+          streamPlayer.decoderTs += 20000;   // nominal 20 ms/packet (ordering only)
+        } catch (e) { console.warn('[opus] decode failed', e); }
+      }
+    }
+
+    function closeStreamDecoder(sp) {
+      if (sp && sp.decoder) {
+        try { sp.decoder.close(); } catch (_) {}
+        sp.decoder = null;
+      }
     }
 
     function pushStreamChunk(turnId, int16) {
@@ -2483,6 +2585,7 @@
       const fireDone = streamPlayer.donePending;
       const chunks = streamPlayer.chunks || [];
       const sr = streamPlayer.sampleRate;
+      closeStreamDecoder(streamPlayer);   // opus: normally already closed at audio.end
       streamPlayer = null;
       if (currentTurnId === turnId) { currentTurnId = null; currentAudioId = null; }
       setDuck(false);        // playback over → release a possible voice-lock duck
@@ -2514,6 +2617,7 @@
       if (!streamPlayer) return;
       const sp = streamPlayer;
       streamPlayer = null;            // detach first, so onended does nothing anymore
+      closeStreamDecoder(sp);         // opus: drop in-flight decodes with the stream
       for (const n of sp.sources) { try { n.stop(); } catch (_) {} try { n.disconnect(); } catch (_) {} }
       if (currentTurnId === sp.turnId) { currentTurnId = null; currentAudioId = null; }
       // Aborted (barge-in/stop) → don't cache; possibly clear the pause flag.
@@ -2535,6 +2639,7 @@
       const vol = parseInt(volume.value, 10) / 100;
       if (playbackGain) playbackGain.gain.value = vol * duckFactor;
       if (currentAudioEl) currentAudioEl.volume = Math.min(1, vol * duckFactor);
+      if (replayGain) replayGain.gain.value = vol * duckFactor;
     }
     function setDuck(on) {
       const f = on ? 0.2 : 1.0;
@@ -2581,6 +2686,30 @@
       const int16 = new Int16Array(n);
       for (let i = 0; i < n; i++) int16[i] = (pcmBytes[2 * i] | (pcmBytes[2 * i + 1] << 8)) << 16 >> 16;
       return { turnId, seq, int16 };
+    }
+
+    // Parses the VCT3 streaming frame (opus-compressed downlink):
+    //   "VCT3" + 1 byte ID length + turn ID + 2 byte seq (BE)
+    //   + repeated (2 byte packet length BE + opus packet).
+    const OPUS_CHUNK_MAGIC = [0x56, 0x43, 0x54, 0x33]; // "VCT3"
+    function parseOpusChunk(arrayBuffer) {
+      if (arrayBuffer.byteLength < 7) return null;
+      const view = new Uint8Array(arrayBuffer);
+      for (let i = 0; i < 4; i++) if (view[i] !== OPUS_CHUNK_MAGIC[i]) return null;
+      const idLen = view[4];
+      if (idLen === 0 || arrayBuffer.byteLength < 7 + idLen) return null;
+      const turnId = new TextDecoder('ascii').decode(view.subarray(5, 5 + idLen));
+      const seq = (view[5 + idLen] << 8) | view[6 + idLen];
+      const packets = [];
+      let off = 7 + idLen;
+      while (off + 2 <= view.length) {
+        const len = (view[off] << 8) | view[off + 1];
+        off += 2;
+        if (off + len > view.length) break;   // truncated record → ignore the rest
+        packets.push(view.slice(off, off + len));
+        off += len;
+      }
+      return { turnId, seq, packets };
     }
 
     function playWavBytes(turnId, audioId, arrayBuffer) {
@@ -2659,8 +2788,33 @@
     const ttsCache = new Map();        // turnId -> { url }
     const TTS_CACHE_MAX = 40;
     let playbackUserPaused = false;    // LIVE streaming paused via suspend()?
-    const replayAudio = new Audio();   // a reused element for replays
+    // Replays run through Web Audio, NOT an <audio> element: HTMLAudio uses a
+    // different audio route than the Web-Audio live path on mobile (iOS media
+    // channel vs. context routing) — replays came out of the wrong speaker.
+    // Own context (not playbackCtx), so pauseLiveStream()'s suspend() and a
+    // paused replay stay independent of each other.
+    let replayCtx = null, replayGain = null, replaySrc = null;
     let replayTurnId = null;
+    let replayPlaying = false, replayPaused = false;
+    let replayGen = 0;                 // guards async decode against re-taps
+
+    function ensureReplayCtx() {
+      if (!replayCtx) {
+        replayCtx = new (window.AudioContext || window.webkitAudioContext)();
+        replayGain = replayCtx.createGain();
+        replayGain.connect(replayCtx.destination);
+      }
+      return replayCtx;
+    }
+
+    function stopReplaySource() {
+      if (replaySrc) {
+        const s = replaySrc; replaySrc = null;
+        try { s.onended = null; s.stop(); } catch (_) {}
+        try { s.disconnect(); } catch (_) {}
+      }
+      replayPlaying = false; replayPaused = false;
+    }
 
     function cacheTts(turnId, url) {
       if (!turnId || !url) return;
@@ -2699,20 +2853,51 @@
     }
     function resumeLiveStream() {
       playbackUserPaused = false;
+      if (replayPlaying) pauseReplay();   // never both at once
       if (playbackCtx) { try { playbackCtx.resume(); } catch (_) {} }
       refreshSpeakerButtons();
     }
 
-    function startReplay(turnId, fromStart) {
+    async function startReplay(turnId, fromStart) {
       const c = ttsCache.get(turnId);
       if (!c) return;
       // Mute other playback so nothing sounds twice.
       if (streamPlayer && !playbackUserPaused) pauseLiveStream();
       if (currentAudioEl && !currentAudioEl.paused) { try { currentAudioEl.pause(); } catch (_) {} }
-      if (replayTurnId !== turnId) { replayAudio.src = c.url; replayTurnId = turnId; }
-      if (fromStart) { try { replayAudio.currentTime = 0; } catch (_) {} }
-      replayAudio.volume = parseInt(volume.value, 10) / 100;
-      replayAudio.play().catch(() => {});
+      ensureReplayCtx();
+      stopReplaySource();
+      const gen = ++replayGen;
+      try {
+        if (!c.buf) {
+          const ab = await (await fetch(c.url)).arrayBuffer();
+          c.buf = await replayCtx.decodeAudioData(ab);
+        }
+      } catch (_) { return; }
+      if (gen !== replayGen) return;   // superseded by a newer tap mid-decode
+      const src = replayCtx.createBufferSource();
+      src.buffer = c.buf;
+      src.connect(replayGain);
+      src.onended = () => {
+        if (replaySrc === src) { replaySrc = null; replayPlaying = false; replayPaused = false; }
+        refreshSpeakerButtons();
+      };
+      replaySrc = src;
+      replayTurnId = turnId;
+      replayPlaying = true; replayPaused = false;
+      applyPlaybackVolume();
+      try { await replayCtx.resume(); } catch (_) {}
+      src.start();
+      refreshSpeakerButtons();
+    }
+
+    function pauseReplay() {
+      if (replayCtx) { try { replayCtx.suspend(); } catch (_) {} }
+      replayPlaying = false; replayPaused = true;
+      refreshSpeakerButtons();
+    }
+    function resumeReplay() {
+      replayPlaying = true; replayPaused = false;
+      if (replayCtx) { try { replayCtx.resume(); } catch (_) {} }
       refreshSpeakerButtons();
     }
 
@@ -2725,9 +2910,9 @@
         if (currentAudioEl.paused) currentAudioEl.play().catch(() => {}); else currentAudioEl.pause();
         refreshSpeakerButtons(); return;
       }
-      if (replayTurnId === turnId) {                               // replay playing / paused
-        if (!replayAudio.paused) { replayAudio.pause(); refreshSpeakerButtons(); return; }
-        if (replayAudio.currentTime > 0 && !replayAudio.ended) { replayAudio.play().catch(() => {}); return; }
+      if (replayTurnId === turnId && replaySrc) {                  // replay playing / paused
+        if (replayPlaying) { pauseReplay(); return; }
+        if (replayPaused) { resumeReplay(); return; }
       }
       startReplay(turnId, false);                                  // otherwise: play again
     }
@@ -2746,8 +2931,8 @@
         if (liveStream) { playing = !playbackUserPaused; paused = playbackUserPaused; }
         else if (liveWav) { playing = !currentAudioEl.paused; paused = currentAudioEl.paused; }
         else if (replayTurnId === T) {
-          playing = !replayAudio.paused;
-          paused = replayAudio.paused && replayAudio.currentTime > 0 && !replayAudio.ended;
+          playing = replayPlaying;
+          paused = replayPaused;
         }
         btn.classList.toggle('disabled', !hasAudio);
         btn.textContent = playing ? '⏸' : (paused ? '▶️' : '🔊');
@@ -2763,8 +2948,8 @@
         if (liveStream) { playing = !playbackUserPaused; paused = playbackUserPaused; }
         else if (liveWav) { playing = !currentAudioEl.paused; paused = currentAudioEl.paused; }
         else if (replayTurnId === T) {
-          playing = !replayAudio.paused;
-          paused = replayAudio.paused && replayAudio.currentTime > 0 && !replayAudio.ended;
+          playing = replayPlaying;
+          paused = replayPaused;
         }
         const menuBtn = wrap.querySelector('.msg-menu-btn');
         if (menuBtn) menuBtn.classList.toggle('disabled', !hasAudio);
@@ -2780,10 +2965,6 @@
         if (dlItem) dlItem.disabled = !hasAudio;
       });
     }
-
-    replayAudio.addEventListener('play', refreshSpeakerButtons);
-    replayAudio.addEventListener('pause', refreshSpeakerButtons);
-    replayAudio.addEventListener('ended', refreshSpeakerButtons);
 
     // Close any open message menu
     let _openMenu = null;
@@ -2938,13 +3119,52 @@
     }
 
     /* ===== WebSocket ===== */
-    // Auto-reconnect: no manual Reconnect button — a watchdog re-opens the
-    // socket every RECONNECT_MS whenever it is closed. connect() is idempotent
-    // (returns while CONNECTING/OPEN), so the watchdog is safe to fire freely.
+    // Auto-reconnect: no manual Reconnect button. connect() is idempotent
+    // (returns while CONNECTING/OPEN), so every trigger below may fire freely
+    // without stacking parallel sockets:
+    //  - after a close, a retry is scheduled with exponential backoff
+    //    (RECONNECT_MIN_MS … RECONNECT_MAX_MS, reset to fast on success);
+    //    while the page is HIDDEN the retry cadence stays slow (no point in
+    //    burning radio in the background),
+    //  - returning to the app (visibilitychange/focus/pageshow/online)
+    //    reconnects IMMEDIATELY — this is the path that matters on mobile,
+    //    where a backgrounded tab's socket is long dead,
+    //  - a slow interval watchdog remains as a safety net.
+    // Session state needs no special resume: 'open' re-sends the settings
+    // (speed/debounce/wake mode/speaker lock/audioCodec) and the server's
+    // hello re-advertises its capabilities.
     let ws = null;
-    let reconnectTimer = null;
+    let reconnectTimer = null;    // pending scheduled retry (setTimeout)
+    let watchdogTimer = null;     // safety-net interval
     let wsWasConnected = false;   // gates the one-shot "connection lost" notice
-    const RECONNECT_MS = 10000;
+    const RECONNECT_MIN_MS = 800;
+    const RECONNECT_MAX_MS = 10000;
+    let reconnectDelayMs = RECONNECT_MIN_MS;
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;                    // already scheduled
+      const hidden = document.visibilityState === 'hidden';
+      const delay = hidden ? RECONNECT_MAX_MS : reconnectDelayMs;
+      if (!hidden) reconnectDelayMs = Math.min(RECONNECT_MAX_MS, reconnectDelayMs * 2);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!ws || ws.readyState > 1) connect();
+      }, delay);
+    }
+
+    // Immediate reconnect when the user (or the network) comes back.
+    function reconnectNow() {
+      if (ws && ws.readyState <= 1) return;          // OPEN/CONNECTING → fine
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      reconnectDelayMs = RECONNECT_MIN_MS;           // user is back → fast retries
+      connect();
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') reconnectNow();
+    });
+    window.addEventListener('focus', reconnectNow);
+    window.addEventListener('pageshow', reconnectNow);
+    window.addEventListener('online', reconnectNow);
 
     function connect() {
       if (ws && ws.readyState <= 1) return;
@@ -2955,12 +3175,14 @@
       catch (err) {
         setWs('err', t('status.error'));
         addBubble('err', t('err.ws', { err: err.message || err }));
+        scheduleReconnect();   // constructor failures fire no 'close' event
         return;
       }
       ws.binaryType = 'arraybuffer';
 
       ws.addEventListener('open', () => {
         wsWasConnected = true;
+        reconnectDelayMs = RECONNECT_MIN_MS;   // connected → backoff back to fast
         setWs('ok', t('status.connected'));
         // Initial-Settings senden
         sendSettings();
@@ -2969,11 +3191,16 @@
 
       ws.addEventListener('message', (ev) => {
         if (typeof ev.data !== 'string') {
-          // Binary: either a progressive PCM chunk (VCT2, streaming) or
-          // a complete WAV file (VCT1, classic path).
+          // Binary: a progressive PCM chunk (VCT2, streaming), an opus chunk
+          // (VCT3, compressed streaming) or a complete WAV file (VCT1, classic).
           const chunk = parsePcmChunk(ev.data);
           if (chunk) {
             pushStreamChunk(chunk.turnId, chunk.int16);
+            return;
+          }
+          const opusChunk = parseOpusChunk(ev.data);
+          if (opusChunk) {
+            feedOpusChunk(opusChunk);
             return;
           }
           const parsed = parseFramedWav(ev.data);
@@ -3000,16 +3227,19 @@
           sttDone(null);   // no transcript event will come for in-flight segments
         }
         if (typeof refreshSendButton === 'function') refreshSendButton();
+        scheduleReconnect();   // fast first retry, exponential backoff after
       });
       ws.addEventListener('error', () => setWs('err', t('status.error')));
     }
-    // Periodic watchdog: reconnect if the socket is closed/closing (readyState
-    // 2/3) or was never created. Started once at boot, runs for the page's life.
+    // Safety-net watchdog: reconnect if the socket is closed/closing
+    // (readyState 2/3) or was never created AND no retry is already scheduled
+    // (the backoff/visibility paths above are the primary mechanisms).
+    // Started once at boot, runs for the page's life.
     function startReconnectWatchdog() {
-      if (reconnectTimer) return;
-      reconnectTimer = setInterval(() => {
-        if (!ws || ws.readyState > 1) connect();
-      }, RECONNECT_MS);
+      if (watchdogTimer) return;
+      watchdogTimer = setInterval(() => {
+        if ((!ws || ws.readyState > 1) && !reconnectTimer) connect();
+      }, RECONNECT_MAX_MS);
     }
 
     function handleMessage(m) {
@@ -3022,6 +3252,11 @@
           else if (m.agent && m.agent.name) applyAgentName(m.agent.name);
           serverStreaming = !!m.streaming;
           streamInputEnabled = !!m.streamInput;
+          serverAudioCaps = m.audio || { opusIn: false, opusOut: false };
+          console.log('[opus] negotiated: uplink=' + (opusUplinkActive() ? 'opus' : 'pcm')
+            + ' downlink=' + (opusDownlinkActive() ? 'opus' : 'pcm')
+            + ' (server opusIn=' + !!serverAudioCaps.opusIn
+            + ' opusOut=' + !!serverAudioCaps.opusOut + ')');
           serverWake = m.wakeWord || { available: false, enabled: false };
           if (m.speakerLock) serverSpeaker = m.speakerLock;
           updateVoiceLockUi();
@@ -3054,9 +3289,13 @@
             }
             applyServerVadParams(m.turn.vad);
           }
+          // The on-open settings went out BEFORE hello (codec caps unknown) —
+          // re-announce now so audioCodec reaches the server.
+          sendSettings();
           break;
         case 'settings.ack':
           applyServerVadParams(m.vad);
+          if (m.audioCodec) console.log('[opus] downlink codec ack: ' + m.audioCodec);
           break;
         case 'session.reset.ack':
           newSessionBtn.disabled = false;
@@ -3407,7 +3646,7 @@
           // ein hier gestarteter Stream-Player bliebe für immer "playing"
           // (Stop-Button dauerhaft an, Wake-Timer blockiert, Phantom-Barge-ins).
           if (Number.isFinite(m.sampleRate)) {
-            startStreamPlayback(m.turnId, m.audioId, m.sampleRate);
+            startStreamPlayback(m.turnId, m.audioId, m.sampleRate, m.codec);
           }
           // E2E latency to first playback + first-token values for agent/TTS.
           if (Number.isFinite(m.e2eMs)) {
@@ -3424,7 +3663,20 @@
         case 'audio.end':
           // Alle Chunks gesendet → Player als "fertig" markieren; playback.done
           // fires when the last buffer has finished playing.
-          endStreamPlayback(m.turnId);
+          // Opus: drain the decoder FIRST — in-flight decodes must land in the
+          // scheduler before the stream is finalized, or the tail is cut off.
+          if (streamPlayer && streamPlayer.turnId === m.turnId && streamPlayer.decoder) {
+            const dec = streamPlayer.decoder, tid = m.turnId;
+            dec.flush().catch(() => {}).finally(() => {
+              try { dec.close(); } catch (_) {}
+              if (streamPlayer && streamPlayer.turnId === tid && streamPlayer.decoder === dec) {
+                streamPlayer.decoder = null;
+              }
+              endStreamPlayback(tid);
+            });
+          } else {
+            endStreamPlayback(m.turnId);
+          }
           if (Number.isFinite(m.ttsMs)) {
             appendTtsToAgentBubble(m.turnId, m.ttsMs);
             statTtsTotal = m.ttsMs;
@@ -3493,6 +3745,8 @@
       };
       if (speakerThreshold != null) s.speakerThreshold = speakerThreshold;
       s.speakerLockEnabled = speakerLockOn;
+      // Downlink codec wish: opus when both sides support it (see opusSupport).
+      s.audioCodec = opusDownlinkActive() ? 'opus' : 'pcm';
       ws.send(JSON.stringify(s));
     }
 
@@ -3709,39 +3963,160 @@
       return vadLike() && streamInputEnabled && ws && ws.readyState === 1;
     }
 
+    /* ===== Opus mic uplink (B1 segments) =====
+       One AudioEncoder per streamed segment; each EncodedAudioChunk goes out
+       as 0x4F ('O') + u16 BE length + packet. Because flush() is async, all
+       opus start/commit/abort work is serialized on ONE promise chain so the
+       wire order (start → frames → commit) can never interleave across
+       segments. The chain normally resolves within a microtask, i.e. before
+       the next mic callback; frames arriving before the queued start ran are
+       still covered by the preroll ring buffer (flushed at start time).
+       Enrollment and PTT/full segments stay raw f32 — only VAD/wake streaming
+       segments are encoded. */
+    let inputOpusEnc = null;      // AudioEncoder of the ACTIVE opus segment
+    let inputOpusTs = 0;          // running sample counter → AudioData timestamps
+    let uplinkCodec = 'pcm';      // codec of the ACTIVE streamed segment
+    let uplinkGen = 0;            // segment generation (guards stale chained tasks)
+    let uplinkChain = Promise.resolve();
+    function chainUplink(fn) {
+      uplinkChain = uplinkChain.then(fn, fn);
+      return uplinkChain;
+    }
+
+    function makeUplinkOpusEncoder(gen) {
+      const enc = new AudioEncoder({
+        output: (chunk) => {
+          if (!ws || ws.readyState !== 1) return;
+          try {
+            const pkt = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(pkt);
+            const framed = new Uint8Array(3 + pkt.length);
+            framed[0] = 0x4F;                       // 'O'
+            framed[1] = (pkt.length >> 8) & 0xFF;   // u16 BE packet length
+            framed[2] = pkt.length & 0xFF;
+            framed.set(pkt, 3);
+            ws.send(framed);
+          } catch (_) {}
+        },
+        error: (e) => console.warn('[opus] uplink encoder error', e),
+      });
+      enc.configure({ codec: 'opus', sampleRate: 16000, numberOfChannels: 1, bitrate: 24000 });
+      enc._gen = gen;   // frames may only enter the encoder of the CURRENT segment
+      return enc;
+    }
+
+    function encodeUplinkFrame(f32) {
+      if (!inputOpusEnc || inputOpusEnc._gen !== uplinkGen) return;
+      if (inputOpusEnc.state !== 'configured' || !f32.length) return;
+      try {
+        const data = new AudioData({
+          format: 'f32', sampleRate: 16000, numberOfFrames: f32.length,
+          numberOfChannels: 1,
+          timestamp: Math.round(inputOpusTs * 1e6 / 16000),
+          data: f32,
+        });
+        inputOpusTs += f32.length;
+        inputOpusEnc.encode(data);
+        try { data.close(); } catch (_) {}
+      } catch (e) { console.warn('[opus] uplink encode failed', e); }
+    }
+
     function beginInputStream(segmentId) {
       if (!streamInputActive()) return false;
-      try {
-        ws.send(JSON.stringify({
-          type: 'segment.stream.start', segmentId,
-          speechStartTs: lastSpeechStartTs, clientNow: Date.now(),
-          bargeIn: pendingBargeIn,
-        }));
-        inputStreaming = true;
-        // Prepend the lead-in (ring buffer).
-        for (const fr of inputPreRoll) ws.send(f32ToBytes(fr));
-        lastSpeechStartTs = null;
-        pendingBargeIn = false;
-        return true;
-      } catch (_) { inputStreaming = false; return false; }
+      const gen = ++uplinkGen;
+      const meta = {
+        type: 'segment.stream.start', segmentId,
+        speechStartTs: lastSpeechStartTs, clientNow: Date.now(),
+        bargeIn: pendingBargeIn,
+      };
+      if (!opusUplinkActive()) {
+        // Raw f32 path — fully synchronous, exactly as before.
+        uplinkCodec = 'pcm';
+        try {
+          ws.send(JSON.stringify(meta));
+          inputStreaming = true;
+          // Prepend the lead-in (ring buffer).
+          for (const fr of inputPreRoll) ws.send(f32ToBytes(fr));
+          lastSpeechStartTs = null;
+          pendingBargeIn = false;
+          return true;
+        } catch (_) { inputStreaming = false; return false; }
+      }
+      uplinkCodec = 'opus';
+      inputStreaming = true;
+      lastSpeechStartTs = null;
+      pendingBargeIn = false;
+      chainUplink(() => {
+        // Stale (aborted / superseded before the chain ran) → send nothing.
+        if (uplinkGen !== gen || !inputStreaming) return;
+        try {
+          inputOpusEnc = makeUplinkOpusEncoder(gen);
+          inputOpusTs = 0;
+          meta.codec = 'opus';
+        } catch (e) {
+          console.warn('[opus] uplink encoder unavailable, falling back to PCM', e);
+          inputOpusEnc = null;
+          uplinkCodec = 'pcm';
+        }
+        try {
+          ws.send(JSON.stringify(meta));
+          // Prepend the lead-in — through the same encoder, order preserved
+          // (it also holds any frames the tap saw before this task ran).
+          for (const fr of inputPreRoll) {
+            if (inputOpusEnc) encodeUplinkFrame(fr);
+            else ws.send(f32ToBytes(fr));
+          }
+        } catch (_) { inputStreaming = false; }
+      });
+      return true;
     }
 
     function commitInputStream(segmentId) {
       if (!inputStreaming) return;
       inputStreaming = false;
-      try {
-        ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId }));
-        sttSent(segmentId);
-      } catch (_) {}
+      if (uplinkCodec !== 'opus') {
+        try {
+          ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId }));
+          sttSent(segmentId);
+        } catch (_) {}
+        return;
+      }
+      chainUplink(async () => {
+        const enc = inputOpusEnc;
+        inputOpusEnc = null;
+        if (enc) {
+          // Every remaining packet must hit the wire BEFORE the commit JSON —
+          // encoder outputs are delivered before flush() resolves.
+          try { await enc.flush(); } catch (_) {}
+          try { enc.close(); } catch (_) {}
+        }
+        try {
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId }));
+            sttSent(segmentId);
+          }
+        } catch (_) {}
+      });
     }
 
     function abortInputStream() {
       if (!inputStreaming) { vadStreamSegId = null; return; }
       inputStreaming = false;
       vadStreamSegId = null;
-      try {
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'segment.stream.abort' }));
-      } catch (_) {}
+      if (uplinkCodec !== 'opus') {
+        try {
+          if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'segment.stream.abort' }));
+        } catch (_) {}
+        return;
+      }
+      chainUplink(() => {
+        const enc = inputOpusEnc;
+        inputOpusEnc = null;
+        if (enc) { try { enc.close(); } catch (_) {} }
+        try {
+          if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'segment.stream.abort' }));
+        } catch (_) {}
+      });
     }
 
     // VAD parameters maintained by the server (arrive via hello / settings.ack)
@@ -3841,8 +4216,12 @@
               total -= inputPreRoll.shift().length;
             }
             // During an active speech segment: stream the frame immediately.
+            // Opus segments encode instead of sending raw; while the queued
+            // stream start has not run yet (no encoder), the frame is simply
+            // kept in the ring buffer above and flushed by the start task.
             if (inputStreaming && ws && ws.readyState === 1) {
-              try { ws.send(f32ToBytes(ds)); } catch (_) {}
+              if (uplinkCodec === 'opus') encodeUplinkFrame(ds);
+              else try { ws.send(f32ToBytes(ds)); } catch (_) {}
             }
           };
           src.connect(tap);
@@ -4803,8 +5182,8 @@
       if (currentAudioEl && typeof currentAudioEl.setSinkId === 'function') {
         try { await currentAudioEl.setSinkId(''); } catch (_) {}
       }
-      if (replayAudio && typeof replayAudio.setSinkId === 'function') {
-        try { await replayAudio.setSinkId(''); } catch (_) {}
+      if (replayCtx && typeof replayCtx.setSinkId === 'function') {
+        try { await replayCtx.setSinkId(''); } catch (_) {}
       }
 
       // --- 3) Switch microphone input ---
@@ -4837,7 +5216,7 @@
     debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
     restoreTranscript();   // vorherige Sitzung anzeigen (Kontext lebt serverseitig weiter)
     connect();
-    startReconnectWatchdog();   // auto-reconnect every 10 s while disconnected
+    startReconnectWatchdog();   // safety net; backoff + visibility handle the rest
   </script>
 </body>
 </html>

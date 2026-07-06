@@ -635,3 +635,59 @@ def test_turn_state_reset_clears_debounce_anchor():
     state.debounce_anchor = 123.0
     state.reset()
     assert state.debounce_anchor == 0.0
+
+
+# --- TTS sentence prefetch ----------------------------------------------------
+def test_tts_prefetch_starts_next_sentence_while_first_streams():
+    """The TTS server has a fixed per-request TTFB, so sentence N+1's synthesis
+    must START while sentence N is still streaming out (bounded lookahead) —
+    otherwise every sentence boundary adds that TTFB as an audible gap. Playback
+    order must stay strictly sequential regardless."""
+
+    class ProbeTTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.started: list = []
+            self.release = asyncio.Event()
+
+        def describe(self):
+            return {"engine": "probe-tts", "sample_rate": 24000, "loaded": True}
+
+        async def synth(self, text, *, speed=1.0):
+            return b"\x00\x00", 24000
+
+        async def synth_stream(self, text, *, speed=1.0):
+            self.started.append(text)
+            yield b"\x00" * 4800, 24000
+            if len(self.started) == 1:
+                await self.release.wait()   # hold sentence 1's stream open
+
+    cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, streaming=True)
+    conv = ConversationManager(StreamingFakeLLM(["Eins. ", "Zwei."]), system_prompt="sys")
+    tts = ProbeTTS()
+    srv.configure(cfg, stt=FakeSTT(), tts=tts, conv=conv, bridge=None,
+                  ghost=HallucinationFilter(enabled=False))
+
+    async def run():
+        from aiohttp.test_utils import TestClient, TestServer
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await ws.send_json({"type": "text.message", "text": "los"})
+
+            # While sentence 1's stream is deliberately held open, sentence 2's
+            # synthesis must begin (the prefetch) …
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while len(tts.started) < 2 and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            assert tts.started == ["Eins.", "Zwei."], tts.started
+
+            # … and after releasing sentence 1 the turn finishes normally.
+            tts.release.set()
+            end, seen, _bin = await _drain_until(ws, "audio.end", timeout=3.0)
+            assert end is not None, seen
+            assert end["chunks"] >= 2
+            await ws.close()
+
+    asyncio.run(run())

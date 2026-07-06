@@ -156,3 +156,53 @@ def test_split_stream_force_cut_word_boundary_without_clause():
     sents, rest = audio.split_stream_sentences(buf.strip(), 30)
     assert sents                              # still force-flushed
     assert all(len(s) <= 30 for s in sents)
+
+
+# --- StreamLeadGate (mutes the TTS lead-noise blob) ---------------------------
+def _pcm16(samples):
+    return np.asarray(samples, dtype=np.int16).tobytes()
+
+
+def test_lead_gate_mutes_blob_keeps_speech():
+    sr = 16000
+    gate = audio.StreamLeadGate(sr, threshold_db=-45.0, prepad_ms=50)
+    silence = _pcm16(np.zeros(sr // 10))                    # 100 ms silence
+    blob = _pcm16((np.random.default_rng(1).standard_normal(sr // 10)
+                   * 32767 * 0.002).astype(np.int16))       # ~-54 dB noise
+    speech = _pcm16((np.sin(np.linspace(0, 300, sr // 2))
+                     * 32767 * 0.3).astype(np.int16))       # loud tone
+    out = gate.process(silence) + gate.process(blob) + gate.process(speech)
+    out += gate.flush()
+    total_in = len(silence) + len(blob) + len(speech)
+    assert len(out) == total_in                             # duration preserved
+    arr = np.frombuffer(out, dtype=np.int16)
+    n_lead = (len(silence) + len(blob)) // 2
+    # Blob region is silenced (up to the 50 ms pre-pad before the onset).
+    prepad = int(sr * 0.05)
+    assert np.max(np.abs(arr[: n_lead - prepad])) == 0
+    # Speech region passes unmodified.
+    assert np.array_equal(arr[n_lead:], np.frombuffer(speech, dtype=np.int16))
+    assert gate.opened
+
+
+def test_lead_gate_all_quiet_becomes_silence():
+    sr = 16000
+    gate = audio.StreamLeadGate(sr)
+    blob = _pcm16((np.random.default_rng(2).standard_normal(sr)
+                   * 32767 * 0.001).astype(np.int16))       # ~-60 dB only
+    out = gate.process(blob) + gate.flush()
+    assert len(out) == len(blob)
+    assert np.max(np.abs(np.frombuffer(out, dtype=np.int16))) == 0
+    assert not gate.opened
+
+
+def test_lead_gate_open_passes_through_verbatim():
+    sr = 16000
+    gate = audio.StreamLeadGate(sr)
+    speech = _pcm16((np.sin(np.linspace(0, 100, sr // 4))
+                     * 32767 * 0.5).astype(np.int16))
+    first = gate.process(speech)
+    assert gate.opened
+    tail = _pcm16([1, 2, 3, 4])
+    assert gate.process(tail) == tail                       # verbatim once open
+    assert gate.flush() == b""

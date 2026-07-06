@@ -132,8 +132,9 @@ curl http://localhost:8319/healthz   # 200 + aktive Backends
 ```
                          Browser (static/index.html)
                           │   ▲
-   16kHz f32 PCM-Frames    │   │  PCM-Chunks (VCT2, gestreamt) / WAV (VCT1)
-   (VAD live / Push-to-Talk)│  │  + JSON-Events
+   16kHz f32 PCM-Frames    │   │  PCM-Chunks (VCT2) / Opus-Chunks (VCT3) / WAV (VCT1)
+   (VAD live / Push-to-Talk;│  │  + JSON-Events
+    Opus-Pakete wenn ausgehandelt)
                           ▼   │
    ┌───────────────────────────────────────────────────────────────┐
    │                  plauder/server.py  (HTTP/WS-Layer)          │
@@ -203,6 +204,17 @@ sentence to TTS earlier), and for B2 `STT_PARTIAL*` (on by default with
 The debounce window is anchored at the moment the user stopped speaking: the
 silence the client VAD already held before committing (redemption) and the
 STT/gate latency count toward `DEBOUNCE_MS` instead of stacking on top of it.
+
+**Opus compression (`AUDIO_OPUS=1`, default):** when the server has the opus
+codec (opuslib + system libopus, see `requirements.txt`) and the browser has
+WebCodecs, both audio links are compressed transparently — the B1 mic uplink
+is opus-encoded client-side (~24 kbit/s instead of raw f32 ~512 kbit/s;
+`segment.stream.start` carries `codec:"opus"`, packets framed as
+`0x4F + u16 len + packet`) and the A2 downlink ships opus packets in `VCT3`
+frames (~48 kbit/s instead of raw PCM16 ~384 kbit/s; negotiated via
+`settings.audioCodec`, announced in `audio.start.codec`). Negotiation is
+automatic via `hello.audio` — clients or servers without support keep the raw
+`VCT2`/f32 paths unchanged. Mainly relevant for mobile links.
 
 The **statistics card** shows the perceived response time: `audio.start` delivers
 `e2eMs` (finished speaking → first playback, incl. the configured
@@ -355,7 +367,8 @@ plauder/
 ├── server.py              # WS handler + turn/streaming orchestration; runtime state
 ├── app.py                 # app boot/wiring: build_app, init_backends, main/run
 ├── images.py              # /upload handler + /uploads → data-URL resolution
-├── audio.py               # PCM/WAV/numpy, frame formats (VCT1/VCT2), sentence splitter
+├── audio.py               # PCM/WAV/numpy, frame formats (VCT1/VCT2/VCT3), sentence splitter
+├── opus_codec.py          # optional opus encode/decode (lazy opuslib/libopus)
 ├── turn_state.py          # debounce + coalescing, VAD parameters
 ├── sanitizer.py           # emoji/markdown stripping, ghost filter, NO_REPLY
 ├── wake.py                # wake-word matching (STT prefix, fuzzy)

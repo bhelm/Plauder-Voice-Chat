@@ -303,6 +303,13 @@ class Config:
     # flushed to TTS (subsequent sentences use tts_max_chars_per_chunk). A long
     # opening sentence otherwise delays first audio by tens of tokens.
     tts_first_chunk_chars: int = 100
+    # Opus audio compression for the browser link (kill switch). When on AND
+    # the opus codec is usable (opuslib + system libopus), hello advertises
+    # audio.opusIn/opusOut and clients with WebCodecs negotiate an opus mic
+    # uplink (~24 kbit/s instead of raw f32 ~512 kbit/s) and an opus TTS
+    # downlink (VCT3, ~48 kbit/s instead of raw PCM16 ~384 kbit/s). Clients or
+    # servers without support keep the raw paths automatically.
+    audio_opus: bool = True
 
     # --- House Mode ---
     house_mode: bool = False
@@ -479,6 +486,7 @@ class Config:
             streaming=env_flag("STREAMING", True),
             tts_chunk_ms=_env_int("TTS_CHUNK_MS", 400),
             tts_first_chunk_chars=_env_int("TTS_FIRST_CHUNK_CHARS", 100),
+            audio_opus=env_flag("AUDIO_OPUS", True),
 
             wake_word_enabled=env_flag("WAKE_WORD_ENABLED", False),
             # Default = AGENT_NAME (lowercased), overridable via WAKE_WORD.

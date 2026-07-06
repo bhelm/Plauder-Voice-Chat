@@ -12,6 +12,7 @@ Pipeline (STREAMING=1, the default — see _stream_reply_and_tts):
                  → speaker-lock gate → wake-word gate
                  → ConversationManager.chat_stream (LLM tokens live)
                  → sanitizer → sentence-wise TTS → VCT2 PCM chunks → browser
+                   (VCT3 opus chunks when the client negotiated audioCodec=opus)
 STREAMING=0 falls back to chat() → TTS.synth → one WAV (VCT1).
 """
 
@@ -28,6 +29,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from . import audio as audio_utils
+from . import opus_codec
 from . import sanitizer
 from . import wake
 from .backends import LLMBackend, STTBackend, TTSBackend, UpstreamTimeoutError
@@ -50,6 +52,8 @@ WS_MAX_MSG_BYTES = 16 * 1024 * 1024   # max size of a single WebSocket frame (im
 WS_HEARTBEAT_S = 20.0                 # WebSocket ping interval
 AGENT_RETRY_DELAY_S = 0.5             # pause before the single silent retry on an idle timeout
 SEGMENT_ID_LEN = 8                    # length of the short hex ids used for segments/turns
+TTS_PREFETCH = 1                      # sentences synthesized ahead while the current one ships
+                                      # (hides the TTS server's per-request time-to-first-byte)
 
 STAGE = 6  # protocol version (client-compatible)
 
@@ -57,6 +61,13 @@ STAGE = 6  # protocol version (client-compatible)
 def _short_id() -> str:
     """Short random hex id for segments / turns / ephemeral users."""
     return uuid.uuid4().hex[:SEGMENT_ID_LEN]
+
+
+def _opus_active() -> bool:
+    """Opus compression usable on this server: enabled via AUDIO_OPUS AND the
+    codec module actually loads (opuslib + system libopus). Drives the hello
+    advertisement and every negotiation checkpoint."""
+    return bool(CFG and CFG.audio_opus and opus_codec.is_available())
 
 # --------------------------------------------------------------------------- #
 # Runtime state (filled by configure() / main()). Module globals, so the
@@ -569,44 +580,153 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
     # segment doesn't shift this turn's measurement point.
     anchor = getattr(state, "speech_end_ts", 0.0) or 0.0
 
+    # Downlink codec: the client opted into opus via settings.audioCodec (only
+    # stored as "opus" when the codec module is usable — see the settings
+    # handler). One encoder per audio stream (turn), created at first chunk
+    # with the real TTS sample rate; packets are batched so one VCT3 frame
+    # covers ~tts_chunk_ms of audio, and the encoder is flushed at stream end.
+    want_opus = getattr(state, "audio_codec", "pcm") == "opus" and _opus_active()
+
     async def _tts_worker() -> int:
         seq = 0
-        while True:
-            sentence = await sentence_q.get()
-            if sentence is None:
-                break
+        opus_enc = None
+        opus_batch: list[bytes] = []
+        chunk_ms = CFG.tts_chunk_ms if CFG else 400
+        batch_packets = max(1, int(chunk_ms) // opus_codec.OpusEncoder.FRAME_MS)
+
+        async def _ship_batch():
+            nonlocal seq
+            if opus_batch:
+                seq += 1
+                await ws.send_bytes(audio_utils.wrap_opus_chunk(turn_id, seq, opus_batch))
+                opus_batch.clear()
+
+        # --- Sentence prefetch -------------------------------------------------
+        # The TTS server has a fixed per-request time-to-first-byte (~0.8 s for
+        # Kokoro), so requesting sentence N+1 only after N finished streaming
+        # creates audible gaps whenever a sentence's audio is shorter than that
+        # overhead. A feeder therefore keeps up to TTS_PREFETCH+1 synth requests
+        # in flight; each writes into its own chunk queue, and the shipper below
+        # drains those queues strictly IN ORDER — playback order is unaffected.
+        synth_tasks: set = set()
+        sem = asyncio.Semaphore(1 + TTS_PREFETCH)
+        order_q: asyncio.Queue = asyncio.Queue()
+
+        async def _synth_to_queue(sentence: str, chunk_q: asyncio.Queue):
             if t_tts0["t"] is None:
                 t_tts0["t"] = time.time()
+            # Per-sentence lead gate: OmniVoice prepends a faint noise blob to
+            # every synthesis — audible as a tiny "hah" at each sentence seam.
+            gate = None
+            last_sr = None
             try:
                 async for pcm, sr in _tts_synth_stream(sentence, state.speed):
-                    if not pcm:
-                        continue
-                    if not started["audio"]:
-                        started["audio"] = True
-                        state.audio_started = True   # reply is audible now
-                        state.client_playing = True
-                        sr_box["sr"] = sr
-                        now = time.time()
-                        start_evt = {
-                            "type": "audio.start", "turnId": turn_id, "audioId": audio_id,
-                            "sampleRate": sr, "ts": now}
-                        # Latency breakdown up to the FIRST playback (≠ total time):
-                        if anchor:
-                            start_evt["e2eMs"] = int((now - anchor) * 1000)
-                            start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
-                        if t_first["t"] is not None:
-                            start_evt["llmFirstMs"] = int((t_first["t"] - t_llm) * 1000)
-                        if t_tts0["t"] is not None:
-                            start_evt["ttsFirstMs"] = int((now - t_tts0["t"]) * 1000)
-                        await ws.send_json(start_evt)
-                    frame_bytes = max(2, int(sr * (CFG.tts_chunk_ms / 1000.0)) * 2)
-                    for frame in audio_utils.iter_pcm_frames(pcm, frame_bytes):
-                        seq += 1
-                        await ws.send_bytes(audio_utils.wrap_pcm_chunk(turn_id, seq, frame))
+                    if gate is None:
+                        gate = audio_utils.StreamLeadGate(sr)
+                    last_sr = sr
+                    pcm = gate.process(pcm)
+                    if pcm:
+                        await chunk_q.put((pcm, sr))
+                # Never-opened gate: ship the held tail as silence so the
+                # sentence's duration (and thus pause timing) is preserved.
+                if gate is not None and last_sr is not None:
+                    tail = gate.flush()
+                    if tail:
+                        await chunk_q.put((tail, last_sr))
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.exception("turn=%s tts chunk failed", turn_id)
+                LOG.exception("turn=%s tts sentence failed", turn_id)
+            finally:
+                sem.release()
+                await chunk_q.put(None)
+
+        async def _feeder():
+            while True:
+                sentence = await sentence_q.get()
+                if sentence is None:
+                    await order_q.put(None)
+                    return
+                await sem.acquire()
+                chunk_q: asyncio.Queue = asyncio.Queue()
+                task = asyncio.create_task(_synth_to_queue(sentence, chunk_q))
+                synth_tasks.add(task)
+                task.add_done_callback(synth_tasks.discard)
+                await order_q.put(chunk_q)
+
+        feeder_task = asyncio.create_task(_feeder())
+
+        async def _iter_chunks_in_order():
+            while True:
+                chunk_q = await order_q.get()
+                if chunk_q is None:
+                    return
+                while True:
+                    item = await chunk_q.get()
+                    if item is None:
+                        break
+                    yield item
+
+        try:
+            async for pcm, sr in _iter_chunks_in_order():
+                if not pcm:
+                    continue
+                if not started["audio"]:
+                    # Create the encoder BEFORE audio.start so the codec
+                    # announced there is the one actually used (an init
+                    # failure falls back to raw VCT2 for the whole turn).
+                    if want_opus and opus_enc is None:
+                        try:
+                            opus_enc = opus_codec.OpusEncoder(
+                                sr, bitrate=opus_codec.DOWNLINK_BITRATE)
+                        except Exception:
+                            LOG.exception(
+                                "turn=%s opus encoder init failed — "
+                                "falling back to PCM", turn_id)
+                    started["audio"] = True
+                    state.audio_started = True   # reply is audible now
+                    state.client_playing = True
+                    sr_box["sr"] = sr
+                    now = time.time()
+                    start_evt = {
+                        "type": "audio.start", "turnId": turn_id, "audioId": audio_id,
+                        "sampleRate": sr,
+                        "codec": "opus" if opus_enc is not None else "pcm",
+                        "ts": now}
+                    # Latency breakdown up to the FIRST playback (≠ total time):
+                    if anchor:
+                        start_evt["e2eMs"] = int((now - anchor) * 1000)
+                        start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
+                    if t_first["t"] is not None:
+                        start_evt["llmFirstMs"] = int((t_first["t"] - t_llm) * 1000)
+                    if t_tts0["t"] is not None:
+                        start_evt["ttsFirstMs"] = int((now - t_tts0["t"]) * 1000)
+                    await ws.send_json(start_evt)
+                if opus_enc is not None:
+                    for pkt in opus_enc.encode_pcm16(pcm):
+                        opus_batch.append(pkt)
+                        if len(opus_batch) >= batch_packets:
+                            await _ship_batch()
+                    continue
+                frame_bytes = max(2, int(sr * (CFG.tts_chunk_ms / 1000.0)) * 2)
+                for frame in audio_utils.iter_pcm_frames(pcm, frame_bytes):
+                    seq += 1
+                    await ws.send_bytes(audio_utils.wrap_pcm_chunk(turn_id, seq, frame))
+        finally:
+            # Normal end, barge-in cancel or a dead socket: never orphan the
+            # feeder or an in-flight prefetch synthesis.
+            feeder_task.cancel()
+            for t in list(synth_tasks):
+                t.cancel()
+            await asyncio.gather(feeder_task, *synth_tasks, return_exceptions=True)
+        # Stream over: flush the encoder's trailing partial frame and ship the
+        # remaining batch before audio.end is emitted by the caller.
+        if opus_enc is not None:
+            try:
+                opus_batch.extend(opus_enc.flush())
+            except Exception:
+                LOG.exception("turn=%s opus flush failed", turn_id)
+            await _ship_batch()
         return seq
 
     async def _emit_text():
@@ -1046,6 +1166,17 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     wake_gating = bool(CFG and getattr(state, "wake_word_enabled", False))
     speaker_gating = SPEAKER is not None and SPEAKER.active()
 
+    # Speaker verification is local CPU work and independent of the transcript
+    # — run it CONCURRENTLY with the (remote) STT instead of after it. The
+    # result is consumed by the speaker gate below only if the segment survives
+    # the text gates; on the drop paths the thread finishes in the background
+    # and its outcome is discarded (the done-callback consumes any exception).
+    verify_task = None
+    if speaker_gating:
+        verify_task = _spawn_tracked(state, asyncio.to_thread(
+            SPEAKER.verify, pcm_bytes, SAMPLE_RATE, duration_s))
+        verify_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+
     # STT
     try:
         t_stt = time.time()
@@ -1123,7 +1254,8 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         # speech, ~1 s windows of the SAME voice scatter far below the
         # full-segment score (a hard windowed gate rejected everything).
         # Windows only assist below, as a RESCUE for mixed segments.
-        res = await asyncio.to_thread(SPEAKER.verify, pcm_bytes, SAMPLE_RATE, duration_s)
+        # (Started before STT — see verify_task above — so both overlap.)
+        res = await verify_task
         speaker_score = round(res.score, 4)
         matched = res.matched
         # Temporal continuity: the owner was just heard (strict match) —
@@ -1807,6 +1939,11 @@ async def ws_handler(request):
         "streaming": bool(CFG.streaming) if CFG else False,
         "streamInput": bool(CFG.streaming) if CFG else False,
         "sttPartial": bool(CFG.stt_partial) if CFG else False,
+        # Opus capability: opusIn = server decodes an opus mic uplink,
+        # opusOut = server can encode the TTS downlink (client opts in via
+        # settings.audioCodec). Both false when AUDIO_OPUS=0 or libopus is
+        # missing — the client then keeps the raw PCM paths.
+        "audio": {"opusIn": _opus_active(), "opusOut": _opus_active()},
         "wakeWord": {
             "available": True,             # wake mode is always selectable (UI)
             "enabled": bool(CFG.wake_word_enabled) if CFG else False,  # start default
@@ -1974,9 +2111,35 @@ async def ws_handler(request):
                     speech_start_ts = None
                     if isinstance(_sst, (int, float)) and isinstance(_cnow, (int, float)):
                         speech_start_ts = time.time() - (float(_cnow) - float(_sst)) / 1000.0
+                    # Uplink codec: codec:"opus" → binary frames are framed opus
+                    # packets, decoded on arrival to 16 kHz f32 so every
+                    # downstream consumer (partials, speaker gates, owner-watch,
+                    # commit STT) keeps seeing plain PCM. Defense in depth: a
+                    # client should only request opus when hello advertised it;
+                    # if the codec is unusable anyway, the segment is dropped
+                    # (frames discarded, commit becomes a no-op) and the client
+                    # is told via transcript.error so its pending-STT UI clears.
+                    _codec = str(data.get("codec") or "pcm").lower()
+                    _opus_dec = None
+                    if _codec == "opus":
+                        if _opus_active():
+                            try:
+                                _opus_dec = opus_codec.OpusDecoder(SAMPLE_RATE)
+                            except Exception:
+                                LOG.exception("opus decoder init failed")
+                        if _opus_dec is None:
+                            LOG.warning("segment %s requested opus but codec is "
+                                        "unavailable — segment dropped",
+                                        data.get("segmentId"))
+                            await ws.send_json({
+                                "type": "transcript.error",
+                                "segmentId": data.get("segmentId"),
+                                "error": "opus codec unavailable on server",
+                                "ts": time.time()})
                     active_stream = {
                         "id": data.get("segmentId") or _short_id(),
                         "buf": bytearray(),
+                        "codec": _codec, "opus_dec": _opus_dec,
                         "speech_start_ts": speech_start_ts,
                         "barge_in": bool(data.get("bargeIn")),
                         "ptt": bool(data.get("ptt")),
@@ -2152,14 +2315,23 @@ async def ws_handler(request):
                     if "speakerLockEnabled" in data and SPEAKER is not None:
                         # Temporary on/off of the whole voice-lock gate (profile kept).
                         SPEAKER.enabled = bool(data["speakerLockEnabled"])
+                    if "audioCodec" in data:
+                        # Downlink codec request. Only honor "opus" when the
+                        # codec is actually usable — otherwise fall back to raw
+                        # PCM and say so in the ack (the client adapts).
+                        want = str(data.get("audioCodec") or "").lower()
+                        state.audio_codec = ("opus" if want == "opus"
+                                             and _opus_active() else "pcm")
                     # hermesMode from client is ignored (fixed to 'separate').
                     vad_params = vad_params_for_debounce(state.debounce_ms)
-                    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s",
-                             state.speed, state.debounce_ms, state.wake_word_enabled)
+                    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s codec=%s",
+                             state.speed, state.debounce_ms, state.wake_word_enabled,
+                             state.audio_codec)
                     await ws.send_json({
                         "type": "settings.ack", "speed": state.speed,
                         "debounceMs": state.debounce_ms,
                         "wakeWordEnabled": state.wake_word_enabled,
+                        "audioCodec": state.audio_codec,
                         "hermesMode": "separate",
                         "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),
                         "speakerLockEnabled": (SPEAKER.enabled if SPEAKER is not None else None),
@@ -2177,7 +2349,30 @@ async def ws_handler(request):
                     # transcription happens at commit; B2 pushes in partials
                     # (throttled) in between; the voice-lock early barge-in
                     # checks the speaker as soon as enough audio streamed in.
-                    active_stream["buf"].extend(msg.data)
+                    if active_stream.get("opus_dec") is not None:
+                        # Opus uplink: decode packets ON ARRIVAL to 16 kHz f32
+                        # so the buffer stays plain PCM for every consumer.
+                        # Decode errors drop the packet, never the WS loop.
+                        try:
+                            _pkts = audio_utils.parse_opus_uplink_packets(msg.data)
+                        except ValueError as exc:
+                            LOG.warning("malformed opus uplink frame dropped "
+                                        "(%d bytes): %s", len(msg.data), exc)
+                            _pkts = []
+                        for _pkt in _pkts:
+                            try:
+                                active_stream["buf"].extend(
+                                    active_stream["opus_dec"].decode_packet(_pkt))
+                            except Exception as exc:
+                                LOG.warning("opus packet decode failed "
+                                            "(%d bytes): %s — packet dropped",
+                                            len(_pkt), exc)
+                    elif active_stream.get("codec") == "opus":
+                        # Opus requested but no decoder (unsupported race):
+                        # frames are opus packets — unusable, drop them.
+                        continue
+                    else:
+                        active_stream["buf"].extend(msg.data)
                     _maybe_spawn_partial(ws, state, active_stream)
                     _maybe_spawn_speaker_barge(ws, state, active_stream)
                     _maybe_spawn_owner_watch(ws, state, active_stream, peer)

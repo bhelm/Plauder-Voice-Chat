@@ -106,8 +106,9 @@ can't do SSE).
 - **A2** sentence-wise TTS + progressive playback: `_stream_reply_and_tts()` in
   server.py splits the token stream into sentences (`audio.split_stream_sentences`),
   pipelines each through `TTSBackend.synth_stream()`, and ships PCM as **`VCT2`**
-  binary chunks; the client plays them gaplessly via Web Audio. NO_REPLY is detected
-  across deltas before any audio is emitted.
+  binary chunks (or opus-encoded **`VCT3`** chunks when the client negotiated
+  `audioCodec:"opus"` — see the protocol section); the client plays them gaplessly
+  via Web Audio. NO_REPLY is detected across deltas before any audio is emitted.
 - **B1** input streaming: VAD-mode client streams mic frames live
   (`segment.stream.start` → binary frames → `segment.stream.commit`); the server
   buffers and transcribes on commit.
@@ -130,16 +131,45 @@ JSON event frames over WS (`hello`, `transcript`/`transcript.partial`/
 `transcript.ignored`, `turn.pending`/`turn.commit`, `reply`/`reply.delta`,
 `audio.start`/`audio.end`,
 `wake.armed`/`wake.detected`/`wake.window`/`wake.closed`, …) plus
-two binary framings. **Cross-device sync:** all browsers share ONE session
+three binary framings. **Cross-device sync:** all browsers share ONE session
 (`WS_CLIENTS` registry in server.py); committed user inputs and final replies
 are mirrored to the other connections as `chat.remote`, and a `session.reset`
 rotates the persisted Hermes session ID (`.hermes_session_id`, read fresh by
 `_apply_hermes_headers` before every LLM call), cancels the peers' in-flight
 turns and clears their UIs via `session.reset.remote`.
-`VCT1` = full WAV (classic path), `VCT2` = streamed PCM chunk (`audio.py` defines
-both; the client parses them in `static/index.html`). `hello` advertises
-capabilities (`streaming`, `streamInput`, `sttPartial`, `wakeWord`) so the client
-adapts. Adding a server event/flag means handling it in `static/index.html` too.
+`VCT1` = full WAV (classic path), `VCT2` = streamed PCM chunk, `VCT3` = streamed
+opus chunk (`audio.py` defines all three; the client parses them in
+`static/index.html`). `hello` advertises capabilities (`streaming`,
+`streamInput`, `sttPartial`, `wakeWord`, `audio`) so the client adapts. Adding a
+server event/flag means handling it in `static/index.html` too.
+
+**Opus compression (`AUDIO_OPUS`, default on).** `plauder/opus_codec.py` wraps
+opuslib/system-libopus (imported ONLY lazily; when missing, `hello.audio`
+advertises `{opusIn:false, opusOut:false}` and everything stays raw — same
+invariant as the GPU backends). The client feature-detects WebCodecs
+(`AudioEncoder`/`AudioDecoder`, codec `opus`) and uses opus automatically when
+both sides support it (no UI toggle; the negotiated codecs are logged to the
+console). **Uplink** (B1 streamed segments only): `segment.stream.start`
+carries `codec:"opus"`, each binary message holds `0x4F ('O') + u16 BE len +
+packet` records (client-encoded @16 kHz ~24 kbit/s; the preroll goes through
+the same encoder, and the encoder is flushed before the commit JSON — all opus
+start/commit/abort work is serialized on one promise chain so wire order can't
+interleave across segments). The server decodes packets ON ARRIVAL into
+`seg["buf"]` as 16 kHz f32, so partials/speaker gates/owner-watch/commit STT
+keep seeing plain PCM; corrupt packets are logged + dropped. Enrollment and
+PTT/full segments stay raw f32. **Downlink:** the client opts in via
+`settings.audioCodec:"opus"` (echoed in `settings.ack`, stored as
+`TurnState.audio_codec`, re-sent after `hello` once caps are known);
+`_tts_worker` then encodes the TTS PCM (one encoder per turn at the TTS sample
+rate, ~48 kbit/s, flushed at stream end) and ships `VCT3` frames =
+`"VCT3" + idLen + turnId + u16 seq + repeated(u16 len + packet)`, one frame per
+~`tts_chunk_ms`; `audio.start` carries `codec:"opus"|"pcm"`. The client decodes
+via `AudioDecoder` into the existing streamPlayer path (gapless scheduling,
+barge-in stop, replay cache, `playback.done`), gates decoded output on
+`streamPlayer.turnId` at decode-output time and flushes the decoder before
+finalizing on `audio.end`. Defense in depth: an opus `segment.stream.start`
+without a usable server codec is answered with `transcript.error` and the
+segment is dropped.
 
 **Latency stats:** `audio.start` carries the time-to-first-audio breakdown —
 `e2eMs` (last segment received → first audio sent; **includes** the debounce

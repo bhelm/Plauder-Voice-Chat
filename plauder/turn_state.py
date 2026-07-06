@@ -143,6 +143,11 @@ class TurnState:
     # STT/gate latency and the client-side silence overlap the pause window
     # instead of stacking on top of it. 0 = no anchor → full debounce.
     debounce_anchor: float = 0.0
+    # Downlink audio codec negotiated by the client via 'settings'
+    # (audioCodec:"opus"): "opus" = TTS chunks go out opus-encoded as VCT3
+    # frames, "pcm" (default) = raw PCM16 VCT2 frames. Only ever set to "opus"
+    # when the codec module is actually usable (see settings handler).
+    audio_codec: str = "pcm"
     # Combined input text of the turn currently being processed (set by
     # _run_turn for its lifetime). If the owner keeps speaking BEFORE any audio
     # of the reply played, the cancelled turn's input is re-queued into the

@@ -7,6 +7,11 @@
 aiohttp>=3.9,<4
 openai>=1.0,<2
 numpy>=1.24,<3
+# Opus audio compression for the browser link (mic uplink + TTS downlink).
+# Pure-python ctypes binding; needs the SYSTEM libopus (Debian: libopus0).
+# Optional at runtime: when the lib is missing the server silently keeps the
+# raw PCM paths (hello does not advertise opus).
+opuslib>=3.0,<4
 
 
 # Tests

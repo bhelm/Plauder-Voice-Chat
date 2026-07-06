@@ -24,6 +24,23 @@ WAV_FRAME_MAGIC = b"VCT1"
 # AudioBuffers from it and stitches them together gaplessly.
 PCM_CHUNK_MAGIC = b"VCT2"
 
+# Magic header for streamed OPUS chunks (bandwidth-reduced downlink; used when
+# the client negotiated audioCodec=opus via `settings`).
+# Format: 4 bytes "VCT3" + 1 byte ID length + N bytes turn ID (ASCII)
+#         + 2 bytes sequence (big-endian uint16)
+#         + repeated records: 2 bytes packet length (big-endian uint16)
+#                             + raw opus packet.
+# The sample rate + codec come in the audio.start event; the client feeds the
+# packets to a WebCodecs AudioDecoder and schedules the decoded PCM exactly
+# like VCT2 chunks.
+OPUS_CHUNK_MAGIC = b"VCT3"
+
+# Uplink framing for opus mic packets (client → server, streamed B1 segments
+# whose `segment.stream.start` carried codec:"opus"). Each binary WS message
+# holds one or more records: 1 byte marker 0x4F ('O') + 2 bytes packet length
+# (big-endian uint16) + raw opus packet.
+OPUS_UPLINK_MARKER = 0x4F
+
 
 def pcm_bytes_to_float32_array(pcm_bytes: bytes) -> np.ndarray:
     """Raw float32 PCM bytes (as from the browser) → numpy array.
@@ -162,6 +179,126 @@ def wrap_pcm_chunk(turn_id: str, seq: int, pcm_bytes: bytes) -> bytes:
     seq16 = max(0, min(0xFFFF, int(seq)))
     header = PCM_CHUNK_MAGIC + bytes([len(tid)]) + tid + bytes([(seq16 >> 8) & 0xFF, seq16 & 0xFF])
     return header + pcm_bytes
+
+
+def wrap_opus_chunk(turn_id: str, seq: int, packets) -> bytes:
+    """Packs one or more opus packets into a VCT3 streaming frame (see
+    OPUS_CHUNK_MAGIC). ``seq`` is the consecutive chunk number (from 1)."""
+    tid = turn_id.encode("ascii", errors="replace")[:255]
+    seq16 = max(0, min(0xFFFF, int(seq)))
+    out = bytearray(OPUS_CHUNK_MAGIC)
+    out.append(len(tid))
+    out.extend(tid)
+    out.extend(((seq16 >> 8) & 0xFF, seq16 & 0xFF))
+    for pkt in packets:
+        if not pkt:
+            continue
+        if len(pkt) > 0xFFFF:
+            raise ValueError(f"opus packet too large ({len(pkt)} bytes)")
+        out.extend(((len(pkt) >> 8) & 0xFF, len(pkt) & 0xFF))
+        out.extend(pkt)
+    return bytes(out)
+
+
+def parse_opus_chunk(data: bytes):
+    """Inverse of :func:`wrap_opus_chunk` (tests / protocol tooling).
+    Returns ``(turn_id, seq, [packets])`` or ``None`` when the frame does not
+    carry the VCT3 magic. Truncated trailing records are dropped."""
+    if len(data) < 7 or data[:4] != OPUS_CHUNK_MAGIC:
+        return None
+    id_len = data[4]
+    if id_len == 0 or len(data) < 7 + id_len:
+        return None
+    turn_id = data[5:5 + id_len].decode("ascii", errors="replace")
+    seq = (data[5 + id_len] << 8) | data[6 + id_len]
+    packets: list[bytes] = []
+    off = 7 + id_len
+    while off + 2 <= len(data):
+        ln = (data[off] << 8) | data[off + 1]
+        off += 2
+        if off + ln > len(data):
+            break
+        packets.append(bytes(data[off:off + ln]))
+        off += ln
+    return turn_id, seq, packets
+
+
+def parse_opus_uplink_packets(data: bytes) -> list[bytes]:
+    """Parses the client's opus uplink framing (see OPUS_UPLINK_MARKER):
+    one or more ``0x4F + u16 length + packet`` records per WS message.
+    Raises ValueError on malformed framing (caller drops the whole message —
+    partial parses could desync the decoder)."""
+    packets: list[bytes] = []
+    off = 0
+    n = len(data)
+    while off < n:
+        if data[off] != OPUS_UPLINK_MARKER or off + 3 > n:
+            raise ValueError(f"malformed opus uplink frame at offset {off}")
+        ln = (data[off + 1] << 8) | data[off + 2]
+        off += 3
+        if off + ln > n:
+            raise ValueError("truncated opus uplink packet")
+        packets.append(bytes(data[off:off + ln]))
+        off += ln
+    return packets
+
+
+class StreamLeadGate:
+    """Mutes the low-level noise blob some TTS models (OmniVoice) emit at the
+    START of every synthesis, before the actual speech onset.
+
+    Measured on OmniVoice: ~100-200 ms at −50…−80 dBFS around 0.1-0.2 s into
+    EVERY generated clip — with sentence-wise synthesis that blob lands at
+    every sentence seam as a faint audible "hah". The gate replaces everything
+    before the first 10 ms window whose RMS clears ``threshold_db`` with true
+    silence (sample count preserved, so pause lengths don't change) and keeps
+    a small pre-pad so soft speech onsets are not clipped. Streaming-friendly:
+    feed chunks through :meth:`process` as they arrive.
+    """
+
+    def __init__(self, sample_rate: int, *, threshold_db: float = -45.0,
+                 prepad_ms: int = 50, win_ms: int = 10):
+        self._thr = (10.0 ** (threshold_db / 20.0)) * 32767.0   # int16 RMS
+        self._win = max(1, int(sample_rate * win_ms / 1000.0))  # samples
+        self._prepad = int(sample_rate * prepad_ms / 1000.0) * 2  # bytes
+        self.opened = False
+        self._held = bytearray()
+
+    def process(self, pcm16: bytes) -> bytes:
+        """Returns the (possibly muted) PCM to ship for this chunk. While the
+        gate is closed, audio older than the pre-pad is emitted as silence;
+        once the onset is found, the pre-pad before it passes unmuted."""
+        if self.opened:
+            return pcm16
+        self._held.extend(pcm16)
+        arr = np.frombuffer(bytes(self._held), dtype=np.int16)
+        nwin = arr.shape[0] // self._win
+        onset = None
+        if nwin:
+            w = arr[: nwin * self._win].astype(np.float32).reshape(nwin, self._win)
+            rms = np.sqrt((w * w).mean(axis=1))
+            hits = np.nonzero(rms >= self._thr)[0]
+            if hits.size:
+                onset = int(hits[0]) * self._win * 2   # byte offset
+        if onset is None:
+            emit = max(0, len(self._held) - self._prepad)
+            emit -= emit % 2
+            if emit:
+                del self._held[:emit]
+                return b"\x00" * emit
+            return b""
+        self.opened = True
+        cut = max(0, onset - self._prepad)
+        out = b"\x00" * cut + bytes(self._held[cut:])
+        self._held.clear()
+        return out
+
+    def flush(self) -> bytes:
+        """End of the stream: whatever is still held never crossed the
+        threshold — ship it as silence (duration preserved)."""
+        n = len(self._held)
+        self._held.clear()
+        return b"" if self.opened else b"\x00" * n
 
 
 def iter_pcm_frames(pcm_bytes: bytes, frame_bytes: int):
