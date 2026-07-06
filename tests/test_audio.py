@@ -141,3 +141,18 @@ def test_crop_f32_spans_merges_overlaps():
     out = np.frombuffer(crop_f32_spans(seg.tobytes(), 1, [(4.0, 8.0), (0.0, 5.0)]),
                         dtype=np.float32)
     assert out.tolist() == list(range(8))   # sorted + merged, no duplication
+
+
+def test_split_stream_force_cut_prefers_clause_boundary():
+    buf = ("Das ist ein sehr langer Satz ohne Punkt, aber mit einem Komma "
+           "und dann geht es immer weiter ohne jede Pause")
+    sents, rest = audio.split_stream_sentences(buf, 60)
+    assert sents[0].endswith(",")            # cut at the clause boundary
+    assert sents[1].startswith("aber")       # nothing lost across the cut
+
+
+def test_split_stream_force_cut_word_boundary_without_clause():
+    buf = "wort " * 30                        # no punctuation at all
+    sents, rest = audio.split_stream_sentences(buf.strip(), 30)
+    assert sents                              # still force-flushed
+    assert all(len(s) <= 30 for s in sents)

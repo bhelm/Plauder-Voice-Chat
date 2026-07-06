@@ -457,6 +457,9 @@
       align-self: flex-end;
       background: var(--bubble-user);
       border-bottom-right-radius: 4px;
+      /* Server-merged text may carry paragraph breaks (coalesced barge-in
+         turns, multi-part text sends) — render them instead of collapsing. */
+      white-space: pre-line;
     }
     .bubble.agent {
       align-self: flex-start;
@@ -529,6 +532,11 @@
       color: var(--err); opacity: .75;
       text-decoration: line-through; text-decoration-thickness: 1px;
     }
+    /* Paragraph break between the carried-over text of a coalesced (barge-in)
+       turn and the continued speech — a real paragraph gap (≈ blank line),
+       not just a line break. */
+    .bubble .vtext .vpara { display: block; height: 1.2em; }
+    .bubble .vtext .vpara:last-child { display: none; }
     .bubble.wake-armed { color: var(--ok); }
     .bubble.silent { opacity: 0.65; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.18); }
     .bubble.discarded {
@@ -2066,7 +2074,11 @@
         el = addBubble('user pending collecting', '…', t('turn.meta', { id: turnId.substr(0,4) }));
         turnUserBubble.set(turnId, el);
         if (_coalesceCarry && _coalesceCarry.length) {
-          turnVoiceHtml.set(turnId, _coalesceCarry.concat(turnVoiceHtml.get(turnId) || []));
+          // Continuation after a barge-in: the carried-over text becomes its
+          // own paragraph; the .vpara marker separates it from what the user
+          // says next (hidden via CSS if nothing follows).
+          turnVoiceHtml.set(turnId, _coalesceCarry.concat(
+            ['<span class="vpara"></span>'], turnVoiceHtml.get(turnId) || []));
           _coalesceCarry = null;
         }
       }
@@ -2248,12 +2260,14 @@
       md.innerHTML = renderMarkdown(text);
     }
     function finalizeAgentBubble(turnId, text, llmMs) {
+      if (discardedTurns.has(turnId)) return;
       const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
       el.classList.remove('pending');
       setAgentBubbleMd(el, text);
       setMeta(el, t('meta.llm', { ms: llmMs }));
     }
     function finalizeSilentAgentBubble(turnId, reason, llmMs) {
+      if (discardedTurns.has(turnId)) return;
       const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
       el.classList.remove('pending');
       el.classList.add('silent');
@@ -2270,7 +2284,18 @@
     }
     // Live reply text (A1): deltas are rendered continuously into the bubble.
     const turnReplyText = new Map();   // turnId -> reply text so far
+    // Turns discarded by the server: late reply.delta/reply frames for them
+    // must not resurrect a bubble via the addPendingAgentBubble fallback.
+    const discardedTurns = new Set();
+    function markTurnDiscarded(turnId) {
+      discardedTurns.add(turnId);
+      turnReplyText.delete(turnId);
+      if (discardedTurns.size > 200) {
+        discardedTurns.delete(discardedTurns.values().next().value);
+      }
+    }
     function appendAgentBubbleDelta(turnId, delta) {
+      if (discardedTurns.has(turnId)) return;
       const el = turnAgentBubble.get(turnId) || addPendingAgentBubble(turnId);
       const acc = (turnReplyText.get(turnId) || '') + (delta || '');
       turnReplyText.set(turnId, acc);
@@ -2402,7 +2427,9 @@
       streamPlayer = {
         turnId, audioId, sampleRate: sampleRate || 24000,
         nextTime: 0, sources: new Set(), ended: false, donePending: true,
+        lead: 0.04,   // scheduling lead-in; grows after underruns (jitter buffer)
         chunks: [],   // collect PCM for the replay cache
+        cachedSamples: 0,
       };
       currentTurnId = turnId;
       currentAudioId = audioId;
@@ -2413,7 +2440,13 @@
     function pushStreamChunk(turnId, int16) {
       if (!streamPlayer || streamPlayer.turnId !== turnId) return;
       if (!int16 || !int16.length) return;
-      if (streamPlayer.chunks) streamPlayer.chunks.push(int16);   // for the replay cache
+      if (streamPlayer.chunks) {   // for the replay cache — capped (long replies)
+        streamPlayer.chunks.push(int16);
+        streamPlayer.cachedSamples += int16.length;
+        if (streamPlayer.cachedSamples > streamPlayer.sampleRate * 300) {
+          streamPlayer.chunks = null;   // >5 min: skip caching, free the PCM
+        }
+      }
       const ctx = ensurePlaybackCtx();
       const f32 = new Float32Array(int16.length);
       for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
@@ -2423,8 +2456,15 @@
       node.buffer = buf;
       node.connect(playbackGain);
       const now = ctx.currentTime;
-      // Small lead-in on the first chunk so nothing gets swallowed.
-      if (streamPlayer.nextTime < now) streamPlayer.nextTime = now + 0.04;
+      // Lead-in on the first chunk so nothing gets swallowed; after a real
+      // underrun (a chunk arrived after its slot passed) grow the lead so a
+      // jittery link converges on a stable buffer instead of gapping forever.
+      if (streamPlayer.nextTime < now) {
+        if (streamPlayer.nextTime > 0) {
+          streamPlayer.lead = Math.min(0.25, streamPlayer.lead * 2);
+        }
+        streamPlayer.nextTime = now + streamPlayer.lead;
+      }
       const startAt = streamPlayer.nextTime;
       node.start(startAt);
       streamPlayer.nextTime = startAt + buf.duration;
@@ -3225,18 +3265,36 @@
           break;
         case 'turn.discarded':
           if (m.coalesced) {
-            // Coalesced: the owner kept speaking before any audio played — the
-            // turn continues in the NEXT bubble. Merge VISUALLY: carry the
-            // colored voice HTML over and drop the old bubbles entirely.
-            _coalesceCarry = (turnVoiceHtml.get(m.turnId) || []).slice();
-            const ub = turnUserBubble.get(m.turnId);
-            if (ub) { ub.remove(); turnUserBubble.delete(m.turnId); }
-            turnVoiceHtml.delete(m.turnId);
+            if (m.requeued === false) {
+              // The backend (Hermes) keeps the interrupted turn's user message
+              // as its OWN entry — mirror that: the committed bubble STAYS as
+              // its own message (incl. its speaker chips), exactly like a
+              // reload restores it. The follow-up speech gets a fresh bubble.
+              const ub = turnUserBubble.get(m.turnId);
+              if (ub) {
+                // Drop any partial suffix of the FOLLOW-UP speech that was
+                // rendered into this bubble while the old turn was in flight.
+                setBubbleText(ub, m.turnId, m.coalescedText || '');
+                ub.classList.remove('pending', 'collecting', 'partial');
+                setMeta(ub, t('turn.meta', { id: m.turnId.substr(0,4) }));
+                turnUserBubble.delete(m.turnId);   // freeze: next turn = new bubble
+              }
+              turnVoiceHtml.delete(m.turnId);
+            } else {
+              // Re-queued server-side: the text rides back inside the NEXT
+              // turn.pending → merge VISUALLY (carry the colored voice HTML
+              // over as its own paragraph) and drop the old bubble.
+              _coalesceCarry = (turnVoiceHtml.get(m.turnId) || []).slice();
+              const ub = turnUserBubble.get(m.turnId);
+              if (ub) { ub.remove(); turnUserBubble.delete(m.turnId); }
+              turnVoiceHtml.delete(m.turnId);
+            }
             const ab = turnAgentBubble.get(m.turnId);
             if (ab) { ab.remove(); turnAgentBubble.delete(m.turnId); }
           } else {
             discardTurn(m.turnId);
           }
+          markTurnDiscarded(m.turnId);
           turnPendingText.delete(m.turnId);
           // Also stop the audio of the discarded turn if it is currently playing.
           stopAudioForTurn(m.turnId);
@@ -3253,20 +3311,21 @@
               // For mixed: the voice text was merged into m.text by the server.
               // Re-set the bubble text so the voice part is visible.
               if (m.source === 'mixed' && m.text) {
+                const commitText = m.text;
                 const vbox = el.querySelector(':scope > .vtext');
                 if (vbox) {
                   // Bubble was rendered with colored voice HTML → replace it
                   // with the server-merged plain text (typed part included).
                   turnVoiceHtml.delete(m.turnId);
-                  vbox.textContent = m.text;
+                  vbox.textContent = commitText;
                 } else {
                   // Find the text node (last text node) and replace it
                   let txtNode = null;
                   for (const n of el.childNodes) {
                     if (n.nodeType === Node.TEXT_NODE) txtNode = n;
                   }
-                  if (txtNode) txtNode.nodeValue = m.text;
-                  else el.appendChild(document.createTextNode(m.text));
+                  if (txtNode) txtNode.nodeValue = commitText;
+                  else el.appendChild(document.createTextNode(commitText));
                 }
               }
               const tag = m.source === 'mixed' ? t('source.voice_text') : t('source.text');
@@ -3482,6 +3541,7 @@
       segPartialText.clear();
       turnPendingText.clear();
       turnReplyText.clear();   // sonst belebt ein spätes reply.delta eine Bubble im geleerten Chat
+      discardedTurns.clear();
       _coalesceCarry = null;
       _lastSegFeed = null; _lastIgnoredBubble = null;
       turnAgentBubble.clear();
@@ -3610,24 +3670,39 @@
        almost immediately. A ring buffer provides ~300 ms of lead-in before speech start. */
     let inputTapNode = null;
     let inputTapSink = null;
+    let inputDs16k = null;            // stateful resampler of the mic session
     let inputPreRoll = [];            // ring buffer (Float32Array @16k)
     let inputStreaming = false;       // true between stream.start and commit
     let vadStreamSegId = null;        // Segment-ID des aktuell gestreamten Segments
     const INPUT_PREROLL_SAMPLES = 16000 * 0.3;
 
-    function downsampleTo16k(float32, inRate) {
-      if (!inRate || inRate === 16000) return new Float32Array(float32);
-      const ratio = inRate / 16000;
-      const outLen = Math.max(1, Math.floor(float32.length / ratio));
-      const out = new Float32Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const idx = i * ratio;
-        const lo = Math.floor(idx);
-        const hi = Math.min(lo + 1, float32.length - 1);
-        const frac = idx - lo;
-        out[i] = float32[lo] * (1 - frac) + float32[hi] * frac;
-      }
-      return out;
+    // Continuous-phase linear resampler to 16 kHz. Stateful (one instance per
+    // capture session): carries the fractional read position and the previous
+    // buffer's last sample across calls. A stateless per-buffer loop resets
+    // the phase every ScriptProcessor buffer (~43 ms), silently dropping ~2
+    // input samples per buffer and creating a discontinuity at every seam —
+    // periodic clicks that degrade STT.
+    function makeDownsampler16k() {
+      let phase = 0, last = 0;
+      return function (float32, inRate) {
+        if (!inRate || inRate === 16000) return new Float32Array(float32);
+        if (!float32.length) return new Float32Array(0);
+        const ratio = inRate / 16000;
+        let t = phase;
+        const out = new Float32Array(Math.ceil((float32.length - t) / ratio) + 1);
+        let n = 0;
+        for (;;) {
+          const lo = Math.floor(t);
+          if (lo + 1 >= float32.length) break;
+          const frac = t - lo;
+          const s0 = lo >= 0 ? float32[lo] : last;
+          out[n++] = s0 * (1 - frac) + float32[lo + 1] * frac;
+          t += ratio;
+        }
+        phase = t - float32.length;
+        last = float32[float32.length - 1];
+        return out.subarray(0, n);
+      };
     }
 
     function streamInputActive() {
@@ -3751,12 +3826,13 @@
         // B1: tap for input streaming (ring buffer + live frames).
         inputPreRoll = [];
         inputStreaming = false;
+        inputDs16k = makeDownsampler16k();
         try {
           const tap = audioCtx.createScriptProcessor(2048, 1, 1);
           tap.onaudioprocess = (ev) => {
             if (enrolling) return;   // enrollment owns the binary channel
             const ch = ev.inputBuffer.getChannelData(0);
-            const ds = downsampleTo16k(ch, audioCtx.sampleRate);
+            const ds = inputDs16k(ch, audioCtx.sampleRate);
             // Maintain the ring buffer (always).
             inputPreRoll.push(ds);
             let total = 0;
@@ -4064,6 +4140,7 @@
         tap = ctx.createScriptProcessor(2048, 1, 1);
         ws.send(JSON.stringify({ type: 'speaker.enroll.start' }));
         const target = 16000 * ENROLL_SECONDS;
+        const ds16k = makeDownsampler16k();
         let sent = 0;
         await new Promise((resolve, reject) => {
           // Ohne Timeout hinge die Aufnahme für immer, wenn der
@@ -4075,7 +4152,7 @@
             ENROLL_SECONDS * 1000 + 8000);
           tap.onaudioprocess = (ev) => {
             if (sent >= target) return;
-            const ds = downsampleTo16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
+            const ds = ds16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
             try { ws.send(f32ToBytes(ds)); } catch (_) {}
             sent += ds.length;
             const pct = Math.min(100, Math.round((sent / target) * 100));

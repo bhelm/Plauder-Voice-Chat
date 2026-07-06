@@ -95,6 +95,10 @@ class TurnState:
     """Holds the current turn of a connection (voice + text + images)."""
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     pending_texts: list = field(default_factory=list)
+    # Input carried over from a coalesced (barged-in) turn. Kept SEPARATE from
+    # pending_texts so it joins the next turn as its own PARAGRAPH ("\n\n")
+    # instead of being sentence-glued into the new speech by merge_transcripts.
+    pending_resume: str = ""
     pending_segment_ids: list = field(default_factory=list)
     pending_text_parts: list = field(default_factory=list)
     pending_image_urls: list = field(default_factory=list)
@@ -133,6 +137,12 @@ class TurnState:
     # contributing to the turn arrived at the server ("user is done speaking").
     # The time until the first playback is measured against this point.
     speech_end_ts: float = 0.0
+    # Debounce anchor: estimated wall-clock moment the user actually stopped
+    # speaking (segment arrival minus the VAD redemption silence the client
+    # already held before committing). The debounce timer counts from HERE, so
+    # STT/gate latency and the client-side silence overlap the pause window
+    # instead of stacking on top of it. 0 = no anchor → full debounce.
+    debounce_anchor: float = 0.0
     # Combined input text of the turn currently being processed (set by
     # _run_turn for its lifetime). If the owner keeps speaking BEFORE any audio
     # of the reply played, the cancelled turn's input is re-queued into the
@@ -164,7 +174,8 @@ class TurnState:
     hermes_session_id_separate: str = field(default_factory=current_hermes_session_id)
 
     def has_pending(self) -> bool:
-        return bool(self.pending_texts or self.pending_text_parts or self.pending_image_urls)
+        return bool(self.pending_resume or self.pending_texts
+                    or self.pending_text_parts or self.pending_image_urls)
 
     def reset(self) -> None:
         """Begin a new turn (after a successful agent call).
@@ -174,8 +185,10 @@ class TurnState:
         debounce_ms and session_user (they apply across turns).
         """
         self.turn_id = uuid.uuid4().hex[:8]
+        self.pending_resume = ""
         self.pending_texts.clear()
         self.pending_segment_ids.clear()
         self.pending_text_parts.clear()
         self.pending_image_urls.clear()
         self.speech_end_ts = 0.0
+        self.debounce_anchor = 0.0

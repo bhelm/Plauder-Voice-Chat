@@ -270,8 +270,12 @@ async def healthz(_request):
 # ============================================================================ #
 # Turn orchestration
 # ============================================================================ #
-def _combine_user_input(voice_merged: str, text_parts: list) -> str:
+def _combine_user_input(voice_merged: str, text_parts: list, resume: str = "") -> str:
     parts: list = []
+    if resume and resume.strip():
+        # Carried-over input of a coalesced (barged-in) turn: its own
+        # paragraph, not sentence-glued into the continued speech.
+        parts.append(resume.strip())
     if voice_merged and voice_merged.strip():
         parts.append(voice_merged.strip())
     for tp in text_parts:
@@ -312,7 +316,8 @@ async def _agent_chat_with_retry(combined: str, *, image_urls, allow_retry: bool
 
 async def _send_turn_pending(ws, state: TurnState):
     voice_merged = sanitizer.merge_transcripts(state.pending_texts)
-    combined = _combine_user_input(voice_merged, state.pending_text_parts)
+    combined = _combine_user_input(voice_merged, state.pending_text_parts,
+                                   resume=state.pending_resume)
     await ws.send_json({
         "type": "turn.pending",
         "turnId": state.turn_id,
@@ -334,7 +339,8 @@ async def _run_turn(ws, state: TurnState):
     segment_ids = list(state.pending_segment_ids)
     text_parts = list(state.pending_text_parts)
     image_urls = list(state.pending_image_urls)
-    combined = _combine_user_input(voice_merged, text_parts)
+    combined = _combine_user_input(voice_merged, text_parts,
+                                   resume=state.pending_resume)
     LOG.info("turn=%s commit: voice_segs=%d text_sends=%d imgs=%d combined=%r",
              turn_id, len(state.pending_texts), len(text_parts), len(image_urls), combined[:200])
 
@@ -344,8 +350,11 @@ async def _run_turn(ws, state: TurnState):
     if BRIDGE:
         BRIDGE.begin_local_call()
     try:
+        # A carried-over resume counts as voice for the source classification
+        # (it originated from speech; _run_turn_inner only uses it for that).
         await _run_turn_inner(ws, state, turn_id, combined=combined,
-                              voice_merged=voice_merged, text_parts=text_parts,
+                              voice_merged=voice_merged or state.pending_resume,
+                              text_parts=text_parts,
                               image_urls=image_urls, segment_ids=segment_ids)
     finally:
         state.inflight_combined = None
@@ -538,6 +547,13 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
     """
     pron = CFG.pronunciations_file if CFG else None
     max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
+    # The FIRST sentence gates time-to-first-audio: force-flush it earlier so a
+    # long punctuation-free opener doesn't stall TTS for tens of tokens.
+    first_max = CFG.tts_first_chunk_chars if CFG else 100
+    if first_max <= 0:
+        first_max = max_chars
+    first_max = min(first_max, max_chars)
+    got_sentence = {"v": False}
     audio_id = f"audio-{turn_id}"
     sentence_q: asyncio.Queue = asyncio.Queue()
 
@@ -635,8 +651,10 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             parts.append(delta)
             await _emit_text()
             pending += delta
-            sents, pending = audio_utils.split_stream_sentences(pending, max_chars)
+            sents, pending = audio_utils.split_stream_sentences(
+                pending, max_chars if got_sentence["v"] else first_max)
             if sents:
+                got_sentence["v"] = True
                 held.extend(sents)
                 await _release()
 
@@ -788,9 +806,21 @@ def _cancel_connection_tasks(state: TurnState) -> None:
             task.cancel()
 
 
+# Minimum debounce sleep even when the pause window is already used up by
+# STT/gate latency — leaves one tick for turn.pending to render and for a
+# same-instant second segment to coalesce.
+DEBOUNCE_MIN_WAIT_S = 0.05
+
+
 async def _debounce_then_run(ws, state: TurnState):
     try:
-        await asyncio.sleep(state.debounce_ms / 1000.0)
+        # Count the pause from the moment the user stopped speaking (anchor),
+        # not from when STT + gates finished: their latency already consumed
+        # part of the debounce window.
+        delay = state.debounce_ms / 1000.0
+        if state.debounce_anchor:
+            delay -= time.time() - state.debounce_anchor
+        await asyncio.sleep(max(DEBOUNCE_MIN_WAIT_S, delay))
     except asyncio.CancelledError:
         return
     turn_id_at_start = state.turn_id
@@ -846,16 +876,22 @@ async def _coalesce_cancel(state: TurnState, ws):
     not keep server-side history."""
     resume = _capture_coalesce(state)
     resume_imgs = _capture_coalesce_images(state)
-    await _cancel_in_flight(state, ws, coalesced=bool(resume))
-    if resume and not _hermes_keeps_history():
-        state.pending_texts.insert(0, resume)
+    requeue = bool(resume) and not _hermes_keeps_history()
+    await _cancel_in_flight(state, ws, coalesced=bool(resume),
+                            coalesced_text=resume, requeued=requeue)
+    if requeue:
+        # As its own paragraph, not merged into the continued speech
+        # (see _combine_user_input / TurnState.pending_resume).
+        state.pending_resume = resume
         if resume_imgs:
             state.pending_image_urls[:0] = resume_imgs
         LOG.info("turn coalesced: re-queued %r (+%d imgs)",
                  resume[:60], len(resume_imgs))
 
 
-async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False):
+async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False,
+                            coalesced_text: str | None = None,
+                            requeued: bool = False):
     # A cancellation ends the running reply → any "do-not-reopen-window" flag
     # that may have been set is thereby moot.
     state.wake_suppress_reopen = False
@@ -875,9 +911,17 @@ async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False):
             tasks_to_await.append(tt)
             cancelled = True
     if cancelled:
-        await ws.send_json({"type": "turn.discarded", "turnId": state.turn_id,
-                            "reason": "new-speech-detected",
-                            "coalesced": coalesced, "ts": time.time()})
+        evt = {"type": "turn.discarded", "turnId": state.turn_id,
+               "reason": "new-speech-detected",
+               "coalesced": coalesced, "ts": time.time()}
+        if coalesced:
+            # requeued=True → the text rides back into the next turn.pending
+            # server-side; False (Hermes keeps history) → the CLIENT must carry
+            # the old text visually, coalescedText is its source.
+            evt["requeued"] = requeued
+            if coalesced_text:
+                evt["coalescedText"] = coalesced_text
+        await ws.send_json(evt)
     if tasks_to_await:
         await asyncio.gather(*tasks_to_await, return_exceptions=True)
     if state.audio_ids:
@@ -1293,6 +1337,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             # "Stop" also discards whatever was composed but not yet
             # dispatched — otherwise it silently rides into the NEXT accepted
             # turn minutes later.
+            state.pending_resume = ""
             state.pending_texts.clear()
             state.pending_segment_ids.clear()
             state.pending_text_parts.clear()
@@ -1354,6 +1399,15 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     # E2E anchor: receive time of this (last) segment. With coalescing the
     # respective last segment wins → measurement from "user last spoke".
     state.speech_end_ts = t0
+    # Debounce anchor: a VAD-committed segment arrives only AFTER the client
+    # held ~0.8×debounce of silence (redemption) — credit that silence so the
+    # total pause before dispatch stays ≈ debounce_ms instead of ~1.8× it.
+    # PTT commits are a deliberate button release → no silence to credit.
+    redemption_s = 0.0
+    if not ptt:
+        vp = vad_params_for_debounce(state.debounce_ms)
+        redemption_s = vp["redemptionFrames"] * vp["frameMs"] / 1000.0
+    state.debounce_anchor = t0 - redemption_s
     await _send_turn_pending(ws, state)
     # (Re)arm the debounce. Two segments can be in STT concurrently — both
     # would arm a timer and the SAME pending input would dispatch twice.
@@ -2019,6 +2073,7 @@ async def ws_handler(request):
                     state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
                 elif t == "session.reset":
                     await _cancel_in_flight(state, ws)
+                    state.pending_resume = ""
                     state.pending_texts.clear()
                     state.pending_segment_ids.clear()
                     # Typed text / attached images composed before the reset

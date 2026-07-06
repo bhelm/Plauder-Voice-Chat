@@ -8,6 +8,7 @@ first-audio latency) is implemented here.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import numpy as np
 
@@ -128,3 +129,65 @@ class OpenAITTSBackend(TTSBackend):
         async with self._lock:
             pcm = await asyncio.to_thread(self._synth_sync, text, speed)
         return pcm, self.sample_rate
+
+    # ~120 ms of PCM per streamed chunk — small enough for fast first audio,
+    # large enough to keep the WS frame count sane.
+    _STREAM_CHUNK_S = 0.12
+
+    async def synth_stream(self, text: str, *, speed: float = 1.0):
+        """True chunked streaming: PCM is yielded while the server is still
+        synthesizing (OpenAI-compatible servers like Kokoro-FastAPI stream the
+        response body). Falls back to the buffered ``synth`` when local time
+        stretching is on (needs the complete clip) or the SDK lacks streaming.
+        """
+        if self._client is None:
+            raise RuntimeError("TTS not initialized (load() did not run)")
+        streaming_api = getattr(self._client.audio.speech, "with_streaming_response", None)
+        if self.local_speed or streaming_api is None:
+            pcm, sr = await self.synth(text, speed=speed)
+            if pcm:
+                yield pcm, sr
+            return
+
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
+        chunk_bytes = max(2, int(self.sample_rate * self._STREAM_CHUNK_S) * 2)
+        api_speed = self._clamp_speed(speed)
+
+        def _produce():
+            try:
+                with streaming_api.create(
+                        model=self.model, voice=self.voice, input=text,
+                        response_format="pcm", speed=api_speed) as resp:
+                    carry = b""  # keep 16-bit sample alignment across chunks
+                    for chunk in resp.iter_bytes(chunk_size=chunk_bytes):
+                        if stop.is_set():
+                            return
+                        data = carry + chunk
+                        keep = len(data) - (len(data) % 2)
+                        carry = data[keep:]
+                        if keep:
+                            loop.call_soon_threadsafe(q.put_nowait, ("pcm", data[:keep]))
+                    if carry and not stop.is_set():
+                        loop.call_soon_threadsafe(q.put_nowait, ("pcm", carry + b"\x00"))
+            except Exception as exc:  # surfaced in the async generator below
+                if not stop.is_set():
+                    loop.call_soon_threadsafe(q.put_nowait, ("err", exc))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, ("end", None))
+
+        producer = asyncio.to_thread(_produce)
+        producer_task = asyncio.ensure_future(producer)
+        try:
+            while True:
+                kind, payload = await q.get()
+                if kind == "pcm":
+                    yield payload, self.sample_rate
+                elif kind == "err":
+                    raise payload
+                else:
+                    break
+        finally:
+            stop.set()
+            await asyncio.gather(producer_task, return_exceptions=True)

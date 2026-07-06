@@ -297,7 +297,15 @@ def split_stream_sentences(buffer: str, max_chars: int) -> tuple[list[str], str]
                 buf = buf[nxt.end():]
                 continue
         if len(buf) > max_chars > 0:
-            cut = buf.rfind(" ", 0, max_chars)
+            # Prefer a clause boundary (comma/semicolon/colon) for the forced
+            # cut — speakers pause there, so the TTS seam is inaudible. Only
+            # fall back to a bare word boundary when no clause mark exists in
+            # a useful position.
+            cut = -1
+            for m2 in re.finditer(r"[,;:]\s", buf[:max_chars + 1]):
+                cut = m2.end()
+            if cut < max(8, max_chars // 4):
+                cut = buf.rfind(" ", 0, max_chars)
             if cut <= 0:
                 cut = max_chars
             head = buf[:cut].strip()

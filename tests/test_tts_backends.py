@@ -122,3 +122,60 @@ def test_omnivoice_synth_with_mock_engine():
     pcm, sr = asyncio.run(eng.synth("Hallo", speed=1.0))
     assert sr == 24000
     assert len(pcm) == 6  # 3 int16
+
+
+# --- synth_stream (true chunked streaming) ----------------------------------
+class _FakeStreamResp:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_bytes(self, chunk_size):
+        yield from self._chunks
+
+
+def _collect_stream(eng, text="Hallo"):
+    async def run():
+        return [c async for c in eng.synth_stream(text, speed=1.0)]
+    return asyncio.run(run())
+
+
+def test_synth_stream_yields_chunks_and_keeps_alignment():
+    eng, client = _openai_with_mock([0])
+    stream_api = MagicMock()
+    stream_api.create.return_value = _FakeStreamResp([b"\x01\x02\x03", b"\x04"])
+    client.audio.speech.with_streaming_response = stream_api
+    chunks = _collect_stream(eng)
+    assert all(len(pcm) % 2 == 0 for pcm, _ in chunks)   # 16-bit alignment
+    assert b"".join(pcm for pcm, _ in chunks) == b"\x01\x02\x03\x04"
+    assert all(sr == eng.sample_rate for _, sr in chunks)
+    # The buffered synth path was NOT used.
+    client.audio.speech.create.assert_not_called()
+
+
+def test_synth_stream_falls_back_to_synth_with_local_speed():
+    eng, client = _openai_with_mock([0, 16384])
+    eng.local_speed = True
+    chunks = _collect_stream(eng)
+    assert len(chunks) == 1                              # one buffered chunk
+    client.audio.speech.create.assert_called_once()
+
+
+def test_synth_stream_propagates_upstream_error():
+    eng, client = _openai_with_mock([0])
+
+    class _Boom(_FakeStreamResp):
+        def iter_bytes(self, chunk_size):
+            raise RuntimeError("kaputt")
+            yield b""  # pragma: no cover
+
+    stream_api = MagicMock()
+    stream_api.create.return_value = _Boom([])
+    client.audio.speech.with_streaming_response = stream_api
+    with pytest.raises(RuntimeError, match="kaputt"):
+        _collect_stream(eng)

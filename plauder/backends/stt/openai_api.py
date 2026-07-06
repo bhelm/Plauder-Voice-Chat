@@ -24,7 +24,6 @@ class OpenAISTTBackend(STTBackend):
         self.language = language
         self.base_url = base_url
         self._client = None
-        self._lock = asyncio.Lock()
         self.last_no_speech_prob = None
 
     @classmethod
@@ -76,5 +75,7 @@ class OpenAISTTBackend(STTBackend):
     async def transcribe(self, audio_pcm: bytes, sample_rate: int) -> str:
         if self._client is None:
             raise RuntimeError("STT not initialized (load() did not run)")
-        async with self._lock:
-            return await asyncio.to_thread(self._transcribe_sync, audio_pcm, sample_rate)
+        # No lock: the SDK's httpx client is thread-safe and pools connections.
+        # Serializing here made the FINAL transcript (which gates the whole
+        # turn) wait behind an in-flight B2 partial of the same segment.
+        return await asyncio.to_thread(self._transcribe_sync, audio_pcm, sample_rate)

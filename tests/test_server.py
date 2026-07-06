@@ -584,3 +584,54 @@ def test_ws_cross_device_sync():
             await b.close()
 
     asyncio.run(run())
+
+
+# --- Debounce anchored at speech end -----------------------------------------
+def test_debounce_anchor_shortens_wait(monkeypatch):
+    """STT/gate latency already consumed the pause window → the debounce timer
+    only sleeps the remainder (floored), not the full debounce again."""
+    import time
+
+    async def run():
+        state = srv.TurnState()
+        state.debounce_ms = 500
+        state.debounce_anchor = time.time() - 10.0   # window long since over
+        ran = asyncio.Event()
+
+        async def fake_run_turn(ws, st):
+            ran.set()
+
+        monkeypatch.setattr(srv, "_run_turn", fake_run_turn)
+        t0 = time.time()
+        await srv._debounce_then_run(None, state)
+        assert ran.is_set()
+        assert time.time() - t0 < 0.3               # far below the 500 ms debounce
+
+    asyncio.run(run())
+
+
+def test_debounce_without_anchor_waits_full_window(monkeypatch):
+    import time
+
+    async def run():
+        state = srv.TurnState()
+        state.debounce_ms = 200                      # no anchor → full window
+        ran = asyncio.Event()
+
+        async def fake_run_turn(ws, st):
+            ran.set()
+
+        monkeypatch.setattr(srv, "_run_turn", fake_run_turn)
+        t0 = time.time()
+        await srv._debounce_then_run(None, state)
+        assert ran.is_set()
+        assert time.time() - t0 >= 0.18
+
+    asyncio.run(run())
+
+
+def test_turn_state_reset_clears_debounce_anchor():
+    state = srv.TurnState()
+    state.debounce_anchor = 123.0
+    state.reset()
+    assert state.debounce_anchor == 0.0

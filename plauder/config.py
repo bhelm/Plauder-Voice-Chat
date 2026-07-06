@@ -299,6 +299,10 @@ class Config:
     streaming: bool = True
     # Target chunk size for the progressive audio transfer (ms per VCT2 frame).
     tts_chunk_ms: int = 400
+    # Max chars buffered for the FIRST sentence of a reply before it is force-
+    # flushed to TTS (subsequent sentences use tts_max_chars_per_chunk). A long
+    # opening sentence otherwise delays first audio by tens of tokens.
+    tts_first_chunk_chars: int = 100
 
     # --- House Mode ---
     house_mode: bool = False
@@ -474,6 +478,7 @@ class Config:
 
             streaming=env_flag("STREAMING", True),
             tts_chunk_ms=_env_int("TTS_CHUNK_MS", 400),
+            tts_first_chunk_chars=_env_int("TTS_FIRST_CHUNK_CHARS", 100),
 
             wake_word_enabled=env_flag("WAKE_WORD_ENABLED", False),
             # Default = AGENT_NAME (lowercased), overridable via WAKE_WORD.

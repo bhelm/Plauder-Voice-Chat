@@ -49,7 +49,10 @@ class OpenAICompatLLMBackend(LLMBackend):
             from ..base import BackendError
             raise BackendError(
                 "openai_compat needs an API key (LLM_API_KEY / FIREWORKS_API_KEY).")
-        self._session = ClientSession(timeout=ClientTimeout(total=self.timeout))
+        # sock_connect: a dead/unreachable upstream must fail fast (and hit the
+        # silent retry) instead of stalling the turn for the full total budget.
+        self._session = ClientSession(
+            timeout=ClientTimeout(total=self.timeout, sock_connect=10))
 
     async def close(self) -> None:
         if self._session:

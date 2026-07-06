@@ -59,11 +59,13 @@ class GatedStreamingLLM:
         self.deltas = list(deltas)
         self.gate = asyncio.Event()
         self.last_meta = {"finish_reason": "stop", "usage": {"total_tokens": 9}}
+        self.calls = []   # message lists received, one entry per chat_stream call
 
     async def chat(self, messages, system_hint=None):
         return "".join(self.deltas)
 
     async def chat_stream(self, messages, system_hint=None):
+        self.calls.append(list(messages))
         if self.deltas:
             yield self.deltas[0]
         await self.gate.wait()

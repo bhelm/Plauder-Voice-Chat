@@ -196,8 +196,13 @@ By default (`STREAMING=1`) the latency-critical path is streamed end-to-end:
 
 `STREAMING=0` falls back to the classic path (generate completely first,
 then one WAV) — useful if an LLM endpoint can't do SSE streaming.
-Tuning knobs: `TTS_CHUNK_MS`, and for B2 `STT_PARTIAL*` (on by default with
+Tuning knobs: `TTS_CHUNK_MS`, `TTS_FIRST_CHUNK_CHARS` (force-flush the first
+sentence to TTS earlier), and for B2 `STT_PARTIAL*` (on by default with
 `whisper_local`).
+
+The debounce window is anchored at the moment the user stopped speaking: the
+silence the client VAD already held before committing (redemption) and the
+STT/gate latency count toward `DEBOUNCE_MS` instead of stacking on top of it.
 
 The **statistics card** shows the perceived response time: `audio.start` delivers
 `e2eMs` (finished speaking → first playback, incl. the configured

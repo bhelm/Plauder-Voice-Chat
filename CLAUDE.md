@@ -90,6 +90,10 @@ auto-reload.
 Browser (16 kHz f32 PCM via Silero VAD or push-to-talk) → WS → `TurnState`
 (debounce `DEBOUNCE_MS`, new input cancels in-flight = barge-in) → STT → ghost
 filter → wake-word gate → `ConversationManager.chat*` → sanitize → TTS → browser.
+The debounce timer is anchored at speech end (`TurnState.debounce_anchor`): the
+client VAD's redemption silence (~0.8×debounce, credited for non-PTT segments)
+and the STT/gate latency count toward the `DEBOUNCE_MS` pause window instead of
+stacking on top of it (floor `DEBOUNCE_MIN_WAIT_S`).
 
 ### Streaming pipeline (`STREAMING=1`, default on)
 

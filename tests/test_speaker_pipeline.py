@@ -397,13 +397,64 @@ def test_own_followup_before_audio_coalesces_not_drops():
             await _send_voice(ws, "s2")      # owner keeps talking, no audio yet
             disc, seen = await _drain_until(ws, "turn.discarded")
             assert disc is not None and disc.get("coalesced") is True, seen
+            assert disc.get("requeued") is True, disc   # no Hermes in tests
+            assert disc.get("coalescedText") == "erster teil", disc
 
             c2, seen2 = await _drain_until(ws, "turn.commit", timeout=3.0)
-            assert c2 is not None and c2["text"] == "erster teil. Zweiter teil", seen2
+            # The carried-over input joins as its OWN PARAGRAPH, not glued
+            # into the continued speech.
+            assert c2 is not None and c2["text"] == "erster teil\n\nzweiter teil", seen2
 
             llm.gate.set()
             assert (await _drain_until(ws, "reply"))[0] is not None
             await ws.close()
+
+    asyncio.run(run())
+
+
+def test_own_followup_hermes_keeps_history_no_resend():
+    """With a Hermes session key the gateway persists the user message of an
+    interrupted turn itself (finalize_turn on interrupt) — the coalesced text
+    must NOT be re-sent: turn.discarded says requeued=false + carries the old
+    text for the client's visual merge, and the next turn (UI and LLM call)
+    contains ONLY the new speech."""
+    from unittest.mock import AsyncMock, patch
+
+    _cfg, llm = _configure_speaker(
+        stt_texts=["erster teil", "zweiter teil"],
+        deltas=["Moment"],
+        decisions=[(True, 0.6), (True, 0.6)],
+        gate_open=False,
+        hermes_session_key_separate="test-hermes-key")
+
+    async def run():
+        with patch("plauder.server.fetch_history", AsyncMock(return_value=[])):
+            async with TestClient(TestServer(srv.build_app())) as client:
+                ws = await client.ws_connect("/ws")
+                await _drain_until(ws, "hello")
+                await _send_voice(ws, "s1")
+                c1, seen0 = await _drain_until(ws, "turn.commit")
+                assert c1 is not None and c1["text"] == "erster teil", seen0
+                assert (await _drain_until(ws, "reply.start"))[0] is not None
+
+                await _send_voice(ws, "s2")   # owner keeps talking, no audio yet
+                disc, seen = await _drain_until(ws, "turn.discarded")
+                assert disc is not None and disc.get("coalesced") is True, seen
+                assert disc.get("requeued") is False, disc
+                assert disc.get("coalescedText") == "erster teil", disc
+
+                c2, seen2 = await _drain_until(ws, "turn.commit", timeout=3.0)
+                assert c2 is not None and c2["text"] == "zweiter teil", seen2
+
+                llm.gate.set()
+                assert (await _drain_until(ws, "reply"))[0] is not None
+                # The follow-up LLM call must not repeat the old text.
+                assert llm.calls, "no LLM calls recorded"
+                last_user = [m for m in llm.calls[-1] if m["role"] == "user"][-1]
+                assert last_user["content"] == "zweiter teil"
+                assert all("erster teil" not in str(m.get("content", ""))
+                           for m in llm.calls[-1])
+                await ws.close()
 
     asyncio.run(run())
 
