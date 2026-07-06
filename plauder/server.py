@@ -1123,9 +1123,11 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
                 t2 = GHOST.strip_ghost_sentences(t2)
             return t2
 
-        async def _trim_foreign(best_hint):
+        async def _trim_foreign(best_hint, veto_bar=None):
             """Cut sustained foreign regions (block-relative) + re-transcribe
-            the kept audio. Returns True when the text was replaced."""
+            the kept audio. Returns True when the text was replaced.
+            ``veto_bar`` overrides the second-opinion bar (default: the full
+            accept threshold)."""
             nonlocal text, speaker_score, speaker_trimmed, speaker_full_text
             foreign, keep = foreign_regions(
                 blocks, duration_s, delta=SPEAKER_BLOCK_DELTA,
@@ -1138,11 +1140,12 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             # a full segment, unlike the noisy grid blocks). A region that
             # still scores like the owner is vetoed — field sessions showed
             # the relative rule cutting the owner's own sentences.
+            bar = SPEAKER.threshold if veto_bar is None else veto_bar
             confirmed = []
             for a, b in foreign:
                 sc = await asyncio.to_thread(
                     SPEAKER.score_region, pcm_bytes, SAMPLE_RATE, a, b)
-                if sc >= SPEAKER.threshold:
+                if sc >= bar:
                     LOG.info("speaker: trim veto seg=%s region=%.1f-%.1f "
                              "score=%.3f (owner)", segment_id, a, b, sc)
                 else:
@@ -1173,8 +1176,12 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             # along in the transcript. Blocks scoring far below the segment's
             # best SAME-LENGTH block are someone else; cut only whole
             # sentences (sentence-level policy), keep the text when in doubt.
+            # Inside a MATCHED segment the veto uses the low FLOOR, not the
+            # accept threshold: the doubt belongs to the owner here.
             if len(blocks) >= 2:
-                await _trim_foreign(max(sc for _, _, sc in blocks))
+                await _trim_foreign(
+                    max(sc for _, _, sc in blocks),
+                    veto_bar=min(SPEAKER.threshold, SPEAKER_TRIM_VETO_FLOOR))
         else:
             rescued = False
             # Mixed segment where the foreign part dominates? → rescue the
@@ -1424,6 +1431,14 @@ SPEAKER_SHORT_SEG_S = 2.5          # shorter segments pass mid-conversation
 # Relative bar between EQUAL-LENGTH 3 s blocks of the same segment (the only
 # scale on which speaker comparisons are valid — see analyze_blocks).
 SPEAKER_BLOCK_DELTA = 0.15
+# Second-opinion veto floor for cutting inside a MATCHED segment: the cut
+# candidate's contiguous re-score must look genuinely foreign before it is
+# cut. Field data (2026-07-06): real foreign passages re-score 0.05–0.15,
+# the owner's quiet sentence tails 0.30–0.34 — the accept threshold (0.4)
+# sat between the two and let the owner's own sentences be cut. The RESCUE
+# path (full verify failed) keeps the strict threshold: there the segment
+# is NOT confirmed as the owner, so the doubt goes toward cutting.
+SPEAKER_TRIM_VETO_FLOOR = 0.25
 # Temporal continuity: after a strict owner match, follow-up segments within
 # this window are judged RELATIVE to that score (last_own − Δ, floored) —
 # sentence tails after an owner-watch split score slightly lower than the

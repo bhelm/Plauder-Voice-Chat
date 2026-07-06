@@ -467,6 +467,65 @@ def test_trim_vetoed_when_region_rescore_says_owner():
     asyncio.run(run())
 
 
+def test_matched_trim_veto_floor_keeps_owner_tails():
+    """Field regression 2026-07-06: in a MATCHED 42 s monolog the relative
+    block rule flagged two quiet sentence tails (blocks 0.30–0.39) and their
+    contiguous re-scores (0.335/0.341) fell just under the accept threshold
+    (0.4) → both were cut although they were the owner. Inside a matched
+    segment the veto bar is the low FLOOR (0.25), not the threshold: regions
+    re-scoring in the ambiguous 0.25–0.4 band are kept; only genuinely
+    foreign re-scores (field: 0.05–0.15) may cut."""
+    _configure_speaker(stt_texts=["mein ganzer monolog bleibt"], deltas=["Ok!"],
+                       decisions=[(True, 0.6)])
+    # 15 s segment, two candidate regions (4.5–7.5 and 12–15): every block
+    # covering them is under the abs floor (thr 0.5) and the relative bar
+    # (best 0.70 − 0.15); the neighbouring blocks protect the rest.
+    srv.SPEAKER.blocks = [(0.0, 3.0, 0.70), (1.5, 4.5, 0.52), (3.0, 6.0, 0.34),
+                          (4.5, 7.5, 0.30), (6.0, 9.0, 0.38), (7.5, 10.5, 0.52),
+                          (9.0, 12.0, 0.60), (10.5, 13.5, 0.34), (12.0, 15.0, 0.30)]
+    # Contiguous re-scores mirror the field values: above the veto floor
+    # (0.25) but below the accept threshold — must be vetoed, nothing cut.
+    srv.SPEAKER.region_scores = [0.335, 0.341]
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await ws.send_json({"type": "segment.start", "segmentId": "s1"})
+            await ws.send_bytes(b"\x00" * (16000 * 4 * 15))
+            tr, seen = await _drain_until(ws, "transcript")
+            assert tr is not None and tr["text"] == "mein ganzer monolog bleibt", seen
+            assert not tr.get("speakerTrimmed"), seen
+            assert srv.STT.calls == 1, "veto must not trigger a re-STT"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_matched_trim_still_cuts_genuinely_foreign_region():
+    """Counterpart to the veto floor: a region whose contiguous re-score is
+    truly foreign (< 0.25) is still cut from a matched segment."""
+    _configure_speaker(
+        stt_texts=["mein satz und eine bahnansage", "nur mein satz"],
+        deltas=["Ok!"], decisions=[(True, 0.6)])
+    srv.SPEAKER.blocks = [(0.0, 3.0, 0.70), (1.5, 4.5, 0.12), (3.0, 6.0, 0.10)]
+    srv.SPEAKER.region_scores = [0.11]
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await ws.send_json({"type": "segment.start", "segmentId": "s1"})
+            await ws.send_bytes(b"\x00" * (16000 * 4 * 6))
+            tr, seen = await _drain_until(ws, "transcript")
+            assert tr is not None and tr["text"] == "nur mein satz", seen
+            assert tr.get("speakerTrimmed") is True, seen
+            assert srv.STT.calls == 2          # full + cropped re-STT
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_trim_skipped_when_blocks_clear_abs_floor():
     """Blocks above the full-segment threshold are owner by definition — one
     outlier-good block must not push them under the relative bar (the exact
