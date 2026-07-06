@@ -168,6 +168,39 @@ WS_CLIENTS: dict = {}
 # Fire-and-forget broadcast tasks (kept referenced so they aren't GC'd).
 _SYNC_TASKS: set = set()
 
+# --- STT warmup (self-hosted Whisper endpoints) ----------------------------
+# A cold faster-whisper server loads its model on the FIRST request (~30 s
+# observed) — without a warmup that lands on the user's first real segment,
+# with zero feedback while transcribe() serializes everything behind its
+# lock. On WS connect we pull the load forward with a short silence clip.
+# Only for self-hosted endpoints (base_url set): the real OpenAI API is
+# always warm and the call would cost money. Throttled globally.
+_STT_WARM_INTERVAL_S = 300.0
+_stt_warm = {"task": None, "ts": 0.0}
+
+
+def _maybe_warmup_stt() -> None:
+    if STT is None or not getattr(STT, "base_url", None):
+        return
+    now = time.time()
+    task = _stt_warm["task"]
+    if (task is not None and not task.done()) or \
+            now - _stt_warm["ts"] < _STT_WARM_INTERVAL_S:
+        return
+    _stt_warm["ts"] = now
+
+    async def _warm():
+        t0 = time.time()
+        try:
+            # 0.5 s of f32 silence — enough to force the remote model load.
+            await STT.transcribe(b"\x00" * (SAMPLE_RATE * 4 // 2), SAMPLE_RATE)
+            LOG.info("stt warmup: done in %d ms", int((time.time() - t0) * 1000))
+        except Exception as exc:
+            LOG.warning("stt warmup failed after %d ms: %s",
+                        int((time.time() - t0) * 1000), exc)
+
+    _stt_warm["task"] = asyncio.create_task(_warm())
+
 
 async def _broadcast_peers(origin_ws, payload: dict) -> None:
     """Best-effort fan-out to every OTHER connected browser."""
@@ -1694,6 +1727,9 @@ async def ws_handler(request):
     if BRIDGE is not None:
         BRIDGE.register_broadcast(ws)
     WS_CLIENTS[ws] = state
+    # A browser just connected → speech is likely soon; warm the STT endpoint
+    # now so a cold remote model doesn't stall the first real segment.
+    _maybe_warmup_stt()
 
     await ws.send_json({
         "type": "hello", "stage": STAGE,

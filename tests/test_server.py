@@ -135,6 +135,45 @@ def test_ws_hello_frame():
     asyncio.run(run())
 
 
+def test_ws_connect_warms_selfhosted_stt():
+    """A WS connect fires ONE warmup transcription when the STT backend points
+    at a self-hosted endpoint (base_url set) — a cold faster-whisper server
+    otherwise stalls the user's first real segment for ~30 s. Cloud/local
+    backends (no base_url) are never warmed (FakeSTT has none: see the other
+    ws tests, whose STT call counts must stay untouched)."""
+    _configure()
+
+    class SelfHostedSTT(FakeSTT):
+        base_url = "http://llm:8000/v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def transcribe(self, audio_pcm, sample_rate):
+            self.calls += 1
+            return ""
+
+    stt = SelfHostedSTT()
+    srv.STT = stt
+    srv._stt_warm["task"] = None
+    srv._stt_warm["ts"] = 0.0
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await asyncio.wait_for(ws.receive_json(), timeout=3)  # hello
+            await asyncio.wait_for(srv._stt_warm["task"], timeout=3)
+            assert stt.calls == 1
+            # Second connect within the throttle window → no second warmup.
+            ws2 = await client.ws_connect("/ws")
+            await asyncio.wait_for(ws2.receive_json(), timeout=3)
+            assert srv._stt_warm["task"].done() and stt.calls == 1
+            await ws.close()
+            await ws2.close()
+
+    asyncio.run(run())
+
+
 def test_ws_text_message_full_pipeline():
     _configure(reply="Das ist die Antwort.")
 

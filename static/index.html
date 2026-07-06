@@ -541,6 +541,14 @@
       animation: pulse 1.2s infinite;
       color: var(--warn);
     }
+    /* LLM thinking: same pulsing dot on the placeholder agent bubble, so a
+       long wait for the first token (slow LLM) visibly stays alive. Keeps
+       pulsing behind the streamed text until the reply is finalized. */
+    .bubble.agent.pending .md::after {
+      content: " ●";
+      animation: pulse 1.2s infinite;
+      color: var(--accent-2);
+    }
     @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
 
     /* === Markdown rendering in agent bubbles === */
@@ -1100,6 +1108,7 @@
         "status.connected": "connected",
         "status.disconnected": "disconnected ({code})",
         "status.error": "error",
+        "sys.ws_lost": "🔌 Connection lost – reconnecting …",
         // VAD status (vadStatus)
         "vad.loading": "loading …",
         "vad.active": "active",
@@ -1120,6 +1129,8 @@
         "mic.speaking": "🗣  Speech detected",
         "mic.recording": "🔴  Recording …",
         "mic.collecting": "⏳  Collecting input …",
+        "mic.transcribing": "✍️  Transcribing …",
+        "mic.transcribing_slow": "✍️  Transcribing … (speech model is starting up, this can take a while)",
         "mic.thinking": "⚙️  {name} is thinking …",
         "mic.playing": "🔊  {name} is speaking …",
         "mic.error": "Error – see log",
@@ -1275,6 +1286,7 @@
         "status.connected": "verbunden",
         "status.disconnected": "getrennt ({code})",
         "status.error": "fehler",
+        "sys.ws_lost": "🔌 Verbindung verloren – verbinde neu …",
         // VAD status (vadStatus)
         "vad.loading": "lade …",
         "vad.active": "aktiv",
@@ -1295,6 +1307,8 @@
         "mic.speaking": "🗣  Sprache erkannt",
         "mic.recording": "🔴  Aufnahme läuft …",
         "mic.collecting": "⏳  Sammle Eingabe …",
+        "mic.transcribing": "✍️  Transkribiere …",
+        "mic.transcribing_slow": "✍️  Transkribiere … (Sprachmodell startet gerade, das kann etwas dauern)",
         "mic.thinking": "⚙️  {name} denkt …",
         "mic.playing": "🔊  {name} spricht …",
         "mic.error": "Fehler – siehe Log",
@@ -1970,7 +1984,9 @@
     function updateStopVisual() {
       if (stopBtn) stopBtn.hidden = !isBusy();
     }
+    let micUiState = 'idle';   // last state set — lets async timers act only if still current
     function setMicUi(state) {
+      micUiState = state;
       updateMicVisual();
       micStatus.classList.remove('speaking','thinking','collecting');
       const wakeWord = (serverWake && serverWake.word) ? serverWake.word : AGENT_NAME;
@@ -1984,6 +2000,8 @@
         speaking:   t('mic.speaking'),
         recording:  t('mic.recording'),
         collecting: t('mic.collecting'),
+        transcribing: t('mic.transcribing'),
+        transcribing_slow: t('mic.transcribing_slow'),
         thinking:   t('mic.thinking', { name: AGENT_NAME }),
         playing:    t('mic.playing', { name: AGENT_NAME }),
         error:      t('mic.error'),
@@ -1991,7 +2009,36 @@
       micStatus.textContent = map[state] || state;
       if (state === 'speaking') micStatus.classList.add('speaking');
       else if (state === 'thinking' || state === 'playing') micStatus.classList.add('thinking');
-      else if (state === 'collecting') micStatus.classList.add('collecting');
+      else if (state === 'collecting' || state === 'transcribing' || state === 'transcribing_slow') micStatus.classList.add('collecting');
+    }
+
+    /* ===== STT progress (segment sent → transcript event) =====
+       The server answers EVERY segment with exactly one of transcript /
+       transcript.ignored / transcript.error — until then the status line
+       shows "Transcribing …" instead of silently reverting to "Listening"
+       (a cold remote Whisper takes 30+ s on its first call; without this
+       the app looks dead). After a few seconds the text escalates to the
+       "model is starting up" variant. */
+    const sttPending = new Set();      // segment ids awaiting their transcript event
+    let sttSlowTimer = null;
+    const STT_SLOW_AFTER_MS = 4000;
+    function sttSent(segmentId) {
+      sttPending.add(String(segmentId));
+      setMicUi('transcribing');
+      if (!sttSlowTimer) sttSlowTimer = setTimeout(() => {
+        sttSlowTimer = null;
+        if (sttPending.size && micUiState === 'transcribing') setMicUi('transcribing_slow');
+      }, STT_SLOW_AFTER_MS);
+    }
+    function sttDone(segmentId) {
+      if (segmentId == null) sttPending.clear();
+      else sttPending.delete(String(segmentId));
+      if (!sttPending.size && sttSlowTimer) { clearTimeout(sttSlowTimer); sttSlowTimer = null; }
+      // Dropped segments (ghost/empty/foreign) produce no turn.pending that
+      // would move the status on — fall back to listening/idle ourselves.
+      if (!sttPending.size && (micUiState === 'transcribing' || micUiState === 'transcribing_slow')) {
+        setMicUi(micActive ? 'listening' : 'idle');
+      }
     }
 
     /* ===== Turn state in the browser =====
@@ -2856,6 +2903,7 @@
     // (returns while CONNECTING/OPEN), so the watchdog is safe to fire freely.
     let ws = null;
     let reconnectTimer = null;
+    let wsWasConnected = false;   // gates the one-shot "connection lost" notice
     const RECONNECT_MS = 10000;
 
     function connect() {
@@ -2872,6 +2920,7 @@
       ws.binaryType = 'arraybuffer';
 
       ws.addEventListener('open', () => {
+        wsWasConnected = true;
         setWs('ok', t('status.connected'));
         // Initial-Settings senden
         sendSettings();
@@ -2903,6 +2952,13 @@
 
       ws.addEventListener('close', (ev) => {
         setWs('err', t('status.disconnected', { code: ev.code }));
+        // One in-chat notice per LOST connection (not per failed reconnect
+        // attempt — those fire close too). The hello bubble marks recovery.
+        if (wsWasConnected) {
+          wsWasConnected = false;
+          addBubble('err', t('sys.ws_lost'));
+          sttDone(null);   // no transcript event will come for in-flight segments
+        }
         if (typeof refreshSendButton === 'function') refreshSendButton();
       });
       ws.addEventListener('error', () => setWs('err', t('status.error')));
@@ -3037,6 +3093,7 @@
           break;
         case 'transcript.ignored':
           // Segment discarded: no wake word, or (speaker lock) not the owner voice.
+          sttDone(m.segmentId);
           if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: rejected voice
           setDuck(false);   // foreign voice → playback back to full volume
           if (m.reason === 'speaker_mismatch') {
@@ -3128,6 +3185,7 @@
           if (micActive) setMicUi('listening');
           break;
         case 'transcript':
+          sttDone(m.segmentId);
           // We write the text directly into the pending user bubble
           // (overwritten by turn.pending below, but for edge cases)
           lastLatency.textContent = `${m.sttMs}ms`;
@@ -3333,6 +3391,7 @@
           addBubble('err', t('err.tts', { error: m.error }));
           break;
         case 'transcript.error':
+          sttDone(m.segmentId);
           addBubble('err', t('err.stt', { error: m.error }));
           if (m.segmentId) segPartialText.delete(m.segmentId);
           clearStalePartial(m.turnId);
@@ -3595,7 +3654,10 @@
     function commitInputStream(segmentId) {
       if (!inputStreaming) return;
       inputStreaming = false;
-      try { ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId })); } catch (_) {}
+      try {
+        ws.send(JSON.stringify({ type: 'segment.stream.commit', segmentId }));
+        sttSent(segmentId);
+      } catch (_) {}
     }
 
     function abortInputStream() {
@@ -3784,7 +3846,9 @@
             // pauses, playback.done → restart); this resume covers the
             // no-turn cases (empty/hallucinated) so nothing gets stuck.
             if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
-            setTimeout(() => { if (micActive) setMicUi('listening'); }, 100);
+            // Only fall back to "Listening" when no segment is awaiting its
+            // transcript — otherwise the "Transcribing …" state stays visible.
+            setTimeout(() => { if (micActive && !sttPending.size) setMicUi('listening'); }, 100);
           },
           onVADMisfire: () => {
             // Speech too short → no segment. Discard the running input stream.
@@ -3792,7 +3856,7 @@
             if (inputStreaming) abortInputStream();
             vadStreamSegId = null;
             if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
-            if (micActive) setMicUi('listening');
+            if (micActive && !sttPending.size) setMicUi('listening');
           },
         });
         await vad.start();
@@ -3835,6 +3899,7 @@
         ptt: !!(opts && opts.ptt),
       }));
       ws.send(f32ToBytes(float32));
+      sttSent(segmentId);
       // Consumed -> reset so the next segment gets fresh values
       // (otherwise an old speech-start/barge-in sticks to the next segment).
       lastSpeechStartTs = null;
@@ -4194,8 +4259,9 @@
         for (const b of captured) { out.set(b, off); off += b.length; }
         segmentCounter += 1;
         segCount.textContent = String(segmentCounter);
+        // sendSegment → sttSent shows "Transcribing …" (the honest state:
+        // STT runs first; "thinking" follows via turn.commit).
         sendSegment(String(segmentCounter), out, { ptt: true });
-        setMicUi('thinking');
       };
       pttPostRollFramesLeft = PTT_POSTROLL_FRAMES;
       pttPendingFinalize = finalize;
