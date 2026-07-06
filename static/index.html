@@ -3901,11 +3901,21 @@
         vadActivationThreshold = parseFloat(vadThreshold.value);
         vadThresholdLabel.textContent = vadActivationThreshold.toFixed(2);
         positionVadMark();
+        // Segmentation threshold follows the slider LIVE while dragging
+        // (barge-in already reads vadActivationThreshold directly).
+        applyVadOptionsLive({
+          positiveSpeechThreshold: vadActivationThreshold,
+          negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
+        });
       });
       vadThreshold.addEventListener('change', () => {
         localStorage.setItem('vadThreshold', String(vadActivationThreshold));
-        // Apply the new threshold to the running VAD segmentation.
-        if (vadLike() && micActive) restartVadSoon();
+        // Apply the new threshold to the running VAD segmentation — live if
+        // possible, full restart only as fallback.
+        if (vadLike() && micActive && !applyVadOptionsLive({
+              positiveSpeechThreshold: vadActivationThreshold,
+              negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
+            })) restartVadSoon();
       });
     }
 
@@ -3961,6 +3971,24 @@
 
     function streamInputActive() {
       return vadLike() && streamInputEnabled && ws && ws.readyState === 1;
+    }
+
+    // Backpressure: on a congested uplink (mobile, weak WLAN) the WS send
+    // buffer grows without bound and delays exactly the frames STT waits on —
+    // plus every control message queued behind them. Mic frames are the one
+    // thing we can shed: above this bound (~4 s raw f32, minutes of opus) new
+    // frames are dropped instead of queued. A short gap in the segment audio
+    // beats a commit that arrives half a minute late.
+    const UPLINK_MAX_BUFFERED = 256 * 1024;   // bytes
+    let _uplinkShedLogTs = 0;
+    function uplinkCongested() {
+      if (!ws || ws.bufferedAmount <= UPLINK_MAX_BUFFERED) return false;
+      const now = Date.now();
+      if (now - _uplinkShedLogTs > 5000) {
+        _uplinkShedLogTs = now;
+        console.warn(`[uplink] congested (${ws.bufferedAmount} bytes buffered) — shedding mic frames`);
+      }
+      return true;
     }
 
     /* ===== Opus mic uplink (B1 segments) =====
@@ -4149,14 +4177,36 @@
         || next.minSpeechFrames    !== currentVadParams.minSpeechFrames
         || next.preSpeechPadFrames !== currentVadParams.preSpeechPadFrames
         || next.frameMs            !== currentVadParams.frameMs;
+      const frameSizeChanged = next.frameMs !== currentVadParams.frameMs;
       currentVadParams = next;
-      if (changed && micActive) restartVadSoon();
+      if (changed && micActive) {
+        // frameMs maps to the worklet's frame size — that one genuinely needs
+        // a rebuild. Everything else is patched on the running instance.
+        if (frameSizeChanged || !applyVadOptionsLive({
+              redemptionFrames: next.redemptionFrames,
+              minSpeechFrames: next.minSpeechFrames,
+              preSpeechPadFrames: next.preSpeechPadFrames,
+            })) restartVadSoon();
+      }
+    }
+
+    // Live-update of the RUNNING VAD's tuning: the library's frame processor
+    // reads its options object on every frame, so mutating it applies
+    // instantly — no stopMic/startMic (which re-runs getUserMedia + model
+    // init and leaves the mic deaf for ~0.5 s on every change). Returns false
+    // when there is no running instance to patch (caller falls back to a
+    // restart, or the values are simply picked up by the next startMic).
+    function applyVadOptionsLive(opts) {
+      const fp = vad && vad.audioNodeVAD && vad.audioNodeVAD.frameProcessor;
+      if (!fp || !fp.options) return false;
+      Object.assign(fp.options, opts);
+      return true;
     }
 
     // Debounced + serialized: if a restart is still running, the next one
     // queues after it instead of starting a second mic in parallel.
-    // Used by applyServerVadParams (new server params) AND by the
-    // VAD sensitivity slider (new threshold).
+    // Only needed when live-patching is impossible (mic device change,
+    // frame size change, or no reachable frame processor).
     function restartVadSoon() {
       if (!micActive) return;
       if (vadRestartTimer) clearTimeout(vadRestartTimer);
@@ -4219,7 +4269,7 @@
             // Opus segments encode instead of sending raw; while the queued
             // stream start has not run yet (no encoder), the frame is simply
             // kept in the ring buffer above and flushed by the start task.
-            if (inputStreaming && ws && ws.readyState === 1) {
+            if (inputStreaming && ws && ws.readyState === 1 && !uplinkCongested()) {
               if (uplinkCodec === 'opus') encodeUplinkFrame(ds);
               else try { ws.send(f32ToBytes(ds)); } catch (_) {}
             }
