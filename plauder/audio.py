@@ -95,6 +95,13 @@ def pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return pcm16.astype(np.float32) / 32768.0
 
 
+def f32le_bytes_to_wav_bytes(raw: bytes, sample_rate: int) -> bytes:
+    """Raw little-endian float32 mono PCM bytes (the wire format of streamed mic
+    frames / enrollment / clone recordings) → 16-bit mono WAV bytes."""
+    samples = np.frombuffer(raw, dtype="<f4")
+    return float32_to_pcm16_wav_bytes(samples, sample_rate)
+
+
 def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
     """Changes the speaking tempo by the factor `rate` (rate>1 = faster,
     rate<1 = slower), WITHOUT shifting the pitch (no chipmunk effect).

@@ -234,6 +234,14 @@ class Config:
     tts_openai_local_speed: bool = False
     tts_speed: float = 1.0
 
+    # --- Voice cloning / voice library (needs the OmniVoice wrapper behind TTS;
+    # plain OpenAI TTS cannot clone). When on, the server advertises the voice
+    # library (hello.voiceClone) and mediates record/upload/select against the
+    # wrapper's /v1/audio/voices CRUD API. The chosen voice is global (whole
+    # session) and its id persists in active_voice_state_path across restarts. ---
+    tts_clone_enabled: bool = False
+    active_voice_state_path: str = ""
+
     # --- TTS: OmniVoice (local) ---
     omnivoice_model: str = "k2-fsa/OmniVoice"
     omnivoice_device: str = "cuda"
@@ -445,6 +453,8 @@ class Config:
             tts_openai_sample_rate=_env_int("TTS_OPENAI_SAMPLE_RATE", OPENAI_TTS_SAMPLE_RATE),
             tts_openai_local_speed=env_flag("TTS_OPENAI_LOCAL_SPEED", False),
             tts_speed=_env_float("TTS_SPEED", 1.0),
+            tts_clone_enabled=env_flag("TTS_CLONE_ENABLED", False),
+            active_voice_state_path=_env("ACTIVE_VOICE_STATE_PATH", ""),
 
             # TTS omnivoice
             omnivoice_model=_first(_env("OMNIVOICE_MODEL"), default="k2-fsa/OmniVoice"),

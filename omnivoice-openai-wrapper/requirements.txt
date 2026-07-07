@@ -17,6 +17,7 @@ huggingface-hub==1.21.0
 fastapi==0.139.0
 uvicorn==0.49.0
 pydantic==2.13.4
+python-multipart==0.0.20   # multipart form parsing for POST /v1/audio/voices
 
 soundfile==0.14.0
 pydub==0.25.1          # needs ffmpeg on PATH for mp3/opus/aac output

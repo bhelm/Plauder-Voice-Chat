@@ -19,6 +19,7 @@ STREAMING=0 falls back to chat() → TTS.synth → one WAV (VCT1).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -31,6 +32,7 @@ from aiohttp import WSMsgType, web
 from . import audio as audio_utils
 from . import opus_codec
 from . import sanitizer
+from . import voices as voices_mod
 from . import wake
 from .backends import LLMBackend, STTBackend, TTSBackend, UpstreamTimeoutError
 from .config import SAMPLE_RATE, Config
@@ -69,6 +71,152 @@ def _opus_active() -> bool:
     advertisement and every negotiation checkpoint."""
     return bool(CFG and CFG.audio_opus and opus_codec.is_available())
 
+
+def _clone_active() -> bool:
+    """Voice library usable: TTS_CLONE_ENABLED and a VoiceLibrary is wired
+    (TTS points at the OmniVoice wrapper). Drives the hello advertisement."""
+    return bool(CFG and CFG.tts_clone_enabled and VOICES is not None)
+
+
+def _active_voice_id() -> str | None:
+    """The globally selected cloned voice id to pass into the TTS call, or None
+    when the voice library is disabled (backend uses its configured default)."""
+    return VOICES.get_active() if _clone_active() else None
+
+
+async def _voice_clone_hello() -> dict:
+    """The ``voiceClone`` capability block for the hello frame: availability plus
+    the current voice list + active id (so the client renders the library at
+    once). Degrades gracefully — a slow/down wrapper never blocks or fails hello."""
+    if not _clone_active():
+        return {"available": False}
+    out = {"available": True, "active": VOICES.get_active(), "voices": []}
+    try:
+        out["voices"] = await asyncio.wait_for(VOICES.list(), timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("voice library unreachable for hello: %s", exc)
+    return out
+
+
+async def _emit_voice_state(origin_ws) -> None:
+    """Push the fresh voice library state (list + active id) to EVERY connected
+    browser after a mutation (select/rename/delete/new), so the shared session
+    stays in sync — same idea as chat.remote / session.reset.remote."""
+    payload = {"type": "voice.state", **(await _voice_clone_hello()), "ts": time.time()}
+    try:
+        await origin_ws.send_json(payload)
+    except Exception:
+        pass
+    await _broadcast_peers(origin_ws, payload)
+
+
+# One short, neutral sentence per UI language for the voice preview button.
+_PREVIEW_SENTENCE = {
+    "de": "Hallo, so klingt diese Stimme.",
+    "en": "Hi, this is how this voice sounds.",
+}
+
+
+def _preview_sentence() -> str:
+    lang = (CFG.app_language if CFG else "en")
+    return _PREVIEW_SENTENCE.get(lang, _PREVIEW_SENTENCE["en"])
+
+
+MAX_VOICE_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+async def _ffmpeg_decode_f32le(data: bytes, sample_rate: int) -> bytes:
+    """Decode arbitrary uploaded audio (mp3/m4a/ogg/webm/wav/…) to raw mono
+    float32 LE PCM at ``sample_rate`` via ffmpeg — the format STT.transcribe
+    expects. Raises on a non-zero ffmpeg exit (unsupported/corrupt input)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", "pipe:0", "-ac", "1", "-ar", str(sample_rate), "-f", "f32le", "pipe:1",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate(data)
+    if proc.returncode != 0:
+        raise RuntimeError((err or b"").decode("utf-8", "replace")[:200] or "ffmpeg failed")
+    return out
+
+
+async def upload_voice_sample(request):
+    """Register an UPLOADED audio file as a new cloned voice (mirrors the image
+    /upload multipart pattern). ref_text: the client's manual transcript if given,
+    otherwise a best-effort ffmpeg-decode + STT of the file. The sample bytes are
+    forwarded to the wrapper, which decodes to the final reference and clones."""
+    if not _clone_active():
+        return web.json_response({"ok": False, "error": "voice cloning disabled"}, status=400)
+    try:
+        reader = await request.multipart()
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": f"multipart parse: {exc}"}, status=400)
+
+    data = b""
+    name = ""
+    ref_text = ""
+    content_type = ""
+    filename = "upload"
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            content_type = (part.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+            filename = part.filename or "upload"
+            chunks: list = []
+            total = 0
+            while True:
+                chunk = await part.read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_VOICE_UPLOAD_BYTES:
+                    return web.json_response(
+                        {"ok": False, "error": f"file too large (>{MAX_VOICE_UPLOAD_BYTES} bytes)"},
+                        status=413)
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        elif part.name == "name":
+            name = (await part.text()).strip()
+        elif part.name in ("refText", "ref_text"):
+            ref_text = (await part.text()).strip()
+
+    if not data:
+        return web.json_response({"ok": False, "error": "missing field 'file'"}, status=400)
+    if content_type and not (content_type.startswith("audio/")
+                             or content_type == "application/octet-stream"):
+        return web.json_response(
+            {"ok": False, "error": f"unsupported content type: {content_type}"}, status=400)
+
+    if not ref_text:
+        # Best-effort auto-transcript so the user need not type it for uploads.
+        try:
+            pcm = await _ffmpeg_decode_f32le(data, SAMPLE_RATE)
+            if pcm and STT is not None:
+                ref_text = (await STT.transcribe(pcm, SAMPLE_RATE) or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("voice upload: auto-transcribe failed: %s", exc)
+    if not ref_text:
+        # Signal the client to ask the user for the transcript and retry.
+        return web.json_response({"ok": False, "error": "need_transcript"}, status=400)
+
+    try:
+        voice = await VOICES.register(
+            data, filename=filename, content_type=content_type or "application/octet-stream",
+            name=name, ref_text=ref_text)
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("voice upload: register failed")
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+
+    # Fan the fresh library state out to every connected browser.
+    try:
+        payload = {"type": "voice.state", **(await _voice_clone_hello()), "ts": time.time()}
+        await _broadcast_peers(None, payload)
+    except Exception:  # noqa: BLE001
+        pass
+    return web.json_response({"ok": True, "voice": voice, "refText": ref_text})
+
 # --------------------------------------------------------------------------- #
 # Runtime state (filled by configure() / main()). Module globals, so the
 # turn handlers can access them without a request context.
@@ -82,6 +230,9 @@ GHOST: sanitizer.HallucinationFilter | None = None
 # Speaker lock (voice gate). None = disabled; otherwise a SpeakerVerifier whose
 # .active() says whether it currently gates (model loaded AND a profile enrolled).
 SPEAKER = None
+# Voice library (cloned-voice CRUD + active-voice selection). None = disabled;
+# a VoiceLibrary when TTS_CLONE_ENABLED and TTS points at the OmniVoice wrapper.
+VOICES = None
 
 # House-Mode speaker-ID (lazy, optional — the speaker_id module is not part of
 # this repo; stays disabled when it is missing).
@@ -90,9 +241,9 @@ _SPEAKER_INIT_FAILED = False
 
 
 def configure(cfg: Config, *, stt=None, tts=None, conv=None, bridge=None, ghost=None,
-              speaker=None):
+              speaker=None, voices=None):
     """Sets the runtime state. Tests can inject mock backends here."""
-    global CFG, STT, TTS, CONV, BRIDGE, GHOST, SPEAKER
+    global CFG, STT, TTS, CONV, BRIDGE, GHOST, SPEAKER, VOICES
     CFG = cfg
     STT = stt
     TTS = tts
@@ -100,6 +251,7 @@ def configure(cfg: Config, *, stt=None, tts=None, conv=None, bridge=None, ghost=
     BRIDGE = bridge
     GHOST = ghost if ghost is not None else sanitizer.HallucinationFilter.from_config(cfg)
     SPEAKER = speaker
+    VOICES = voices
 
 
 def get_speaker_identifier():
@@ -501,8 +653,12 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
     state.client_playing = True
     await ws.send_json(start_evt)
     t_tts = time.time()
+    _synth_kw = {"speed": state.speed}
+    _vid = _active_voice_id()
+    if _vid is not None:
+        _synth_kw["voice"] = _vid
     try:
-        pcm_bytes, sr = await TTS.synth(cleaned, speed=state.speed)
+        pcm_bytes, sr = await TTS.synth(cleaned, **_synth_kw)
     except asyncio.CancelledError:
         LOG.info("turn=%s tts cancelled", turn_id)
         state.audio_ids.discard(audio_id)
@@ -534,15 +690,21 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         raise
 
 
-async def _tts_synth_stream(text: str, speed: float):
+async def _tts_synth_stream(text: str, speed: float, voice: str | None = None):
     """TTS streaming with fallback: uses ``synth_stream`` if present, otherwise
-    the classic ``synth`` (one chunk). Keeps the orchestrator backend-agnostic."""
+    the classic ``synth`` (one chunk). Keeps the orchestrator backend-agnostic.
+    ``voice`` optionally overrides the default voice (cloned-voice id); it is
+    only forwarded when set, so duck-typed backends without a ``voice`` kwarg
+    keep working."""
+    kw = {"speed": speed}
+    if voice is not None:
+        kw["voice"] = voice
     fn = getattr(TTS, "synth_stream", None)
     if fn is not None:
-        async for item in fn(text, speed=speed):
+        async for item in fn(text, **kw):
             yield item
     else:
-        pcm, sr = await TTS.synth(text, speed=speed)
+        pcm, sr = await TTS.synth(text, **kw)
         if pcm:
             yield pcm, sr
 
@@ -557,6 +719,8 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
     is played back while sentence 2 is still being generated/synthesized.
     """
     pron = CFG.pronunciations_file if CFG else None
+    # Cloned voice for this whole reply, resolved once (None = backend default).
+    reply_voice = _active_voice_id()
     max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
     # The FIRST sentence gates time-to-first-audio: force-flush it earlier so a
     # long punctuation-free opener doesn't stall TTS for tens of tokens.
@@ -620,7 +784,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             gate = None
             last_sr = None
             try:
-                async for pcm, sr in _tts_synth_stream(sentence, state.speed):
+                async for pcm, sr in _tts_synth_stream(sentence, state.speed, reply_voice):
                     if gate is None:
                         gate = audio_utils.StreamLeadGate(sr)
                     last_sr = sr
@@ -1909,6 +2073,9 @@ async def ws_handler(request):
     # Speaker-lock enrollment: while set, incoming binary frames are the owner's
     # enrollment recording (NOT a segment) and are buffered here until commit.
     enroll_stream: bytearray | None = None
+    # Voice-clone recording: same idea as enroll_stream — while set, binary frames
+    # are the reference sample for a new cloned voice, buffered until commit.
+    clone_stream: bytearray | None = None
 
     if BRIDGE is not None:
         BRIDGE.register_broadcast(ws)
@@ -1917,6 +2084,7 @@ async def ws_handler(request):
     # now so a cold remote model doesn't stall the first real segment.
     _maybe_warmup_stt()
 
+    voice_clone = await _voice_clone_hello()
     await ws.send_json({
         "type": "hello", "stage": STAGE,
         "msg": f"Server ready – agent: {CFG.agent_name}.",
@@ -1961,6 +2129,9 @@ async def ws_handler(request):
             # Runtime toggle state (the client re-asserts its own on connect).
             "enabled": bool(SPEAKER is not None and getattr(SPEAKER, "enabled", True)),
         },
+        # Voice library: available = cloning wired (wrapper behind TTS). Carries
+        # the current voice list + active id so the client renders immediately.
+        "voiceClone": voice_clone,
         "turn": {
             "debounce_ms": state.debounce_ms,
             "debounce_ms_min": CFG.debounce_ms_min, "debounce_ms_max": CFG.debounce_ms_max,
@@ -2099,10 +2270,10 @@ async def ws_handler(request):
                         "ptt": bool(data.get("ptt")),
                     })
                 elif t == "segment.stream.start":
-                    # While the owner is recording an enrollment take, VAD
-                    # segments are ignored entirely — their frames would race
-                    # with the enrollment frames for the binary channel.
-                    if enroll_stream is not None:
+                    # While the owner is recording an enrollment or voice-clone
+                    # take, VAD segments are ignored entirely — their frames
+                    # would race with the recording frames for the binary channel.
+                    if enroll_stream is not None or clone_stream is not None:
                         continue
                     # B1: start of a streamed segment. Following binary frames
                     # (raw f32le) are appended until segment.stream.commit arrives.
@@ -2216,6 +2387,97 @@ async def ws_handler(request):
                         "enrolled": bool(SPEAKER is not None and SPEAKER.has_profile()),
                         "count": (SPEAKER._count if SPEAKER is not None else 0),
                         "ts": time.time()})
+                elif t == "voice.clone.start":
+                    # Begin buffering a voice-clone reference recording. Same
+                    # channel discipline as enrollment: drop any half-streamed
+                    # segment + queued metas so their frames can't leak in.
+                    if not _clone_active():
+                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                            "error": "unavailable", "ts": time.time()})
+                    else:
+                        if active_stream is not None:
+                            active_stream["done"] = True
+                            active_stream = None
+                        pending_segment_meta.clear()
+                        clone_stream = bytearray()
+                elif t == "voice.clone.commit":
+                    buf = bytes(clone_stream) if clone_stream is not None else b""
+                    clone_stream = None
+                    name = (data.get("name") or "").strip()
+                    if not _clone_active():
+                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                            "error": "unavailable", "ts": time.time()})
+                    elif len(buf) < int(SAMPLE_RATE * 4 * 1.0):  # < ~1 s of f32 PCM
+                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                            "error": "too_short", "ts": time.time()})
+                    else:
+                        try:
+                            ref_text = (await STT.transcribe(buf, SAMPLE_RATE) or "").strip()
+                            if not ref_text:
+                                await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                                    "error": "no_speech", "ts": time.time()})
+                            else:
+                                wav = await asyncio.to_thread(
+                                    audio_utils.f32le_bytes_to_wav_bytes, buf, SAMPLE_RATE)
+                                voice = await VOICES.register(
+                                    wav, filename="clone.wav", content_type="audio/wav",
+                                    name=name, ref_text=ref_text)
+                                LOG.info("voice clone registered: id=%s name=%r ref=%r",
+                                         voice.get("id"), voice.get("name"), ref_text[:60])
+                                await ws.send_json({"type": "voice.clone.ack", "ok": True,
+                                                    "voice": voice, "refText": ref_text,
+                                                    "ts": time.time()})
+                                await _emit_voice_state(ws)
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.exception("voice clone failed")
+                            await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                                "error": str(exc), "ts": time.time()})
+                elif t == "voice.clone.abort":
+                    clone_stream = None
+                elif t == "voice.list":
+                    if _clone_active():
+                        await _emit_voice_state(ws)
+                elif t == "voice.select":
+                    if _clone_active():
+                        VOICES.set_active(str(data.get("id") or "").strip())
+                        await _emit_voice_state(ws)
+                elif t == "voice.rename":
+                    if _clone_active():
+                        try:
+                            await VOICES.rename(str(data.get("id") or ""),
+                                                str(data.get("name") or "").strip())
+                            await _emit_voice_state(ws)
+                        except Exception as exc:  # noqa: BLE001
+                            await ws.send_json({"type": "voice.error", "op": "rename",
+                                                "error": str(exc), "ts": time.time()})
+                elif t == "voice.delete":
+                    if _clone_active():
+                        vid = str(data.get("id") or "")
+                        try:
+                            await VOICES.delete(vid)
+                            # If the deleted voice was active, fall back to default.
+                            if VOICES.get_active() == vid:
+                                VOICES.set_active(voices_mod.DEFAULT_VOICE_ID)
+                            await _emit_voice_state(ws)
+                        except Exception as exc:  # noqa: BLE001
+                            await ws.send_json({"type": "voice.error", "op": "delete",
+                                                "error": str(exc), "ts": time.time()})
+                elif t == "voice.preview":
+                    if _clone_active():
+                        vid = str(data.get("id") or voices_mod.DEFAULT_VOICE_ID)
+                        ptext = (data.get("text") or _preview_sentence()).strip()
+                        try:
+                            pcm, sr = await TTS.synth(ptext, speed=state.speed, voice=vid)
+                            wav = await asyncio.to_thread(
+                                audio_utils.pcm16_to_wav_bytes, pcm, sr)
+                            await ws.send_json({
+                                "type": "voice.preview.audio", "id": vid, "mime": "audio/wav",
+                                "audioB64": base64.b64encode(wav).decode("ascii"),
+                                "ts": time.time()})
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.exception("voice preview failed")
+                            await ws.send_json({"type": "voice.error", "op": "preview",
+                                                "error": str(exc), "ts": time.time()})
                 elif t == "text.message":
                     text_val = (data.get("text") or "").strip()
                     img_urls = data.get("imageUrls") or []
@@ -2343,6 +2605,10 @@ async def ws_handler(request):
                 if enroll_stream is not None:
                     # Owner enrollment recording — buffer, don't treat as a segment.
                     enroll_stream.extend(msg.data)
+                    continue
+                if clone_stream is not None:
+                    # Voice-clone reference recording — buffer until commit.
+                    clone_stream.extend(msg.data)
                     continue
                 if active_stream is not None:
                     # B1: frame of a streamed segment — append. The final

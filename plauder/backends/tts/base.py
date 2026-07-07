@@ -18,18 +18,26 @@ class TTSBackend(abc.ABC):
         """Initializes the backend (load client/model)."""
 
     @abc.abstractmethod
-    async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
-        """Synthesizes text → (16-bit mono PCM bytes, sample_rate)."""
+    async def synth(self, text: str, *, speed: float = 1.0,
+                    voice: str | None = None) -> tuple[bytes, int]:
+        """Synthesizes text → (16-bit mono PCM bytes, sample_rate).
 
-    async def synth_stream(self, text: str, *, speed: float = 1.0):
+        ``voice`` optionally overrides the backend's default voice for this one
+        call (e.g. a cloned-voice id from the voice library). Backends that
+        don't support per-call voices ignore it.
+        """
+
+    async def synth_stream(self, text: str, *, speed: float = 1.0,
+                           voice: str | None = None):
         """Async generator: yields ``(pcm_bytes, sample_rate)`` chunks as soon
         as they are ready. The server sends each chunk progressively to the
-        client (gapless playback).
+        client (gapless playback). ``voice`` overrides the default voice for
+        this call (see ``synth``).
 
         Default fallback: a single chunk with the complete ``synth`` result.
         Backends with native audio streaming override this.
         """
-        pcm, sr = await self.synth(text, speed=speed)
+        pcm, sr = await self.synth(text, speed=speed, voice=voice)
         if pcm:
             yield pcm, sr
 

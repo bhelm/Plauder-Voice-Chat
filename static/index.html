@@ -289,6 +289,27 @@
     .vlock.locked.paused { border-color: rgba(167,139,250,.35); }
     .vlock.paused .vlock-badge { border-color: var(--border); background: var(--panel); box-shadow: none; }
     .vlock.paused .vlock-chip { color: var(--warn); border-color: rgba(251,191,36,.5); }
+    /* ===== Voice library (cloned voices) — reuses the .vlock card chrome ===== */
+    .voices-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 10px; }
+    .voices-empty { font-size: 12px; color: var(--muted); text-align: center; padding: 6px; }
+    .voices-row {
+      display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 9px;
+      border: 1px solid var(--border); background: var(--panel); font-size: 13px;
+    }
+    .voices-row.active { border-color: rgba(167,139,250,.6); background: rgba(167,139,250,.10); }
+    .voices-row .vname { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .voices-row .vtag { font-size: 10px; font-weight: 700; color: rgba(167,139,250,.95); letter-spacing: .04em; }
+    .voices-row .vbuiltin { font-size: 10px; color: var(--muted); }
+    .voices-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .voices-actions button {
+      background: none; border: 1px solid var(--border); color: var(--muted); cursor: pointer;
+      border-radius: 7px; padding: 3px 7px; font-size: 12px;
+    }
+    .voices-actions button:hover { color: var(--text); border-color: var(--muted); }
+    .voices-actions button.danger:hover { color: var(--err); border-color: rgba(248,113,113,.5); }
+    .voices-add { display: flex; gap: 8px; }
+    .voices-add .vlock-enroll { flex: 1; }
+    .voices-add .voices-upload { flex: 0 0 auto; width: auto; padding-left: 12px; padding-right: 12px; }
     /* Generic slide toggle */
     .switch { position: relative; display: inline-flex; flex-shrink: 0; cursor: pointer; }
     .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
@@ -911,6 +932,34 @@
         </div>
       </details>
 
+      <!-- Voice library: clone a speaking voice (record or upload), name it,
+           pick the active one for the whole session. Hidden unless the server
+           has voice cloning wired (hello.voiceClone.available). -->
+      <details class="acc vlock voices" id="voicesCard" style="display:none;" open data-sec="voices">
+        <summary class="vlock-head">
+          <div class="vlock-badge">🗣️</div>
+          <div>
+            <div class="vlock-title" data-i18n="voices.title">Voices</div>
+            <div class="vlock-sub" data-i18n="voices.tagline">Clone &amp; choose a speaking voice</div>
+          </div>
+          <span class="vlock-chip" id="voicesChip"></span>
+        </summary>
+        <div class="acc-body">
+          <div data-i18n="voices.help" style="font-size: 11px; color: var(--muted);">
+            Record a short sample or upload an audio file to clone a voice, then pick which voice the assistant speaks in. The choice applies to every device and is kept across sessions.
+          </div>
+          <div class="voices-list" id="voicesList"></div>
+          <div class="voices-add">
+            <button id="recordVoiceBtn" class="vlock-enroll">
+              <span class="vlock-prog" id="voiceRecProg"></span>
+              <span><span class="vlock-rec-dot"></span> <span id="recordVoiceLabel" data-i18n="voices.record">🎙️ Record a voice</span></span>
+            </button>
+            <button id="uploadVoiceBtn" class="vlock-enroll voices-upload" data-i18n="voices.upload">⬆︎ Upload</button>
+            <input id="uploadVoiceInput" type="file" accept="audio/*" style="display:none;" />
+          </div>
+        </div>
+      </details>
+
       <!-- ── Section: Detection & timing ────────────────────────────── -->
       <details class="acc" open data-sec="detection">
         <summary>🎚️ <span data-i18n="settings.sec_detection">Detection &amp; timing</span></summary>
@@ -1199,6 +1248,32 @@
         "voicelock.too_short": "Too short — speak for a few seconds.",
         "voicelock.unavailable": "Speaker model not loaded on the server.",
         "voicelock.error": "Enrollment failed: {err}",
+        // Voice library (cloned voices)
+        "voices.title": "Voices",
+        "voices.tagline": "Clone & choose a speaking voice",
+        "voices.help": "Record a short sample or upload an audio file to clone a voice, then pick which voice the assistant speaks in. The choice applies to every device and is kept across sessions.",
+        "voices.chip_none": "—",
+        "voices.builtin": "built-in",
+        "voices.active": "ACTIVE",
+        "voices.select": "Use",
+        "voices.preview": "Preview",
+        "voices.rename": "Rename",
+        "voices.delete": "Delete",
+        "voices.record": "🎙️ Record a voice",
+        "voices.recording": "Recording… ({pct}%)",
+        "voices.upload": "⬆︎ Upload",
+        "voices.uploading": "Uploading…",
+        "voices.empty": "No voices yet — record or upload one.",
+        "voices.name_prompt": "Name for this voice:",
+        "voices.default_name": "Cloned voice",
+        "voices.rename_prompt": "New name:",
+        "voices.delete_confirm": "Delete voice “{name}”?",
+        "voices.transcript_prompt": "Couldn’t auto-detect the words. Type exactly what is spoken in the file:",
+        "voices.saved": "✅ Voice “{name}” added.",
+        "voices.too_short": "Too short — speak for a few seconds.",
+        "voices.no_speech": "No speech recognised in the sample.",
+        "voices.unavailable": "Voice cloning is not available.",
+        "voices.error": "Voice operation failed: {err}",
         // Speaker button
         "speaker.tip": "Click: play / pause · Hold: from the start",
         "speaker.no_audio": "No audio (e.g. after reloading the page)",
@@ -1377,6 +1452,32 @@
         "voicelock.too_short": "Zu kurz — sprich ein paar Sekunden.",
         "voicelock.unavailable": "Sprecher-Modell auf dem Server nicht geladen.",
         "voicelock.error": "Einlernen fehlgeschlagen: {err}",
+        // Stimmen-Bibliothek (geklonte Stimmen)
+        "voices.title": "Stimmen",
+        "voices.tagline": "Stimme klonen & auswählen",
+        "voices.help": "Nimm eine kurze Probe auf oder lade eine Audiodatei hoch, um eine Stimme zu klonen — und wähle, in welcher Stimme die Assistentin spricht. Die Auswahl gilt für alle Geräte und bleibt über Sitzungen hinweg erhalten.",
+        "voices.chip_none": "—",
+        "voices.builtin": "Standard",
+        "voices.active": "AKTIV",
+        "voices.select": "Wählen",
+        "voices.preview": "Vorschau",
+        "voices.rename": "Umbenennen",
+        "voices.delete": "Löschen",
+        "voices.record": "🎙️ Stimme aufnehmen",
+        "voices.recording": "Aufnahme… ({pct}%)",
+        "voices.upload": "⬆︎ Hochladen",
+        "voices.uploading": "Wird hochgeladen…",
+        "voices.empty": "Noch keine Stimmen — nimm eine auf oder lade eine hoch.",
+        "voices.name_prompt": "Name für diese Stimme:",
+        "voices.default_name": "Geklonte Stimme",
+        "voices.rename_prompt": "Neuer Name:",
+        "voices.delete_confirm": "Stimme „{name}“ löschen?",
+        "voices.transcript_prompt": "Die Wörter konnten nicht automatisch erkannt werden. Tippe genau ein, was in der Datei gesprochen wird:",
+        "voices.saved": "✅ Stimme „{name}“ hinzugefügt.",
+        "voices.too_short": "Zu kurz — sprich ein paar Sekunden.",
+        "voices.no_speech": "Keine Sprache in der Probe erkannt.",
+        "voices.unavailable": "Stimmen-Klonen ist nicht verfügbar.",
+        "voices.error": "Stimmen-Aktion fehlgeschlagen: {err}",
         // Speaker button
         "speaker.tip": "Klick: Abspielen / Pause · Gedrückt halten: von vorn",
         "speaker.no_audio": "Kein Audio (z.B. nach Neuladen der Seite)",
@@ -1529,6 +1630,14 @@
     const voiceLockThresholdLabel = document.getElementById('voiceLockThresholdLabel');
     const voiceLockToggleRow = document.getElementById('voiceLockToggleRow');
     const voiceLockToggle    = document.getElementById('voiceLockToggle');
+    const voicesCard       = document.getElementById('voicesCard');
+    const voicesChip       = document.getElementById('voicesChip');
+    const voicesList       = document.getElementById('voicesList');
+    const recordVoiceBtn   = document.getElementById('recordVoiceBtn');
+    const recordVoiceLabel = document.getElementById('recordVoiceLabel');
+    const voiceRecProg     = document.getElementById('voiceRecProg');
+    const uploadVoiceBtn   = document.getElementById('uploadVoiceBtn');
+    const uploadVoiceInput = document.getElementById('uploadVoiceInput');
 
     /* ===== Persistent UI settings (survive a reload) =====
        Mode, VAD threshold, wake-cue volume and panel state are already
@@ -2343,6 +2452,9 @@
     function opusDownlinkActive() { return opusSupport.dec && serverAudioCaps.opusOut; }
     let serverWake = { available: false, enabled: false }; // wake-word info (from hello)
     let serverSpeaker = { available: false, enrolled: false, count: 0 }; // voice-lock (from hello)
+    // Voice library (cloned voices) from hello.voiceClone / voice.state broadcasts.
+    let serverVoiceClone = { available: false, active: 'default', voices: [] };
+    const VOICE_CLONE_SECONDS = 8;
     // Runtime on/off for the voice lock (persisted). Re-asserted to the server
     // on every (re)connect via sendSettings(); default on.
     let speakerLockOn = localStorage.getItem('speakerLockOn') !== '0';
@@ -3292,6 +3404,12 @@
           serverWake = m.wakeWord || { available: false, enabled: false };
           if (m.speakerLock) serverSpeaker = m.speakerLock;
           updateVoiceLockUi();
+          if (m.voiceClone) serverVoiceClone = {
+            available: !!m.voiceClone.available,
+            active: m.voiceClone.active || 'default',
+            voices: m.voiceClone.voices || [],
+          };
+          updateVoicesUi();
           addBubble('sys', `🟢 ${m.msg}`);
           // On the first hello, set the start mode: the user's remembered choice
           // (localStorage) takes precedence, otherwise the server default (wakeWord.enabled).
@@ -3328,6 +3446,24 @@
         case 'settings.ack':
           applyServerVadParams(m.vad);
           if (m.audioCodec) console.log('[opus] downlink codec ack: ' + m.audioCodec);
+          break;
+        case 'voice.state':
+          serverVoiceClone = { available: true, active: m.active || 'default', voices: m.voices || [] };
+          updateVoicesUi();
+          break;
+        case 'voice.clone.ack':
+          if (m.ok) {
+            addBubble('sys', t('voices.saved', { name: (m.voice && m.voice.name) || t('voices.default_name') }));
+          } else {
+            const emap = { too_short: 'voices.too_short', no_speech: 'voices.no_speech', unavailable: 'voices.unavailable' };
+            addBubble('err', t(emap[m.error] || 'voices.error', { err: m.error }));
+          }
+          break;
+        case 'voice.preview.audio':
+          playPreviewAudio(m.audioB64, m.mime);
+          break;
+        case 'voice.error':
+          addBubble('err', t('voices.error', { err: m.error }));
           break;
         case 'session.reset.ack':
           newSessionBtn.disabled = false;
@@ -4647,6 +4783,181 @@
     if (enrollVoiceBtn) enrollVoiceBtn.addEventListener('click', enrollRecord);
     if (forgetVoiceBtn) forgetVoiceBtn.addEventListener('click', () => {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'speaker.enroll.clear' }));
+    });
+
+    /* ===== Voice library (cloned voices) ===== */
+    function voiceSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+    function mkVoiceBtn(label, onClick, danger) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      if (danger) b.className = 'danger';
+      b.addEventListener('click', onClick);
+      return b;
+    }
+
+    function updateVoicesUi() {
+      if (!voicesCard) return;
+      const avail = !!(serverVoiceClone && serverVoiceClone.available);
+      voicesCard.style.display = avail ? '' : 'none';
+      if (!avail) return;
+      const list = serverVoiceClone.voices || [];
+      const active = serverVoiceClone.active || 'default';
+      const activeVoice = list.find(v => v.id === active);
+      if (voicesChip) voicesChip.textContent = (activeVoice && activeVoice.name) || t('voices.chip_none');
+      if (!voicesList) return;
+      voicesList.innerHTML = '';
+      if (!list.length) {
+        const e = document.createElement('div');
+        e.className = 'voices-empty'; e.textContent = t('voices.empty');
+        voicesList.appendChild(e);
+        return;
+      }
+      list.forEach(v => {
+        const row = document.createElement('div');
+        row.className = 'voices-row' + (v.id === active ? ' active' : '');
+        const nm = document.createElement('span');
+        nm.className = 'vname'; nm.textContent = v.name || v.id;
+        row.appendChild(nm);
+        if (v.isDefault) {
+          const b = document.createElement('span');
+          b.className = 'vbuiltin'; b.textContent = t('voices.builtin');
+          row.appendChild(b);
+        }
+        if (v.id === active) {
+          const tg = document.createElement('span');
+          tg.className = 'vtag'; tg.textContent = t('voices.active');
+          row.appendChild(tg);
+        }
+        const acts = document.createElement('div');
+        acts.className = 'voices-actions';
+        if (v.id !== active) acts.appendChild(mkVoiceBtn(t('voices.select'), () => voiceSend({ type: 'voice.select', id: v.id })));
+        acts.appendChild(mkVoiceBtn(t('voices.preview'), () => voiceSend({ type: 'voice.preview', id: v.id })));
+        if (!v.isDefault) {
+          acts.appendChild(mkVoiceBtn(t('voices.rename'), () => {
+            const name = prompt(t('voices.rename_prompt'), v.name || '');
+            if (name && name.trim()) voiceSend({ type: 'voice.rename', id: v.id, name: name.trim() });
+          }));
+          acts.appendChild(mkVoiceBtn(t('voices.delete'), () => {
+            if (confirm(t('voices.delete_confirm', { name: v.name || v.id }))) voiceSend({ type: 'voice.delete', id: v.id });
+          }, true));
+        }
+        row.appendChild(acts);
+        voicesList.appendChild(row);
+      });
+    }
+
+    function playPreviewAudio(b64, mime) {
+      try {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'audio/wav' }));
+        const a = new Audio(url);
+        a.onended = () => { try { URL.revokeObjectURL(url); } catch (_) {} };
+        a.play().catch(() => {});
+      } catch (_) {}
+    }
+
+    // Record a ~8s reference take and register it as a new cloned voice.
+    // Mirrors enrollRecord: it owns the binary channel (reuses the `enrolling`
+    // guard so the VAD/PTT senders stand down) and streams raw 16 kHz f32 PCM.
+    async function cloneRecord() {
+      if (enrolling) return;
+      if (!serverVoiceClone.available) { addBubble('err', t('voices.unavailable')); return; }
+      if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
+      const name = prompt(t('voices.name_prompt'), '');
+      if (name === null) return;                    // cancelled
+      enrolling = true;
+      recordVoiceBtn.disabled = true;
+      recordVoiceBtn.classList.add('recording');
+      if (inputStreaming) abortInputStream();
+      if (vad && micActive) { try { vad.pause(); } catch (_) {} }
+      let ctx = null, stream = null, tap = null, sink = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = ctx.createMediaStreamSource(stream);
+        tap = ctx.createScriptProcessor(2048, 1, 1);
+        ws.send(JSON.stringify({ type: 'voice.clone.start' }));
+        const target = 16000 * VOICE_CLONE_SECONDS;
+        const ds16k = makeDownsampler16k();
+        let sent = 0;
+        await new Promise((resolve, reject) => {
+          const deadline = setTimeout(
+            () => reject(new Error('recording timed out (no audio frames)')),
+            VOICE_CLONE_SECONDS * 1000 + 8000);
+          tap.onaudioprocess = (ev) => {
+            if (sent >= target) return;
+            const ds = ds16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
+            try { ws.send(f32ToBytes(ds)); } catch (_) {}
+            sent += ds.length;
+            const pct = Math.min(100, Math.round((sent / target) * 100));
+            if (voiceRecProg) voiceRecProg.style.width = pct + '%';
+            recordVoiceLabel.textContent = t('voices.recording', { pct });
+            if (sent >= target) { clearTimeout(deadline); resolve(); }
+          };
+          src.connect(tap);
+          sink = ctx.createGain(); sink.gain.value = 0;
+          tap.connect(sink).connect(ctx.destination);
+        });
+        ws.send(JSON.stringify({ type: 'voice.clone.commit', name: (name || '').trim() }));
+        // Result comes back as 'voice.clone.ack' (+ a 'voice.state' broadcast).
+      } catch (e) {
+        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'voice.clone.abort' })); } catch (_) {}
+        addBubble('err', t('voices.error', { err: (e && e.message) || e }));
+      } finally {
+        try { if (tap) tap.disconnect(); } catch (_) {}
+        try { if (sink) sink.disconnect(); } catch (_) {}
+        try { if (stream) stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
+        try { if (ctx) await ctx.close(); } catch (_) {}
+        enrolling = false;
+        recordVoiceBtn.disabled = false;
+        recordVoiceBtn.classList.remove('recording');
+        if (voiceRecProg) voiceRecProg.style.width = '0%';
+        recordVoiceLabel.textContent = t('voices.record');
+        if (vad && micActive) { try { vad.start(); } catch (_) {} }
+      }
+    }
+
+    async function uploadVoiceFile(file, name, refText) {
+      const fd = new FormData();
+      fd.append('file', file, file.name || 'sample');
+      fd.append('name', name || '');
+      if (refText) fd.append('refText', refText);
+      uploadVoiceBtn.disabled = true;
+      const prevLabel = uploadVoiceBtn.textContent;
+      uploadVoiceBtn.textContent = t('voices.uploading');
+      try {
+        const resp = await fetch(`${BASE}/voice-upload`, { method: 'POST', body: fd });
+        const j = await resp.json().catch(() => ({ ok: false, error: 'bad response' }));
+        if (!j.ok) {
+          if (j.error === 'need_transcript') {
+            const tx = prompt(t('voices.transcript_prompt'), '');
+            if (tx && tx.trim()) { await uploadVoiceFile(file, name, tx.trim()); return; }
+            return;
+          }
+          addBubble('err', t('voices.error', { err: j.error || ('HTTP ' + resp.status) }));
+          return;
+        }
+        addBubble('sys', t('voices.saved', { name: (j.voice && j.voice.name) || name || t('voices.default_name') }));
+        voiceSend({ type: 'voice.list' });   // refresh (also broadcast to peers)
+      } catch (e) {
+        addBubble('err', t('voices.error', { err: (e && e.message) || e }));
+      } finally {
+        uploadVoiceBtn.disabled = false;
+        uploadVoiceBtn.textContent = prevLabel;
+      }
+    }
+
+    if (recordVoiceBtn) recordVoiceBtn.addEventListener('click', cloneRecord);
+    if (uploadVoiceBtn) uploadVoiceBtn.addEventListener('click', () => uploadVoiceInput && uploadVoiceInput.click());
+    if (uploadVoiceInput) uploadVoiceInput.addEventListener('change', () => {
+      const f = uploadVoiceInput.files && uploadVoiceInput.files[0];
+      uploadVoiceInput.value = '';
+      if (!f) return;
+      const suggested = (f.name || 'voice').replace(/\.[^.]+$/, '');
+      const name = prompt(t('voices.name_prompt'), suggested);
+      if (name === null) return;
+      uploadVoiceFile(f, (name || '').trim(), '');
     });
 
     /* ===== Push-to-Talk =====

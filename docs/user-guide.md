@@ -125,6 +125,26 @@ the foreign passage struck through in red. Full behavior + setup:
 
 ---
 
+## Voices (cloning)
+
+Appears as a **Voices** card only when the server has voice cloning wired
+(`TTS_CLONE_ENABLED=1` + the OmniVoice wrapper behind TTS). It clones and manages
+the voice the assistant speaks in.
+
+- **🎙️ Record a voice** — records ~8 s, then asks for a name and adds it to the
+  library. Speak naturally in a quiet spot for the best clone.
+- **⬆️ Upload** — pick an audio file (any format). The spoken words are detected
+  automatically; if that fails you're asked to type them.
+- Each voice row has **Use** (make it the active voice), **🔊 Preview** (hear a
+  test sentence), **Rename**, and **Delete**. The built-in default voice can't be
+  deleted.
+- The **active** voice is used for **every** connected device and is remembered
+  across restarts and new sessions — pick once, it sticks.
+
+Full behavior + setup: [README → Voices](../README.md#voices-cloning).
+
+---
+
 ## Latency / stats footer
 
 The footer shows the perceived response time for the last turn:

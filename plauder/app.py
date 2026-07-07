@@ -48,6 +48,7 @@ def build_app() -> web.Application:
     app.router.add_get(p("/healthz"), server.healthz)
     app.router.add_get(p("/ws"), server.ws_handler)
     app.router.add_post(p("/upload"), upload_image)
+    app.router.add_post(p("/voice-upload"), server.upload_voice_sample)
     if server.STATIC_DIR.exists():
         app.router.add_static(p("/static/"), server.STATIC_DIR, show_index=False)
     app.router.add_static(p("/uploads/"), UPLOAD_DIR, show_index=False)
@@ -96,7 +97,20 @@ async def init_backends(cfg: Config):
             LOG.warning("Speaker lock disabled (load failed): %s", exc)
             speaker = None
 
-    return stt, tts, conv, speaker
+    # Voice library (cloned voices). Only usable when TTS talks to the OmniVoice
+    # wrapper (openai backend + a base_url) — plain OpenAI TTS can't clone.
+    voices = None
+    if cfg.tts_clone_enabled:
+        if cfg.tts_backend == "openai" and cfg.tts_openai_base_url:
+            from .voices import VoiceLibrary
+            voices = VoiceLibrary(cfg.tts_openai_base_url, cfg.tts_openai_api_key,
+                                  cfg.active_voice_state_path)
+        else:
+            LOG.warning("TTS_CLONE_ENABLED is set but TTS is not the OmniVoice "
+                        "wrapper (need TTS_BACKEND=openai + TTS_OPENAI_BASE_URL) "
+                        "— voice library disabled.")
+
+    return stt, tts, conv, speaker, voices
 
 
 async def main():
@@ -115,14 +129,17 @@ async def main():
                  cfg.house_speaker_id, cfg.house_wake_word, cfg.house_auth)
 
     try:
-        stt, tts, conv, speaker = await init_backends(cfg)
+        stt, tts, conv, speaker, voices = await init_backends(cfg)
     except Exception:
         LOG.exception("Backend initialization failed")
         sys.exit(3)
 
     bridge = None  # Telegram bridge is legacy/optional; off by default.
 
-    server.configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge, speaker=speaker)
+    server.configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge, speaker=speaker,
+                     voices=voices)
+    if voices is not None:
+        LOG.info("🗣️  Voice library active (active voice=%s)", voices.get_active())
     if speaker is not None:
         LOG.info("🔒 Speaker lock active (enrolled=%s, threshold=%.2f)",
                  speaker.has_profile(), speaker.threshold)

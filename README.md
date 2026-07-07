@@ -28,6 +28,10 @@ Fireworks), local models (faster-whisper, OmniVoice) and gateway backends
 - 🔒 **Voice lock** — optional speaker verification: enroll your voice from the
   UI and only *your* voice is transcribed; other people and background voices
   (TV, kids) are dropped before the LLM (see [Voice lock](#voice-lock)).
+- 🗣️ **Voice library / cloning** — record a short sample or upload an audio file
+  to clone a speaking voice, name it, and pick which voice the assistant speaks
+  in. Persistent and shared across all devices. Needs the OmniVoice wrapper
+  behind TTS; off by default (`TTS_CLONE_ENABLED`) (see [Voices](#voices-cloning)).
 - 🗣️ **Turn-taking & barge-in** — debounce/coalescing; speaking again while the
   agent is answering discards its reply and starts a new turn.
 - 💬 **Text + 🖼️ images** — type alongside the voice and attach images
@@ -290,6 +294,32 @@ Until a profile is enrolled the gate stays open (fail-open), and any load proble
 is **model-specific**: after switching `SPEAKER_MODEL_PATH` an old profile is
 ignored (logged) and you re-enroll. All parameters:
 [Configuration → Speaker lock](docs/configuration.md#speaker-lock-voice-gate).
+
+---
+
+## Voices (cloning)
+
+Give the assistant a **custom speaking voice** — cloned from a few seconds of
+audio — and manage a whole library of them from the browser. Enable with
+`TTS_CLONE_ENABLED=1`; a **"Voices"** card then appears in the settings panel.
+
+- **Add a voice** — 🎙️ record a ~8 s sample, or ⬆️ upload an audio file (any
+  format). The reference transcript is filled in automatically (Whisper); for
+  uploads you can also type it if auto-detection fails.
+- **Manage** — name, rename, delete, and 🔊 preview each voice. A built-in
+  default voice always exists and can't be deleted.
+- **Pick the active voice** — the assistant speaks in it for **every** connected
+  device, and the choice **persists across restarts and new sessions** (stored
+  in `ACTIVE_VOICE_STATE_PATH`, default `./.active_voice`).
+
+**Requires the OmniVoice wrapper behind TTS** — voice cloning is an OmniVoice
+capability, so `TTS_BACKEND=openai` must point at
+[`omnivoice-openai-wrapper`](omnivoice-openai-wrapper/README.md) (plain OpenAI
+TTS can't clone; the flag is ignored with a warning otherwise). The library
+itself — reference WAVs + metadata — lives **on the wrapper/GPU box**
+(`OMNIVOICE_VOICES_DIR`); the app mediates all record/upload/manage actions so
+the browser never talks to the GPU box directly. Parameters:
+[Configuration → Voice cloning](docs/configuration.md#voice-cloning--voice-library).
 
 ---
 

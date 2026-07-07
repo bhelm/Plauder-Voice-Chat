@@ -15,6 +15,10 @@ house_data/
 .hermes_session_id
 .hermes_session_id.tmp
 
+# Persisted active cloned-voice id (runtime state; see TTS_CLONE_ENABLED)
+.active_voice
+.active_voice.tmp
+
 # Speaker lock: downloaded embedding models + the enrolled voice profile
 models/
 *.onnx

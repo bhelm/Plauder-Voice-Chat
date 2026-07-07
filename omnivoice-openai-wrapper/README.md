@@ -119,12 +119,14 @@ systemd unit.
 | Var | Default | Meaning |
 |---|---|---|
 | `OMNIVOICE_MODEL` | `k2-fsa/OmniVoice` | Hugging Face model id |
-| `OMNIVOICE_REF_WAV` | `./ref/ref.wav` | voice-clone reference audio |
+| `OMNIVOICE_REF_WAV` | `./ref/ref.wav` | built-in (`default`) voice reference audio |
 | `OMNIVOICE_REF_TXT` | `./ref/ref.txt` | exact transcript of that audio |
+| `OMNIVOICE_VOICES_DIR` | `./voices` | persistent voice library (added voices: `{id}.wav` + `{id}.json`) |
 | `OMNIVOICE_LANG` | `de` | default synthesis language |
-| `OMNIVOICE_VOICE` | `de_female` | advertised voice name |
+| `OMNIVOICE_VOICE` | `de_female` | display name of the built-in `default` voice |
 | `OMNIVOICE_NUM_STEP` | `32` | diffusion steps — lower = faster/rougher (16 is a good live default) |
 | `OMNIVOICE_NORMALIZE` | `1` | expand German digits/dates/currency before synth |
+| `OMNIVOICE_PROMPT_CACHE` | `8` | max cloned prompts kept warm in VRAM (LRU) |
 | `CUDA_VISIBLE_DEVICES` | — | pin to one GPU |
 | `HF_HOME` | — | model cache location |
 
@@ -161,12 +163,29 @@ service behind all of them.
 
 ## Endpoints
 
-- `POST /v1/audio/speech` — body `{input, response_format?, speed?, language?}`.
+- `POST /v1/audio/speech` — body `{input, voice?, response_format?, speed?, language?}`.
   `response_format` ∈ `mp3` (default) `wav` `flac` `pcm` `opus` `aac`.
-  `language` is a non-standard convenience override (defaults to `OMNIVOICE_LANG`).
+  `voice` selects a library voice by **id** (`default` or an id from
+  `GET /v1/audio/voices`); an unknown id falls back to `default` so audio never
+  breaks. `language` is a non-standard convenience override (defaults to `OMNIVOICE_LANG`).
 - `GET /v1/models` — advertises the single `omnivoice` model.
-- `GET /v1/audio/voices` — the one configured voice name.
-- `GET /health` — `{status: ok|loading, voice}`.
+- `GET /v1/audio/voices` — the voice library: `{voices: [{id, name, created, isDefault}]}`.
+- `POST /v1/audio/voices` — **register a new cloned voice.** `multipart/form-data`
+  with `file` (any audio format — decoded via ffmpeg to a 24 kHz mono reference),
+  `name`, and `ref_text` (exact transcript of the sample). Returns `{id, name, …}`.
+- `PATCH /v1/audio/voices/{id}` — rename: body `{name}` (built-in `default` is immutable).
+- `DELETE /v1/audio/voices/{id}` — remove a cloned voice (built-in `default` can't be deleted).
+- `GET /health` — `{status: ok|loading, voice, voices}`.
+
+### Voice library
+
+Beyond the frozen built-in voice, the wrapper keeps a **persistent library** under
+`OMNIVOICE_VOICES_DIR`: each added voice is a reference WAV + a small JSON of
+`{id, name, ref_text, created}`, reloaded on restart. Clone prompts are built
+lazily and cached in VRAM (LRU, `OMNIVOICE_PROMPT_CACHE`). The voice-chat app
+drives all of this from the browser (record/upload/rename/delete/pick-active) —
+see the app's `TTS_CLONE_ENABLED`.
 
 Requests are serialized (single GPU, one `threading.Lock`); the model and the
-frozen clone prompt are loaded once at startup with a warmup pass.
+built-in clone prompt are loaded once at startup with a warmup pass. Registering
+a voice runs its decode + clone in a threadpool so concurrent speech isn't blocked.

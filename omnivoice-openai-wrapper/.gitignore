@@ -3,6 +3,8 @@ ref/ref.wav
 ref/ref.txt
 ref/cand_*.wav
 ref/*.bak.*
+# Persistent voice library (user recordings/uploads + metadata).
+voices/
 out/
 *.log
 __pycache__/

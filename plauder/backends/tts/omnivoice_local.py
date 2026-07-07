@@ -113,7 +113,10 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
                 samples = np.concatenate(parts) if parts else np.zeros(1, dtype=np.float32)
         return audio_utils.float32_to_pcm16_bytes(samples)
 
-    async def synth(self, text: str, *, speed: float = 1.0) -> tuple[bytes, int]:
+    async def synth(self, text: str, *, speed: float = 1.0,
+                    voice: str | None = None) -> tuple[bytes, int]:
+        # `voice` (per-call clone-voice override) is not supported by the
+        # in-process backend — the reference is fixed at construction. Ignored.
         if self._tts is None:
             raise RuntimeError("TTS not initialized (load() did not run)")
         async with self._lock:

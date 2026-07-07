@@ -30,6 +30,7 @@ annotated template — copy it to `.env` and edit.
 - [Backend selection](#backend-selection)
 - [STT — speech to text](#stt--speech-to-text)
 - [TTS — text to speech](#tts--text-to-speech)
+- [Voice cloning / voice library](#voice-cloning--voice-library)
 - [LLM](#llm)
 - [Turn-taking](#turn-taking)
 - [Streaming & latency](#streaming--latency)
@@ -146,6 +147,25 @@ omnivoice torch`). For a shared GPU box prefer the standalone wrapper instead
 | `OMNIVOICE_REF_AUDIO` | `` | Reference voice WAV (**required** in `clone` mode). |
 | `OMNIVOICE_REF_TEXT` | `` | Transcript of the reference audio (optional). |
 | `OMNIVOICE_LANGUAGE` | *(= `APP_LANGUAGE`)* | Spoken language; empty follows `APP_LANGUAGE`. |
+
+## Voice cloning / voice library
+
+In-browser voice library: record or upload a sample → cloned voice, name/rename/
+delete, and pick the active voice for the whole session. **Requires the OmniVoice
+wrapper behind TTS** (`TTS_BACKEND=openai` + `TTS_OPENAI_BASE_URL` pointing at
+[`omnivoice-openai-wrapper`](../omnivoice-openai-wrapper/README.md)) — plain
+OpenAI TTS can't clone, so the flag is ignored (with a warning) otherwise. See
+[Voices](../README.md#voices-cloning).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TTS_CLONE_ENABLED` | `0` | `1` = advertise the voice library to the browser (`hello.voiceClone`) and mediate record/upload/select against the wrapper's `/v1/audio/voices` CRUD API. |
+| `ACTIVE_VOICE_STATE_PATH` | *(= `./.active_voice`)* | File persisting the globally selected voice id, so the choice survives restarts and new sessions. |
+
+> The voice library itself (reference WAVs + metadata) lives **on the wrapper /
+> GPU box**, configured there via `OMNIVOICE_VOICES_DIR` (default `./voices`) and
+> `OMNIVOICE_PROMPT_CACHE` (max cloned prompts kept warm in VRAM, default `8`) —
+> see the [wrapper README](../omnivoice-openai-wrapper/README.md).
 
 ## LLM
 

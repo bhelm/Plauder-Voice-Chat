@@ -1,0 +1,120 @@
+"""Voice library: per-call TTS voice override, active-voice persistence, and the
+server-side clone helpers. All network-free (fake OpenAI client / fake library)."""
+import asyncio
+import types
+from unittest.mock import MagicMock
+
+import numpy as np
+
+from plauder import server as srv
+from plauder.backends.tts.openai_api import OpenAITTSBackend
+from plauder.voices import DEFAULT_VOICE_ID, VoiceLibrary
+
+
+class _Cfg:
+    tts_backend = "openai"
+    tts_openai_api_key = "sk-test"
+    tts_openai_model = "tts-1"
+    tts_openai_voice = "nova"
+    tts_openai_base_url = None
+    tts_sentence_split = False
+    tts_max_chars_per_chunk = 220
+    tts_sentence_gap_ms = 120
+
+
+def _openai_with_mock():
+    eng = OpenAITTSBackend.from_config(_Cfg())
+    resp = MagicMock()
+    resp.read.return_value = np.asarray([1, 2, 3], dtype=np.int16).tobytes()
+    client = MagicMock()
+    client.audio.speech.create.return_value = resp
+    eng._client = client
+    return eng, client
+
+
+# --- per-call voice override -------------------------------------------------
+def test_synth_voice_override_wins_over_default():
+    eng, client = _openai_with_mock()
+    asyncio.run(eng.synth("hi", voice="clone-123"))
+    assert client.audio.speech.create.call_args.kwargs["voice"] == "clone-123"
+
+
+def test_synth_without_voice_uses_default():
+    eng, client = _openai_with_mock()
+    asyncio.run(eng.synth("hi"))
+    assert client.audio.speech.create.call_args.kwargs["voice"] == "nova"
+
+
+# --- active-voice persistence ------------------------------------------------
+def test_active_voice_defaults_to_builtin(tmp_path):
+    lib = VoiceLibrary("http://x/v1", state_path=str(tmp_path / ".active_voice"))
+    assert lib.get_active() == DEFAULT_VOICE_ID
+
+
+def test_active_voice_persists_across_instances(tmp_path):
+    path = str(tmp_path / ".active_voice")
+    VoiceLibrary("http://x/v1", state_path=path).set_active("abc123")
+    # a fresh instance (fresh cache) reads the persisted id back
+    assert VoiceLibrary("http://x/v1", state_path=path).get_active() == "abc123"
+
+
+def test_set_active_empty_falls_back_to_default(tmp_path):
+    lib = VoiceLibrary("http://x/v1", state_path=str(tmp_path / ".active_voice"))
+    assert lib.set_active("") == DEFAULT_VOICE_ID
+
+
+def test_voice_url_built_under_v1():
+    lib = VoiceLibrary("http://box:8880/v1/", state_path="/tmp/none")
+    assert lib._url("") == "http://box:8880/v1/audio/voices"
+    assert lib._url("/abc") == "http://box:8880/v1/audio/voices/abc"
+
+
+# --- server helpers ----------------------------------------------------------
+class _FakeVoices:
+    def __init__(self, active="clone-1"):
+        self._active = active
+
+    def get_active(self):
+        return self._active
+
+    async def list(self):
+        return [
+            {"id": DEFAULT_VOICE_ID, "name": "Built-in", "isDefault": True},
+            {"id": "clone-1", "name": "Me", "isDefault": False},
+        ]
+
+
+def test_clone_active_and_active_voice_id(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
+    monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
+    assert srv._clone_active() is True
+    assert srv._active_voice_id() == "clone-1"
+
+
+def test_clone_inactive_when_disabled(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
+    monkeypatch.setattr(srv, "VOICES", _FakeVoices())
+    assert srv._clone_active() is False
+    assert srv._active_voice_id() is None
+
+
+def test_clone_inactive_when_no_library(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
+    monkeypatch.setattr(srv, "VOICES", None)
+    assert srv._clone_active() is False
+    assert srv._active_voice_id() is None
+
+
+def test_voice_clone_hello_available(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
+    monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
+    hello = asyncio.run(srv._voice_clone_hello())
+    assert hello["available"] is True
+    assert hello["active"] == "clone-1"
+    assert {v["id"] for v in hello["voices"]} == {DEFAULT_VOICE_ID, "clone-1"}
+
+
+def test_voice_clone_hello_unavailable(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
+    monkeypatch.setattr(srv, "VOICES", None)
+    assert asyncio.run(srv._voice_clone_hello()) == {"available": False}
