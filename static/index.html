@@ -2468,6 +2468,8 @@
         cachedSamples: 0,
         decoder: null,       // opus downlink: WebCodecs AudioDecoder (VCT3)
         decoderTs: 0,        // running packet timestamp (ordering only)
+        coalesce: [],        // decoded opus packets awaiting one merged push
+        coalesceSamples: 0,
       };
       if (codec === 'opus') {
         try {
@@ -2510,7 +2512,7 @@
               const v = Math.max(-1, Math.min(1, f32[i]));
               int16[i] = v < 0 ? v * 32768 : v * 32767;
             }
-            pushStreamChunk(turnId, int16);
+            queueDecodedChunk(turnId, int16);
           } catch (_) { try { audioData.close(); } catch (_) {} }
         },
         error: (e) => console.warn('[opus] downlink decoder error', e),
@@ -2530,6 +2532,35 @@
           streamPlayer.decoderTs += 20000;   // nominal 20 ms/packet (ordering only)
         } catch (e) { console.warn('[opus] decode failed', e); }
       }
+    }
+
+    // Coalesce decoded opus packets (20 ms each) into ~300 ms buffers before
+    // scheduling. One BufferSource per packet means ~50 nodes/s — a long reply
+    // synthesizes much faster than realtime, so thousands of scheduled nodes
+    // pile up and load the audio thread (audible as crackle from mid-reply to
+    // the end). The PCM path ships ~400 ms per node; this matches that. No
+    // latency cost: the server already batches ~tts_chunk_ms of packets per
+    // VCT3 frame, so packets arrive in bursts of that size anyway.
+    const OPUS_COALESCE_S = 0.3;
+    function queueDecodedChunk(turnId, int16) {
+      if (!streamPlayer || streamPlayer.turnId !== turnId) return;
+      streamPlayer.coalesce.push(int16);
+      streamPlayer.coalesceSamples += int16.length;
+      if (streamPlayer.coalesceSamples >= streamPlayer.sampleRate * OPUS_COALESCE_S) {
+        flushDecodedChunks(turnId);
+      }
+    }
+
+    function flushDecodedChunks(turnId) {
+      if (!streamPlayer || streamPlayer.turnId !== turnId) return;
+      const parts = streamPlayer.coalesce;
+      if (!parts.length) return;
+      const merged = new Int16Array(streamPlayer.coalesceSamples);
+      let off = 0;
+      for (const p of parts) { merged.set(p, off); off += p.length; }
+      streamPlayer.coalesce = [];
+      streamPlayer.coalesceSamples = 0;
+      pushStreamChunk(turnId, merged);
     }
 
     function closeStreamDecoder(sp) {
@@ -2608,6 +2639,7 @@
 
     function endStreamPlayback(turnId) {
       if (!streamPlayer || streamPlayer.turnId !== turnId) return;
+      flushDecodedChunks(turnId);   // opus: ship the sub-threshold tail
       streamPlayer.ended = true;
       maybeFinishStream();
     }

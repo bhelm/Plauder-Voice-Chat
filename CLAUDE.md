@@ -166,7 +166,10 @@ rate, ~48 kbit/s, flushed at stream end) and ships `VCT3` frames =
 ~`tts_chunk_ms`; `audio.start` carries `codec:"opus"|"pcm"`. The client decodes
 via `AudioDecoder` into the existing streamPlayer path (gapless scheduling,
 barge-in stop, replay cache, `playback.done`), gates decoded output on
-`streamPlayer.turnId` at decode-output time and flushes the decoder before
+`streamPlayer.turnId` at decode-output time, coalesces the decoded 20 ms
+packets into ~300 ms buffers before scheduling (one WebAudio node per packet
+would pile up thousands of scheduled nodes on long replies → audio-thread
+crackle; tail flushed in `endStreamPlayback`) and flushes the decoder before
 finalizing on `audio.end`. Defense in depth: an opus `segment.stream.start`
 without a usable server codec is answered with `transcript.error` and the
 segment is dropped.
