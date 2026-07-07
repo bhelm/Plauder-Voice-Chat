@@ -5,7 +5,10 @@ speech-to-speech chat, including the optional features (voice lock, wake word,
 local GPU backends, systemd, reverse proxy).
 
 The short version for the impatient is in the [README](README.md#getting-started);
-this guide covers the full path with all the options.
+this guide covers the full path with all the options. For an exhaustive,
+grouped list of **every** `.env` variable see the
+**[configuration reference](docs/configuration.md)**; for the browser UI see the
+**[user guide](docs/user-guide.md)**.
 
 ---
 
@@ -27,8 +30,11 @@ this guide covers the full path with all the options.
 > access put the app behind HTTPS (see [reverse proxy](#7-reverse-proxy--sub-path))
 > or tunnel it (`ssh -L 8319:localhost:8319 yourserver`).
 
-No ffmpeg, no system audio libraries, no GPU are needed for the cloud default —
-audio is handled as raw PCM in Python and in the browser.
+No ffmpeg and no GPU are needed for the cloud default — audio is handled as raw
+PCM in Python and in the browser. The one optional system library is **libopus**
+(Debian/Ubuntu: `sudo apt install libopus0`): if present, the mic uplink and TTS
+downlink are Opus-compressed (`AUDIO_OPUS=1`, mainly useful on mobile links); if
+absent, the server silently keeps the raw PCM paths.
 
 ## 2. Get the code and start it
 
@@ -55,7 +61,10 @@ Then open **http://localhost:8319**, allow the microphone, and talk.
 ## 3. Configure `.env` (the only config file)
 
 All configuration and all secrets live in `.env` (gitignored). Every option is
-documented inline in [`.env.example`](.env.example). The minimal cloud setup:
+documented inline in [`.env.example`](.env.example) and grouped with defaults in
+the [configuration reference](docs/configuration.md) — including optional extras
+not covered step-by-step here (pronunciation lexicon, startup warmups, Hermes
+memory binding). The minimal cloud setup:
 
 ```bash
 # STT + TTS via OpenAI
@@ -106,6 +115,10 @@ WHISPER_DEVICE=cpu          # or cuda on a GPU box
 WHISPER_MODEL=base          # cpu: base/small; gpu: large-v3-turbo
 WHISPER_LOCAL_FILES_ONLY=0  # 1 on air-gapped/GPU boxes with pre-downloaded models
 ```
+
+Endpoints that lazy-load the model on first request pay a cold-start cost on the
+user's first real turn — set `STT_WARMUP=1` (and `TTS_WARMUP=1` for a self-hosted
+TTS) to fire one throwaway call at startup instead.
 
 ### Local TTS (OmniVoice)
 
