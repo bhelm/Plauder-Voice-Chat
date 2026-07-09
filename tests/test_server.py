@@ -137,6 +137,29 @@ def test_ws_hello_frame():
     asyncio.run(run())
 
 
+def test_ws_malformed_type_field_does_not_kill_connection():
+    """Hostile/garbage frames must be ignored, not tear down the socket: a
+    valid-JSON frame whose `type` is unhashable ({"type": ["ping"]}) crashed
+    the dispatch-table lookup with TypeError (regression from the ws_handler
+    refactor); non-dict JSON bodies raised AttributeError even before it.
+    Both must fall through like unknown types do — connection stays usable."""
+    _configure()
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": ["ping"]})   # unhashable type value
+            await ws.send_json({"type": {"x": 1}})   # dito
+            await ws.send_json([1, 2, 3])            # valid JSON, not a dict
+            await ws.send_json({"type": "ping"})     # must still be answered
+            ack = await asyncio.wait_for(ws.receive_json(), timeout=3)
+            assert ack["type"] == "ack"
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_ws_connect_warms_selfhosted_stt():
     """A WS connect fires ONE warmup transcription when the STT backend points
     at a self-hosted endpoint (base_url set) — a cold faster-whisper server

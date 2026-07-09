@@ -2265,7 +2265,12 @@ async def ws_handler(request):
                 except json.JSONDecodeError:
                     LOG.warning("ws non-json text from %s: %r", peer, msg.data)
                     continue
-                handler = _WS_TEXT_HANDLERS.get(data.get("type"))
+                # Hostile-input guard: `type` may be any JSON value; a non-str
+                # (unhashable list/dict included) must fall through to the
+                # debug log like unknown types do — not raise out of the loop
+                # and tear down the connection.
+                t = data.get("type") if isinstance(data, dict) else None
+                handler = _WS_TEXT_HANDLERS.get(t) if isinstance(t, str) else None
                 if handler is not None:
                     await handler(conn, data)
                 else:
