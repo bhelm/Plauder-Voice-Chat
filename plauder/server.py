@@ -243,18 +243,30 @@ def _broadcast_peers_bg(origin_ws, payload: dict) -> None:
 # ============================================================================ #
 # HTTP routes
 # ============================================================================ #
+def _asset_version() -> str:
+    """Cache-busting version for the split client assets (`?v=…` in index.html):
+    the newest mtime across the non-vendor client files, so every deploy
+    invalidates the browser cache without a build step."""
+    files = [INDEX_HTML, STATIC_DIR / "style.css",
+             *sorted((STATIC_DIR / "js").glob("*.js"))]
+    mtimes = [int(p.stat().st_mtime) for p in files if p.exists()]
+    return str(max(mtimes)) if mtimes else "0"
+
+
 async def index(_request):
     if not INDEX_HTML.exists():
         return web.Response(status=500, text=f"index.html missing: {INDEX_HTML}")
     # Inject the configured UI language (APP_LANGUAGE) so the page renders in the
-    # right locale immediately, without a flash of the fallback language, and the
+    # right locale immediately, without a flash of the fallback language, the
     # sub-path prefix (BASE_PATH) so the client builds WS/upload/asset URLs that
-    # resolve behind a reverse proxy.
+    # resolve behind a reverse proxy, and the asset version for cache busting of
+    # the split CSS/JS files.
     lang = (CFG.app_language if CFG else "en")
     base = (CFG.base_path if CFG else "")
     html = (INDEX_HTML.read_text(encoding="utf-8")
             .replace("__APP_LANG__", lang)
-            .replace("__BASE_PATH__", base))
+            .replace("__BASE_PATH__", base)
+            .replace("__ASSET_VER__", _asset_version()))
     return web.Response(text=html, content_type="text/html")
 
 

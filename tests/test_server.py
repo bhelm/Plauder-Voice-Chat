@@ -115,6 +115,13 @@ def test_index_served():
         async with TestClient(TestServer(srv.build_app())) as client:
             resp = await client.get("/")
             assert resp.status == 200
+            html = await resp.text()
+            # Every serve-time placeholder must be replaced (language, sub-path
+            # prefix, asset cache-busting version for the split CSS/JS files).
+            for ph in ("__APP_LANG__", "__BASE_PATH__", "__ASSET_VER__"):
+                assert ph not in html, f"unreplaced placeholder {ph}"
+            assert 'href="/static/style.css?v=' in html
+            assert 'src="/static/js/i18n.js?v=' in html
 
     asyncio.run(run())
 

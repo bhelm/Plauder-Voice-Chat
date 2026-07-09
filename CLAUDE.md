@@ -11,14 +11,15 @@ English — match that when editing.
 **Language / i18n.** `APP_LANGUAGE` (`en`/`de`, default `en`) is the single
 language switch. It drives the assistant's default spoken language (the
 `_DEFAULT_VOICE_HINTS` entry in `config.py`) and the STT default language, and it
-is the UI locale handed to the browser. The client (`static/index.html`) is i18n
-with an in-file `I18N = { en, de }` dictionary plus a tiny `t()` /
-`applyI18n()` layer; UI text lives under `data-i18n*` attributes or `t('key')`
-calls — never hard-code user-facing strings. The server injects the language at
-serve time by replacing the `__APP_LANG__` placeholder in `index.html` (so the
-page renders in the right locale with no flash) and also advertises it as
-`hello.lang`. When adding UI strings, add a key to **both** `I18N.en` and
-`I18N.de`.
+is the UI locale handed to the browser. The client is i18n with an
+`I18N = { en, de }` dictionary (`static/js/i18n.js`) plus a tiny `t()` /
+`applyI18n()` layer in `index.html`; UI text lives under `data-i18n*` attributes
+or `t('key')` calls — never hard-code user-facing strings. The server injects
+the language at serve time by replacing the `__APP_LANG__` placeholder in
+`index.html` (so the page renders in the right locale with no flash) and also
+advertises it as `hello.lang`. When adding UI strings, add a key to **both**
+`I18N.en` and `I18N.de` — `tests/client/pure_modules.test.mjs` fails on
+mismatched key sets.
 
 **Sub-path / `BASE_PATH`.** `BASE_PATH` (default `''` = root, e.g. `/voice`) lets
 the app run behind a reverse proxy under a sub-path. `build_app()` registers every
@@ -30,6 +31,9 @@ ort `wasmPaths` use the injected `__BASE_PATH__` directly, since they run before
 `BASE` exists). Image URLs sent back to the server stay canonical (`/uploads/…`,
 prefixed only for display via `mediaUrl()`). Any new client URL or absolute asset
 path must go through `BASE`/`__BASE_PATH__`, or it breaks under a sub-path.
+The split CSS/JS asset URLs additionally carry `?v=__ASSET_VER__`, replaced at
+serve time with the newest client-file mtime (`_asset_version()` in server.py)
+— cache busting without a build step.
 
 ## Commands
 
@@ -43,9 +47,16 @@ curl http://127.0.0.1:8319/healthz       # 200 + active backends
 
 There is **no lint step** and no pytest config file; tests rely on `tests/conftest.py`.
 
-The browser client is a single hand-written file, `static/index.html` (~4500 lines
-of inline JS — no build step). After editing its JS, syntax-check by extracting the
-`<script>` blocks and running `node --check`; it cannot be unit-tested here.
+The browser client is hand-written with **no build step**: `static/index.html`
+(markup + the stateful app logic as inline JS) plus classic scripts under
+`static/js/` (`i18n.js` string table, `markdown.js` renderer, `vct.js` binary
+frame parsers) and `static/style.css`. The split files are plain classic
+scripts loaded before the main inline block — top-level `const`/`function`
+bindings are shared through the global lexical scope, so no
+import/export/window wiring. After editing client JS run
+`.venv/bin/python -m pytest tests/test_client_js.py -q`: it `node --check`s
+every file and inline block and unit-tests the pure modules
+(`tests/client/pure_modules.test.mjs`).
 
 Restarting the running server: it is managed by systemd
 (`voice-chat.service`, `Restart=always`) — use `systemctl restart voice-chat`;
