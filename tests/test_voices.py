@@ -118,3 +118,79 @@ def test_voice_clone_hello_unavailable(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", None)
     assert asyncio.run(srv._voice_clone_hello()) == {"available": False}
+
+
+# --- clone commit (recording → cleanup → STT → register) ----------------------
+def _f32(parts):
+    return np.concatenate(parts).astype(np.float32).tobytes()
+
+
+def _tone(dur_s, amp=0.25, sr=16000):
+    n = int(sr * dur_s)
+    return (np.sin(2 * np.pi * 220.0 * np.arange(n) / sr) * amp).astype(np.float32)
+
+
+def _sil(dur_s, sr=16000):
+    return np.zeros(int(sr * dur_s), dtype=np.float32)
+
+
+class _FakeSTT:
+    def __init__(self, text="hallo welt"):
+        self.text = text
+        self.buffers = []
+
+    async def transcribe(self, buf, sr):
+        self.buffers.append(buf)
+        return self.text
+
+
+class _FakeRegVoices:
+    def __init__(self):
+        self.calls = []
+
+    async def register(self, data, *, filename, content_type, name, ref_text):
+        self.calls.append({"data": data, "name": name, "ref_text": ref_text})
+        return {"id": "clone-9", "name": name, "isDefault": False}
+
+
+def _wire(monkeypatch, *, trim=True, stt=None, voices=None):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=True, tts_clone_trim=trim, app_language="en"))
+    monkeypatch.setattr(srv, "STT", stt or _FakeSTT())
+    monkeypatch.setattr(srv, "VOICES", voices or _FakeRegVoices())
+
+
+def test_clone_commit_trims_edge_fragment_before_stt(monkeypatch):
+    stt, voices = _FakeSTT(), _FakeRegVoices()
+    _wire(monkeypatch, stt=stt, voices=voices)
+    buf = _f32([_tone(0.4), _sil(0.6), _tone(3.0), _sil(0.5)])  # half word at start
+    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    assert ack["ok"] is True and ack["refText"] == "hallo welt"
+    # STT saw the CLEANED buffer (fragment + gap removed), not the raw recording
+    assert len(stt.buffers[0]) < len(buf)
+    assert voices.calls[0]["ref_text"] == "hallo welt"
+    assert voices.calls[0]["data"][:4] == b"RIFF"
+
+
+def test_clone_commit_rejects_edge_only_speech(monkeypatch):
+    voices = _FakeRegVoices()
+    _wire(monkeypatch, voices=voices)
+    buf = _f32([_tone(1.0), _sil(0.5), _tone(1.0)])  # speech touches both edges
+    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    assert ack == {"ok": False, "error": "edge_speech"}
+    assert voices.calls == []
+
+
+def test_clone_commit_trim_disabled_passes_raw_buffer(monkeypatch):
+    stt = _FakeSTT()
+    _wire(monkeypatch, trim=False, stt=stt)
+    buf = _f32([_tone(0.4), _sil(0.6), _tone(3.0), _sil(0.5)])
+    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    assert ack["ok"] is True
+    assert len(stt.buffers[0]) == len(buf)
+
+
+def test_clone_commit_too_short_raw(monkeypatch):
+    _wire(monkeypatch)
+    ack = asyncio.run(srv._clone_commit(_f32([_sil(0.5)]), "Me"))
+    assert ack == {"ok": False, "error": "too_short"}

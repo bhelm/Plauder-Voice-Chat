@@ -160,6 +160,7 @@ OpenAI TTS can't clone, so the flag is ignored (with a warning) otherwise. See
 | Variable | Default | Meaning |
 |---|---|---|
 | `TTS_CLONE_ENABLED` | `0` | `1` = advertise the voice library to the browser (`hello.voiceClone`) and mediate record/upload/select against the wrapper's `/v1/audio/voices` CRUD API. |
+| `TTS_CLONE_TRIM` | `1` | Auto-clean reference samples before cloning: half words cut off at the recording edges are removed (speech touching the window boundary is dropped up to the first pause) and edge silence is trimmed to a ~200 ms pad. A recording with *only* cut-off speech is rejected (`edge_speech` → re-record); a cleanup-failing upload falls back to the original file. `0` = register samples exactly as captured. |
 | `ACTIVE_VOICE_STATE_PATH` | *(= `./.active_voice`)* | File persisting the globally selected voice id, so the choice survives restarts and new sessions. |
 
 > The voice library itself (reference WAVs + metadata) lives **on the wrapper /

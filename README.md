@@ -303,9 +303,13 @@ Give the assistant a **custom speaking voice** — cloned from a few seconds of
 audio — and manage a whole library of them from the browser. Enable with
 `TTS_CLONE_ENABLED=1`; a **"Voices"** card then appears in the settings panel.
 
-- **Add a voice** — 🎙️ record a ~8 s sample, or ⬆️ upload an audio file (any
+- **Add a voice** — 🎙️ record a ~15 s sample, or ⬆️ upload an audio file (any
   format). The reference transcript is filled in automatically (Whisper); for
-  uploads you can also type it if auto-detection fails.
+  uploads you can also type it if auto-detection fails. Samples are **auto-
+  cleaned** before cloning (`TTS_CLONE_TRIM`, default on): half words cut off
+  at the recording edges — which the model would reproduce as noise — are
+  removed and edge silence is trimmed, so talking over the start/end of the
+  recording window no longer ruins the clone.
 - **Manage** — name, rename, delete, and 🔊 preview each voice. A built-in
   default voice always exists and can't be deleted.
 - **Pick the active voice** — the assistant speaks in it for **every** connected

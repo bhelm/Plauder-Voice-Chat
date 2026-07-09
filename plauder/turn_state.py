@@ -172,6 +172,9 @@ class TurnState:
     # voice trailing on scores slightly lower (sentence tails after an
     # owner-watch split, longer utterances), while foreign voices stay far
     # below. Preserved across turns (deliberately not cleared by reset()).
+    # The TIMESTAMP is additionally refreshed on playback.done so the window
+    # covers the follow-up after a long reply; the SCORE only moves on a
+    # strict match.
     speaker_last_own: float = 0.0
     speaker_last_own_ts: float = 0.0
     # Hermes session ID for the voice session (deterministic from the session

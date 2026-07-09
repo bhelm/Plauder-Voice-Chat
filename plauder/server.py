@@ -189,12 +189,32 @@ async def upload_voice_sample(request):
         return web.json_response(
             {"ok": False, "error": f"unsupported content type: {content_type}"}, status=400)
 
-    if not ref_text:
+    # Decode for cleanup + auto-transcription. Best-effort: if ffmpeg can't
+    # read the file, the original bytes are forwarded untouched (the wrapper
+    # decodes on its own) and a manual transcript is required.
+    pcm = b""
+    try:
+        pcm = await _ffmpeg_decode_f32le(data, SAMPLE_RATE)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("voice upload: decode failed (forwarding as-is): %s", exc)
+    if pcm and CFG is not None and CFG.tts_clone_trim:
+        # Same edge cleanup as recorded samples. Lenient here (uploads are
+        # usually pre-cut): when nothing usable remains, forward the original
+        # instead of rejecting.
+        cleaned, tinfo = audio_utils.trim_clone_reference(pcm, SAMPLE_RATE)
+        if cleaned is not None:
+            if tinfo["dropped_head"] or tinfo["dropped_tail"]:
+                LOG.info("voice upload: dropped cut-off edge speech (head=%s tail=%s)",
+                         tinfo["dropped_head"], tinfo["dropped_tail"])
+            pcm = cleaned
+            data = await asyncio.to_thread(
+                audio_utils.f32le_bytes_to_wav_bytes, pcm, SAMPLE_RATE)
+            filename = "upload.wav"
+            content_type = "audio/wav"
+    if not ref_text and pcm and STT is not None:
         # Best-effort auto-transcript so the user need not type it for uploads.
         try:
-            pcm = await _ffmpeg_decode_f32le(data, SAMPLE_RATE)
-            if pcm and STT is not None:
-                ref_text = (await STT.transcribe(pcm, SAMPLE_RATE) or "").strip()
+            ref_text = (await STT.transcribe(pcm, SAMPLE_RATE) or "").strip()
         except Exception as exc:  # noqa: BLE001
             LOG.warning("voice upload: auto-transcribe failed: %s", exc)
     if not ref_text:
@@ -216,6 +236,41 @@ async def upload_voice_sample(request):
     except Exception:  # noqa: BLE001
         pass
     return web.json_response({"ok": True, "voice": voice, "refText": ref_text})
+
+
+async def _clone_commit(buf: bytes, name: str) -> dict:
+    """Validate, clean, transcribe and register a recorded clone sample.
+    Returns the ``voice.clone.ack`` payload (without ``ts``). Strict about the
+    edge cleanup: half words cut off by the recording window are dropped, and
+    when nothing usable remains the user is asked to re-record (unlike uploads,
+    where the original is forwarded as-is)."""
+    if len(buf) < int(SAMPLE_RATE * 4 * 1.0):  # < ~1 s of f32 PCM
+        return {"ok": False, "error": "too_short"}
+    if CFG is not None and CFG.tts_clone_trim:
+        cleaned, tinfo = audio_utils.trim_clone_reference(buf, SAMPLE_RATE)
+        if cleaned is None:
+            return {"ok": False, "error": tinfo["reason"] or "no_speech"}
+        if tinfo["dropped_head"] or tinfo["dropped_tail"]:
+            LOG.info("voice clone: dropped cut-off edge speech (head=%s tail=%s, kept %.1fs)",
+                     tinfo["dropped_head"], tinfo["dropped_tail"], tinfo["kept_s"])
+        buf = cleaned
+    try:
+        # ref_text is transcribed from the CLEANED buffer, so it matches the
+        # reference audio exactly (the model subtitles every audible word).
+        ref_text = (await STT.transcribe(buf, SAMPLE_RATE) or "").strip()
+        if not ref_text:
+            return {"ok": False, "error": "no_speech"}
+        wav = await asyncio.to_thread(
+            audio_utils.f32le_bytes_to_wav_bytes, buf, SAMPLE_RATE)
+        voice = await VOICES.register(
+            wav, filename="clone.wav", content_type="audio/wav",
+            name=name, ref_text=ref_text)
+        LOG.info("voice clone registered: id=%s name=%r ref=%r",
+                 voice.get("id"), voice.get("name"), ref_text[:60])
+        return {"ok": True, "voice": voice, "refText": ref_text}
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("voice clone failed")
+        return {"ok": False, "error": str(exc)}
 
 # --------------------------------------------------------------------------- #
 # Runtime state (filled by configure() / main()). Module globals, so the
@@ -2203,6 +2258,16 @@ async def ws_handler(request):
                                 "reason": "oneshot", "ts": time.time()})
                         else:
                             await _open_wake_window(ws, state, reason="done")
+                    # Voice lock, temporal continuity: restart the follow-up
+                    # window at the END of the reply playback (same "done"
+                    # pattern as the wake window above). Anchored at the
+                    # user's segment the window was always expired by the
+                    # time they could answer — LLM + TTS + playback routinely
+                    # exceed SPEAKER_CONT_WINDOW_S. Only the timestamp moves;
+                    # the SCORE anchor still requires a strict match.
+                    if (SPEAKER is not None and SPEAKER.active()
+                            and state.speaker_last_own > 0):
+                        state.speaker_last_own_ts = time.time()
                     ident = get_speaker_identifier()
                     if ident is not None:
                         try:
@@ -2407,31 +2472,12 @@ async def ws_handler(request):
                     if not _clone_active():
                         await ws.send_json({"type": "voice.clone.ack", "ok": False,
                                             "error": "unavailable", "ts": time.time()})
-                    elif len(buf) < int(SAMPLE_RATE * 4 * 1.0):  # < ~1 s of f32 PCM
-                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                                            "error": "too_short", "ts": time.time()})
                     else:
-                        try:
-                            ref_text = (await STT.transcribe(buf, SAMPLE_RATE) or "").strip()
-                            if not ref_text:
-                                await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                                                    "error": "no_speech", "ts": time.time()})
-                            else:
-                                wav = await asyncio.to_thread(
-                                    audio_utils.f32le_bytes_to_wav_bytes, buf, SAMPLE_RATE)
-                                voice = await VOICES.register(
-                                    wav, filename="clone.wav", content_type="audio/wav",
-                                    name=name, ref_text=ref_text)
-                                LOG.info("voice clone registered: id=%s name=%r ref=%r",
-                                         voice.get("id"), voice.get("name"), ref_text[:60])
-                                await ws.send_json({"type": "voice.clone.ack", "ok": True,
-                                                    "voice": voice, "refText": ref_text,
-                                                    "ts": time.time()})
-                                await _emit_voice_state(ws)
-                        except Exception as exc:  # noqa: BLE001
-                            LOG.exception("voice clone failed")
-                            await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                                                "error": str(exc), "ts": time.time()})
+                        ack = await _clone_commit(buf, name)
+                        await ws.send_json({"type": "voice.clone.ack", **ack,
+                                            "ts": time.time()})
+                        if ack.get("ok"):
+                            await _emit_voice_state(ws)
                 elif t == "voice.clone.abort":
                     clone_stream = None
                 elif t == "voice.list":

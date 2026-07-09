@@ -102,6 +102,125 @@ def f32le_bytes_to_wav_bytes(raw: bytes, sample_rate: int) -> bytes:
     return float32_to_pcm16_wav_bytes(samples, sample_rate)
 
 
+def trim_clone_reference(raw_f32: bytes, sample_rate: int, *,
+                         edge_ms: int = 150, gap_ms: int = 120,
+                         edge_gap_ms: int = 60, pad_ms: int = 200,
+                         min_region_ms: int = 80, min_keep_s: float = 1.0):
+    """Clean a voice-clone reference recording: drop cut-off speech at the
+    buffer edges and trim leading/trailing dead air to a small pad.
+
+    A fixed-length recording often catches the user mid-word at the start or
+    end ("…albes Wort"); those fragments end up in the reference WAV and the
+    TTS model reproduces them as noise it can't subtitle with ``ref_text``.
+    Rule: a speech region that touches the recording boundary (within
+    ``edge_ms``) is dropped entirely — the safest cut — as long as at least
+    ``min_keep_s`` of speech remains elsewhere. When it wouldn't (the speech
+    runs continuously over the edge, so the boundary region IS the content),
+    the region is instead cut at the breath pause (≥ ``edge_gap_ms``, found
+    in the un-merged frame mask) nearest the boundary, sacrificing only the
+    words between that pause and the edge.
+    Speech regions are found with an adaptive RMS threshold (relative to the
+    recording's own noise floor and peak), so mic level doesn't matter;
+    isolated blips shorter than ``min_region_ms`` (clicks) are ignored.
+
+    Returns ``(trimmed_f32_bytes, info)``. ``trimmed_f32_bytes`` is ``None``
+    when nothing usable remains; ``info["reason"]`` then explains why
+    (``no_speech`` / ``edge_speech`` / ``too_short``) and callers surface it.
+    ``info`` also reports ``dropped_head``/``dropped_tail`` (a fragment was
+    cut), ``head_cut_s``/``tail_cut_s`` (total audio removed per side) and
+    ``kept_s`` (net speech kept)."""
+    samples = pcm_bytes_to_float32_array(raw_f32)
+    info = {"reason": "", "dropped_head": False, "dropped_tail": False,
+            "head_cut_s": 0.0, "tail_cut_s": 0.0, "kept_s": 0.0}
+    frame = max(1, int(sample_rate * 0.02))          # 20 ms analysis frames
+    nfr = samples.shape[0] // frame
+    if nfr < 2:
+        info["reason"] = "too_short"
+        return None, info
+    w = samples[: nfr * frame].reshape(nfr, frame)
+    rms = np.sqrt((w * w).mean(axis=1))
+    # Adaptive threshold: well above the noise floor, well below speech peaks,
+    # never under an absolute floor (all-digital-silence stays "no speech").
+    noise = float(np.percentile(rms, 15))
+    peak = float(np.percentile(rms, 97))
+    thr = max(noise * 3.0, peak * 0.06, 1e-4)
+    mask = rms >= thr
+
+    # Contiguous speech runs → merge across pauses shorter than gap_ms →
+    # drop isolated micro-blips. Everything in frame units.
+    runs: list[list[int]] = []
+    for i, on in enumerate(mask):
+        if on and runs and i == runs[-1][1]:
+            runs[-1][1] = i + 1
+        elif on:
+            runs.append([i, i + 1])
+    gap_fr = max(1, int(gap_ms / 20.0))
+    merged: list[list[int]] = []
+    for a, b in runs:
+        if merged and a - merged[-1][1] < gap_fr:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    min_fr = max(1, int(min_region_ms / 20.0))
+    regions = [(a, b) for a, b in merged if b - a >= min_fr]
+    if not regions:
+        info["reason"] = "no_speech"
+        return None, info
+
+    # Cut points inside an edge-touching region: the raw (unmerged) runs
+    # expose breath pauses of edge_gap_ms..gap_ms that the merge bridged.
+    fine_fr = max(1, int(edge_gap_ms / 20.0))
+
+    def _sub_runs(a: int, b: int) -> list[list[int]]:
+        return [r for r in runs if r[0] >= a and r[1] <= b]
+
+    def _cut_head(a: int, b: int):
+        """Region touches the START: keep from the first internal pause on."""
+        sub = _sub_runs(a, b)
+        for i in range(1, len(sub)):
+            if sub[i][0] - sub[i - 1][1] >= fine_fr:
+                return (sub[i][0], b)
+        return None
+
+    def _cut_tail(a: int, b: int):
+        """Region touches the END: keep up to the last internal pause."""
+        sub = _sub_runs(a, b)
+        for i in range(len(sub) - 1, 0, -1):
+            if sub[i][0] - sub[i - 1][1] >= fine_fr:
+                return (a, sub[i - 1][1])
+        return None
+
+    def _speech_s(regs) -> float:
+        return sum(b - a for a, b in regs) * frame / sample_rate
+
+    dur_s = samples.shape[0] / sample_rate
+    edge_s = edge_ms / 1000.0
+    if regions and regions[0][0] * frame / sample_rate <= edge_s:
+        info["dropped_head"] = True
+        # Whole-region drop unless that would gut the take (then cut inside).
+        kept = _cut_head(*regions[0]) if _speech_s(regions[1:]) < min_keep_s else None
+        regions = ([kept] if kept else []) + regions[1:]
+    if regions and regions[-1][1] * frame / sample_rate >= dur_s - edge_s:
+        info["dropped_tail"] = True
+        kept = _cut_tail(*regions[-1]) if _speech_s(regions[:-1]) < min_keep_s else None
+        regions = regions[:-1] + ([kept] if kept else [])
+    if not regions:
+        info["reason"] = "edge_speech"
+        return None, info
+
+    info["kept_s"] = sum(b - a for a, b in regions) * frame / sample_rate
+    if info["kept_s"] < min_keep_s:
+        info["reason"] = "too_short"
+        return None, info
+
+    pad = int(sample_rate * pad_ms / 1000.0)
+    a = max(0, regions[0][0] * frame - pad)
+    b = min(samples.shape[0], regions[-1][1] * frame + pad)
+    info["head_cut_s"] = a / sample_rate
+    info["tail_cut_s"] = (samples.shape[0] - b) / sample_rate
+    return samples[a:b].tobytes(), info
+
+
 def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:
     """Changes the speaking tempo by the factor `rate` (rate>1 = faster,
     rate<1 = slower), WITHOUT shifting the pitch (no chipmunk effect).

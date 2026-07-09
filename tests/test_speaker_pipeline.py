@@ -850,3 +850,64 @@ def test_playback_done_clears_barge_target():
             await ws.close()
 
     asyncio.run(run())
+
+
+def test_playback_done_refreshes_continuity_window():
+    """A long reply outlives SPEAKER_CONT_WINDOW_S: anchored at the user's own
+    segment, the continuity window is always expired by the time the reply has
+    finished playing (LLM + TTS + playback). playback.done restarts the clock,
+    so a hair-under-threshold follow-up right after the reply is accepted."""
+    _configure_speaker(
+        stt_texts=["mein anfang", "kurze antwort danach"],
+        deltas=["Eins."],
+        # s1: strict at 0.52; s2: 0.45 (< thr 0.5, but ≥ bar thr−Δ = 0.38).
+        decisions=[(True, 0.52), (False, 0.45)])
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _send_voice(ws, "s1")
+            assert (await _drain_until(ws, "reply"))[0] is not None
+
+            # The reply took longer than the window → anchor timestamp stale.
+            state = next(iter(srv.WS_CLIENTS.values()))
+            state.speaker_last_own_ts -= srv.SPEAKER_CONT_WINDOW_S + 30
+
+            # Playback just ended → window restarts now.
+            await ws.send_json({"type": "playback.done"})
+            await ws.send_json({"type": "ping"})   # fence: playback.done processed
+            await _drain_until(ws, "ack")
+
+            await _send_voice(ws, "s2")
+            tr, seen = await _drain_until(ws, "transcript")
+            assert tr is not None and tr["text"] == "kurze antwort danach", seen
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_stale_continuity_anchor_without_playback_done_rejects():
+    """Control for the playback.done refresh: with the window expired and NO
+    playback.done, the same hair-under-threshold follow-up stays rejected."""
+    _configure_speaker(
+        stt_texts=["mein anfang", "kurze antwort danach"],
+        deltas=["Eins."],
+        decisions=[(True, 0.52), (False, 0.45)])
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _send_voice(ws, "s1")
+            assert (await _drain_until(ws, "reply"))[0] is not None
+
+            state = next(iter(srv.WS_CLIENTS.values()))
+            state.speaker_last_own_ts -= srv.SPEAKER_CONT_WINDOW_S + 30
+
+            await _send_voice(ws, "s2")
+            ig, seen = await _drain_until(ws, "transcript.ignored")
+            assert ig is not None and ig["reason"] == "speaker_mismatch", seen
+            await ws.close()
+
+    asyncio.run(run())

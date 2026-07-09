@@ -240,6 +240,10 @@ class Config:
     # wrapper's /v1/audio/voices CRUD API. The chosen voice is global (whole
     # session) and its id persists in active_voice_state_path across restarts. ---
     tts_clone_enabled: bool = False
+    # Auto-clean clone reference samples before registering: drop cut-off
+    # half words at the recording edges + trim edge silence (audio.
+    # trim_clone_reference). Applies to recorded AND uploaded samples.
+    tts_clone_trim: bool = True
     active_voice_state_path: str = ""
 
     # --- TTS: OmniVoice (local) ---
@@ -454,6 +458,7 @@ class Config:
             tts_openai_local_speed=env_flag("TTS_OPENAI_LOCAL_SPEED", False),
             tts_speed=_env_float("TTS_SPEED", 1.0),
             tts_clone_enabled=env_flag("TTS_CLONE_ENABLED", False),
+            tts_clone_trim=env_flag("TTS_CLONE_TRIM", True),
             active_voice_state_path=_env("ACTIVE_VOICE_STATE_PATH", ""),
 
             # TTS omnivoice

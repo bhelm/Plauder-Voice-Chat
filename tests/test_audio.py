@@ -206,3 +206,92 @@ def test_lead_gate_open_passes_through_verbatim():
     tail = _pcm16([1, 2, 3, 4])
     assert gate.process(tail) == tail                       # verbatim once open
     assert gate.flush() == b""
+
+
+# --- voice-clone reference cleanup ------------------------------------------
+_SR = 16000
+
+
+def _tone(dur_s: float, amp: float = 0.25) -> np.ndarray:
+    n = int(_SR * dur_s)
+    return (np.sin(2 * np.pi * 220.0 * np.arange(n) / _SR) * amp).astype(np.float32)
+
+
+def _sil(dur_s: float) -> np.ndarray:
+    return np.zeros(int(_SR * dur_s), dtype=np.float32)
+
+
+def _trim(parts):
+    raw = np.concatenate(parts).astype(np.float32).tobytes()
+    return audio.trim_clone_reference(raw, _SR)
+
+
+def test_trim_clean_recording_keeps_speech_trims_silence():
+    out, info = _trim([_sil(0.8), _tone(3.0), _sil(0.8)])
+    assert out is not None
+    assert not info["dropped_head"] and not info["dropped_tail"]
+    dur = len(out) / 4 / _SR
+    assert abs(dur - 3.4) < 0.15                 # speech + 2×200 ms pad
+    assert abs(info["head_cut_s"] - 0.6) < 0.1   # 800 ms silence → 200 ms pad
+
+
+def test_trim_drops_half_word_at_start():
+    out, info = _trim([_tone(0.4), _sil(0.6), _tone(3.0), _sil(0.5)])
+    assert out is not None
+    assert info["dropped_head"] and not info["dropped_tail"]
+    dur = len(out) / 4 / _SR
+    assert abs(dur - 3.4) < 0.15                 # fragment + its gap are gone
+    samples = np.frombuffer(out, dtype=np.float32)
+    assert np.abs(samples[: int(_SR * 0.1)]).max() < 1e-3   # starts in the pad
+
+
+def test_trim_drops_half_word_at_end():
+    out, info = _trim([_sil(0.5), _tone(3.0), _sil(0.6), _tone(0.4)])
+    assert out is not None
+    assert info["dropped_tail"] and not info["dropped_head"]
+    assert abs(len(out) / 4 / _SR - 3.4) < 0.15
+
+
+def test_trim_rejects_when_only_edge_speech_remains():
+    out, info = _trim([_tone(1.0), _sil(0.5), _tone(1.0)])   # touches both edges
+    assert out is None
+    assert info["reason"] == "edge_speech"
+    assert info["dropped_head"] and info["dropped_tail"]
+
+
+def test_trim_rejects_silence_only():
+    out, info = _trim([_sil(4.0)])
+    assert out is None
+    assert info["reason"] == "no_speech"
+
+
+def test_trim_rejects_too_little_speech_left():
+    out, info = _trim([_sil(1.0), _tone(0.5), _sil(1.0)])
+    assert out is None
+    assert info["reason"] == "too_short"
+
+
+def test_trim_ignores_click_blips():
+    parts = [_sil(0.5), _tone(0.04, amp=0.9), _sil(0.5), _tone(3.0), _sil(0.5)]
+    out, info = _trim(parts)
+    assert out is not None
+    # the 40 ms click neither counts as speech nor extends the kept span
+    assert abs(len(out) / 4 / _SR - 3.4) < 0.15
+
+
+def test_trim_overrun_cuts_at_breath_pause_inside_region():
+    # Speech runs over the END with no >=120 ms pause — but an 80 ms breath
+    # pause sits before the final (cut-off) word. Only that word must go,
+    # not the whole region.
+    out, info = _trim([_sil(1.0), _tone(3.0), _sil(0.08), _tone(0.4)])
+    assert out is not None
+    assert info["dropped_tail"] and not info["dropped_head"]
+    assert abs(len(out) / 4 / _SR - 3.4) < 0.15   # 3 s speech + 2×200 ms pad
+    assert abs(info["kept_s"] - 3.0) < 0.15
+
+
+def test_trim_overrun_at_start_cuts_at_breath_pause():
+    out, info = _trim([_tone(0.4), _sil(0.08), _tone(3.0), _sil(1.0)])
+    assert out is not None
+    assert info["dropped_head"] and not info["dropped_tail"]
+    assert abs(info["kept_s"] - 3.0) < 0.15
