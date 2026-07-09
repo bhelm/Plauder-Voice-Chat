@@ -568,49 +568,66 @@ async def _tts_synth_stream(text: str, speed: float, voice: str | None = None):
             yield pcm, sr
 
 
-async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
-                                combined, resolved_imgs):
-    """Streaming turn (A1+A2).
+class _StreamingReply:
+    """One streaming turn (A1+A2): LLM tokens are read live; as soon as a
+    sentence is complete, it goes into the TTS queue. A parallel TTS worker
+    synthesizes sentence by sentence and sends the audio as PCM chunks (VCT2;
+    VCT3 opus when negotiated) progressively to the client — sentence 1 is
+    played back while sentence 2 is still being generated/synthesized.
 
-    LLM tokens are read live; as soon as a sentence is complete, it goes into
-    the TTS queue. A parallel TTS worker synthesizes sentence by sentence and
-    sends the audio as PCM chunks (VCT2) progressively to the client — sentence 1
-    is played back while sentence 2 is still being generated/synthesized.
+    A class instead of a closure pile: the token consumer, the text emitter,
+    the sentence release valve and the TTS worker all share this mutable
+    per-turn state. ``run()`` is the entry point; everything else is internal.
     """
-    pron = CFG.pronunciations_file if CFG else None
-    # Cloned voice for this whole reply, resolved once (None = backend default).
-    reply_voice = voice_clone.active_voice_id()
-    max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
-    # The FIRST sentence gates time-to-first-audio: force-flush it earlier so a
-    # long punctuation-free opener doesn't stall TTS for tens of tokens.
-    first_max = CFG.tts_first_chunk_chars if CFG else 100
-    if first_max <= 0:
-        first_max = max_chars
-    first_max = min(first_max, max_chars)
-    got_sentence = {"v": False}
-    audio_id = f"audio-{turn_id}"
-    sentence_q: asyncio.Queue = asyncio.Queue()
 
-    parts: list[str] = []          # all LLM deltas received so far
-    held: list[str] = []           # finished sentences still waiting for TTS release
-    flushed_any = {"v": False}
-    sent_len = {"v": 0}            # text length already sent to the client
-    started = {"audio": False}
-    sr_box = {"sr": None}
-    t_tts0 = {"t": None}
-    t_first = {"t": None}          # timestamp of the first LLM token
-    # E2E anchor ("user done speaking"); freeze it now so a later incoming
-    # segment doesn't shift this turn's measurement point.
-    anchor = getattr(state, "speech_end_ts", 0.0) or 0.0
+    def __init__(self, ws, state: TurnState, turn_id, reply_id, *,
+                 combined, resolved_imgs):
+        self.ws = ws
+        self.state = state
+        self.turn_id = turn_id
+        self.reply_id = reply_id
+        self.combined = combined
+        self.resolved_imgs = resolved_imgs
 
-    # Downlink codec: the client opted into opus via settings.audioCodec (only
-    # stored as "opus" when the codec module is usable — see the settings
-    # handler). One encoder per audio stream (turn), created at first chunk
-    # with the real TTS sample rate; packets are batched so one VCT3 frame
-    # covers ~tts_chunk_ms of audio, and the encoder is flushed at stream end.
-    want_opus = getattr(state, "audio_codec", "pcm") == "opus" and _opus_active()
+        self.pron = CFG.pronunciations_file if CFG else None
+        # Cloned voice for this whole reply, resolved once (None = backend default).
+        self.reply_voice = voice_clone.active_voice_id()
+        self.max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
+        # The FIRST sentence gates time-to-first-audio: force-flush it earlier so a
+        # long punctuation-free opener doesn't stall TTS for tens of tokens.
+        first_max = CFG.tts_first_chunk_chars if CFG else 100
+        if first_max <= 0:
+            first_max = self.max_chars
+        self.first_max = min(first_max, self.max_chars)
+        self.got_sentence = False
+        self.audio_id = f"audio-{turn_id}"
+        self.sentence_q: asyncio.Queue = asyncio.Queue()
 
-    async def _tts_worker() -> int:
+        self.parts: list[str] = []     # all LLM deltas received so far
+        self.held: list[str] = []      # finished sentences still waiting for TTS release
+        self.pending = ""              # partial sentence not yet split off
+        self.flushed_any = False
+        self.sent_len = 0              # text length already sent to the client
+        self.audio_started = False
+        self.sr = None
+        self.t_tts0 = None
+        self.t_first = None            # timestamp of the first LLM token
+        self.t_llm = None              # set in run() BEFORE the worker starts
+        # E2E anchor ("user done speaking"); freeze it now so a later incoming
+        # segment doesn't shift this turn's measurement point.
+        self.anchor = getattr(state, "speech_end_ts", 0.0) or 0.0
+
+        # Downlink codec: the client opted into opus via settings.audioCodec
+        # (only stored as "opus" when the codec module is usable — see the
+        # settings handler). One encoder per audio stream (turn), created at
+        # first chunk with the real TTS sample rate; packets are batched so one
+        # VCT3 frame covers ~tts_chunk_ms of audio, flushed at stream end.
+        self.want_opus = (getattr(state, "audio_codec", "pcm") == "opus"
+                          and _opus_active())
+
+    # --- TTS side ---------------------------------------------------------- #
+    async def _tts_worker(self) -> int:
+        ws, turn_id, state = self.ws, self.turn_id, self.state
         seq = 0
         opus_enc = None
         opus_batch: list[bytes] = []
@@ -624,7 +641,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                 await ws.send_bytes(audio_utils.wrap_opus_chunk(turn_id, seq, opus_batch))
                 opus_batch.clear()
 
-        # --- Sentence prefetch -------------------------------------------------
+        # --- Sentence prefetch ---------------------------------------------
         # The TTS server has a fixed per-request time-to-first-byte (~0.8 s for
         # Kokoro), so requesting sentence N+1 only after N finished streaming
         # creates audible gaps whenever a sentence's audio is shorter than that
@@ -636,14 +653,15 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
         order_q: asyncio.Queue = asyncio.Queue()
 
         async def _synth_to_queue(sentence: str, chunk_q: asyncio.Queue):
-            if t_tts0["t"] is None:
-                t_tts0["t"] = time.time()
+            if self.t_tts0 is None:
+                self.t_tts0 = time.time()
             # Per-sentence lead gate: OmniVoice prepends a faint noise blob to
             # every synthesis — audible as a tiny "hah" at each sentence seam.
             gate = None
             last_sr = None
             try:
-                async for pcm, sr in _tts_synth_stream(sentence, state.speed, reply_voice):
+                async for pcm, sr in _tts_synth_stream(sentence, state.speed,
+                                                       self.reply_voice):
                     if gate is None:
                         gate = audio_utils.StreamLeadGate(sr)
                     last_sr = sr
@@ -666,7 +684,7 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
 
         async def _feeder():
             while True:
-                sentence = await sentence_q.get()
+                sentence = await self.sentence_q.get()
                 if sentence is None:
                     await order_q.put(None)
                     return
@@ -694,11 +712,11 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             async for pcm, sr in _iter_chunks_in_order():
                 if not pcm:
                     continue
-                if not started["audio"]:
+                if not self.audio_started:
                     # Create the encoder BEFORE audio.start so the codec
                     # announced there is the one actually used (an init
                     # failure falls back to raw VCT2 for the whole turn).
-                    if want_opus and opus_enc is None:
+                    if self.want_opus and opus_enc is None:
                         try:
                             opus_enc = opus_codec.OpusEncoder(
                                 sr, bitrate=opus_codec.DOWNLINK_BITRATE)
@@ -706,24 +724,24 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
                             LOG.exception(
                                 "turn=%s opus encoder init failed — "
                                 "falling back to PCM", turn_id)
-                    started["audio"] = True
+                    self.audio_started = True
                     state.audio_started = True   # reply is audible now
                     state.client_playing = True
-                    sr_box["sr"] = sr
+                    self.sr = sr
                     now = time.time()
                     start_evt = {
-                        "type": "audio.start", "turnId": turn_id, "audioId": audio_id,
-                        "sampleRate": sr,
+                        "type": "audio.start", "turnId": turn_id,
+                        "audioId": self.audio_id, "sampleRate": sr,
                         "codec": "opus" if opus_enc is not None else "pcm",
                         "ts": now}
                     # Latency breakdown up to the FIRST playback (≠ total time):
-                    if anchor:
-                        start_evt["e2eMs"] = int((now - anchor) * 1000)
+                    if self.anchor:
+                        start_evt["e2eMs"] = int((now - self.anchor) * 1000)
                         start_evt["debounceMs"] = state.debounce_ms  # pause share of e2e
-                    if t_first["t"] is not None:
-                        start_evt["llmFirstMs"] = int((t_first["t"] - t_llm) * 1000)
-                    if t_tts0["t"] is not None:
-                        start_evt["ttsFirstMs"] = int((now - t_tts0["t"]) * 1000)
+                    if self.t_first is not None:
+                        start_evt["llmFirstMs"] = int((self.t_first - self.t_llm) * 1000)
+                    if self.t_tts0 is not None:
+                        start_evt["ttsFirstMs"] = int((now - self.t_tts0) * 1000)
                     await ws.send_json(start_evt)
                 if opus_enc is not None:
                     for pkt in opus_enc.encode_pcm16(pcm):
@@ -752,156 +770,168 @@ async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
             await _ship_batch()
         return seq
 
-    async def _emit_text():
+    # --- LLM side ---------------------------------------------------------- #
+    async def _emit_text(self):
         """Sends new reply text to the client — but only once it's clear that
         it's not a pure NO_REPLY (otherwise 'NO_REPLY' — or a partial 'NO_'
         token — would briefly flash up)."""
-        full = "".join(parts)
-        if not flushed_any["v"] and sanitizer.is_no_reply_prefix(full.strip()):
+        full = "".join(self.parts)
+        if not self.flushed_any and sanitizer.is_no_reply_prefix(full.strip()):
             return
-        if len(full) > sent_len["v"]:
-            await ws.send_json({
-                "type": "reply.delta", "turnId": turn_id, "replyId": reply_id,
-                "delta": full[sent_len["v"]:], "ts": time.time()})
-            sent_len["v"] = len(full)
+        if len(full) > self.sent_len:
+            await self.ws.send_json({
+                "type": "reply.delta", "turnId": self.turn_id,
+                "replyId": self.reply_id,
+                "delta": full[self.sent_len:], "ts": time.time()})
+            self.sent_len = len(full)
 
-    async def _release(force: bool = False):
-        full = "".join(parts).strip()
-        if not flushed_any["v"] and not force and sanitizer.is_no_reply_prefix(full):
+    async def _release(self, force: bool = False):
+        """Feed finished sentences to the TTS queue — held back while the
+        reply could still turn out to be a pure NO_REPLY."""
+        full = "".join(self.parts).strip()
+        if not self.flushed_any and not force and sanitizer.is_no_reply_prefix(full):
             return  # could still become NO_REPLY → hold back the sentences
-        while held:
-            cleaned = sanitizer.sanitize_for_tts(held.pop(0), pronunciations_file=pron)
+        while self.held:
+            cleaned = sanitizer.sanitize_for_tts(self.held.pop(0),
+                                                 pronunciations_file=self.pron)
             if cleaned:
-                await sentence_q.put(cleaned)
-                flushed_any["v"] = True
+                await self.sentence_q.put(cleaned)
+                self.flushed_any = True
 
-    pending = ""
-
-    async def _consume_stream():
-        nonlocal pending
+    async def _consume_stream(self):
         # Re-apply THIS connection's Hermes session id right before the call:
         # it lives on the process-wide LLM singleton, and awaits between turn
         # start and request build let a concurrent connection overwrite it
         # (cross-session contamination). This shrinks the race window to the
         # request build itself.
-        _apply_hermes_headers(state)
+        _apply_hermes_headers(self.state)
         agen = CONV.chat_stream(
-            combined, user_key=state.session_user or _default_user(),
-            image_urls=resolved_imgs if resolved_imgs else None)
+            self.combined, user_key=self.state.session_user or _default_user(),
+            image_urls=self.resolved_imgs if self.resolved_imgs else None)
         async for delta in agen:
-            if t_first["t"] is None:
-                t_first["t"] = time.time()
-            parts.append(delta)
-            await _emit_text()
-            pending += delta
-            sents, pending = audio_utils.split_stream_sentences(
-                pending, max_chars if got_sentence["v"] else first_max)
+            if self.t_first is None:
+                self.t_first = time.time()
+            self.parts.append(delta)
+            await self._emit_text()
+            self.pending += delta
+            sents, self.pending = audio_utils.split_stream_sentences(
+                self.pending, self.max_chars if self.got_sentence else self.first_max)
             if sents:
-                got_sentence["v"] = True
-                held.extend(sents)
-                await _release()
+                self.got_sentence = True
+                self.held.extend(sents)
+                await self._release()
 
-    # Bind t_llm BEFORE starting the worker: the worker reads it in its closure
-    # (for llmFirstMs). If an `await` later sat between create_task and this
-    # assignment, the worker could otherwise read it unbound (NameError).
-    t_llm = time.time()
-    tts_task = asyncio.create_task(_tts_worker())
-    state.audio_ids.add(audio_id)
-    allow_retry = (CFG.llm_retry_timeout_on_idle
-                   and not _queue_has_more_work(state, exclude_task=state.agent_task))
+    # --- Orchestration ------------------------------------------------------ #
+    async def run(self):
+        ws, state, turn_id, reply_id = self.ws, self.state, self.turn_id, self.reply_id
+        # Bind t_llm BEFORE starting the worker: the worker reads it (for
+        # llmFirstMs) as soon as the first chunk arrives.
+        self.t_llm = time.time()
+        tts_task = asyncio.create_task(self._tts_worker())
+        state.audio_ids.add(self.audio_id)
+        allow_retry = (CFG.llm_retry_timeout_on_idle
+                       and not _queue_has_more_work(state, exclude_task=state.agent_task))
 
-    async def _drain_tts():
-        sentence_q.put_nowait(None)
-        return await asyncio.gather(tts_task, return_exceptions=True)
+        async def _drain_tts():
+            self.sentence_q.put_nowait(None)
+            return await asyncio.gather(tts_task, return_exceptions=True)
 
-    try:
         try:
-            await _consume_stream()
-        except UpstreamTimeoutError:
-            if parts or not allow_retry:
-                raise
-            LOG.warning("turn=%s agent upstream timeout, retry once (stream)", turn_id)
-            await asyncio.sleep(AGENT_RETRY_DELAY_S)
-            pending = ""
-            await _consume_stream()
-    except asyncio.CancelledError:
-        LOG.info("turn=%s stream cancelled", turn_id)
-        tts_task.cancel()
-        await asyncio.gather(tts_task, return_exceptions=True)
-        # Do NOT discard audio_id: _cancel_in_flight then still sends an
-        # audio.stop to the client (backup for the local barge-in stop).
-        raise
-    except UpstreamTimeoutError as exc:
-        await _drain_tts()
-        state.audio_ids.discard(audio_id)
-        LOG.warning("turn=%s agent upstream timeout (stream, no retry): %s", turn_id, exc)
-        await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
-                            "error": "upstream provider timeout",
-                            "errorKind": "upstream_timeout", "ts": time.time()})
-        await _reopen_wake_window_after_silent(ws, state)
-        return
-    except Exception as exc:
-        await _drain_tts()
-        state.audio_ids.discard(audio_id)
-        LOG.exception("turn=%s agent stream failed", turn_id)
-        await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
-                            "error": str(exc), "ts": time.time()})
-        await _reopen_wake_window_after_silent(ws, state)
-        return
-
-    # From here on the TTS worker is still alive — a barge-in cancel landing in
-    # any of the awaits below must not orphan it (it would keep sending audio
-    # of the discarded turn and then block forever on the sentence queue).
-    try:
-        # Take the remaining buffer as the last sentence.
-        if pending.strip():
-            held.append(pending.strip())
-        full_reply = "".join(parts).strip()
-        llm_ms = int((time.time() - t_llm) * 1000)
-        meta = dict(getattr(CONV, "last_stream_meta", {}) or {})
-
-        if sanitizer.is_no_reply(full_reply):
+            try:
+                await self._consume_stream()
+            except UpstreamTimeoutError:
+                if self.parts or not allow_retry:
+                    raise
+                LOG.warning("turn=%s agent upstream timeout, retry once (stream)", turn_id)
+                await asyncio.sleep(AGENT_RETRY_DELAY_S)
+                self.pending = ""
+                await self._consume_stream()
+        except asyncio.CancelledError:
+            LOG.info("turn=%s stream cancelled", turn_id)
+            tts_task.cancel()
+            await asyncio.gather(tts_task, return_exceptions=True)
+            # Do NOT discard audio_id: _cancel_in_flight then still sends an
+            # audio.stop to the client (backup for the local barge-in stop).
+            raise
+        except UpstreamTimeoutError as exc:
             await _drain_tts()
-            state.audio_ids.discard(audio_id)
-            LOG.info("turn=%s agent NO_REPLY llm=%dms (stream)", turn_id, llm_ms)
-            await ws.send_json({
-                "type": "reply.silent", "turnId": turn_id, "replyId": reply_id,
-                "reason": "no_reply", "llmMs": llm_ms, "usage": meta.get("usage"),
-                "finishReason": meta.get("finish_reason"), "ts": time.time()})
+            state.audio_ids.discard(self.audio_id)
+            LOG.warning("turn=%s agent upstream timeout (stream, no retry): %s", turn_id, exc)
+            await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
+                                "error": "upstream provider timeout",
+                                "errorKind": "upstream_timeout", "ts": time.time()})
+            await _reopen_wake_window_after_silent(ws, state)
+            return
+        except Exception as exc:
+            await _drain_tts()
+            state.audio_ids.discard(self.audio_id)
+            LOG.exception("turn=%s agent stream failed", turn_id)
+            await ws.send_json({"type": "reply.error", "turnId": turn_id, "replyId": reply_id,
+                                "error": str(exc), "ts": time.time()})
             await _reopen_wake_window_after_silent(ws, state)
             return
 
-        await _release(force=True)            # release held-back sentences
-        await _emit_text()                    # remaining text to the client
-        cleaned_full = sanitizer.sanitize_for_tts(full_reply, pronunciations_file=pron)
-        LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
-        await ws.send_json({
-            "type": "reply", "turnId": turn_id, "replyId": reply_id,
-            "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
-            "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
-            "streamed": True, "ts": time.time()})
-        _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
-                                 "text": full_reply, "ts": time.time()})
+        # From here on the TTS worker is still alive — a barge-in cancel landing in
+        # any of the awaits below must not orphan it (it would keep sending audio
+        # of the discarded turn and then block forever on the sentence queue).
+        try:
+            # Take the remaining buffer as the last sentence.
+            if self.pending.strip():
+                self.held.append(self.pending.strip())
+            full_reply = "".join(self.parts).strip()
+            llm_ms = int((time.time() - self.t_llm) * 1000)
+            meta = dict(getattr(CONV, "last_stream_meta", {}) or {})
 
-        if BRIDGE and BRIDGE.enabled and cleaned_full:
-            BRIDGE.remember_self_sent(full_reply)
-            asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
+            if sanitizer.is_no_reply(full_reply):
+                await _drain_tts()
+                state.audio_ids.discard(self.audio_id)
+                LOG.info("turn=%s agent NO_REPLY llm=%dms (stream)", turn_id, llm_ms)
+                await ws.send_json({
+                    "type": "reply.silent", "turnId": turn_id, "replyId": reply_id,
+                    "reason": "no_reply", "llmMs": llm_ms, "usage": meta.get("usage"),
+                    "finishReason": meta.get("finish_reason"), "ts": time.time()})
+                await _reopen_wake_window_after_silent(ws, state)
+                return
 
-        results = await _drain_tts()
-        state.audio_ids.discard(audio_id)
-    except asyncio.CancelledError:
-        tts_task.cancel()
-        await asyncio.gather(tts_task, return_exceptions=True)
-        raise
-    total_chunks = next((r for r in results if isinstance(r, int)), 0)
-    if started["audio"]:
-        tts_ms = int((time.time() - t_tts0["t"]) * 1000) if t_tts0["t"] else 0
-        LOG.info("turn=%s tts ok chunks=%d sr=%s tts=%dms speed=%.2f (stream)",
-                 turn_id, total_chunks, sr_box["sr"], tts_ms, state.speed)
-        await ws.send_json({
-            "type": "audio.end", "turnId": turn_id, "audioId": audio_id,
-            "chunks": total_chunks, "sampleRate": sr_box["sr"], "ttsMs": tts_ms,
-            "speed": state.speed, "ts": time.time()})
+            await self._release(force=True)       # release held-back sentences
+            await self._emit_text()               # remaining text to the client
+            cleaned_full = sanitizer.sanitize_for_tts(full_reply,
+                                                      pronunciations_file=self.pron)
+            LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
+            await ws.send_json({
+                "type": "reply", "turnId": turn_id, "replyId": reply_id,
+                "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
+                "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
+                "streamed": True, "ts": time.time()})
+            _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
+                                     "text": full_reply, "ts": time.time()})
+
+            if BRIDGE and BRIDGE.enabled and cleaned_full:
+                BRIDGE.remember_self_sent(full_reply)
+                asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
+
+            results = await _drain_tts()
+            state.audio_ids.discard(self.audio_id)
+        except asyncio.CancelledError:
+            tts_task.cancel()
+            await asyncio.gather(tts_task, return_exceptions=True)
+            raise
+        total_chunks = next((r for r in results if isinstance(r, int)), 0)
+        if self.audio_started:
+            tts_ms = int((time.time() - self.t_tts0) * 1000) if self.t_tts0 else 0
+            LOG.info("turn=%s tts ok chunks=%d sr=%s tts=%dms speed=%.2f (stream)",
+                     turn_id, total_chunks, self.sr, tts_ms, state.speed)
+            await ws.send_json({
+                "type": "audio.end", "turnId": turn_id, "audioId": self.audio_id,
+                "chunks": total_chunks, "sampleRate": self.sr, "ttsMs": tts_ms,
+                "speed": state.speed, "ts": time.time()})
+
+
+async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
+                                combined, resolved_imgs):
+    """Streaming turn (A1+A2) — see _StreamingReply."""
+    await _StreamingReply(ws, state, turn_id, reply_id,
+                          combined=combined, resolved_imgs=resolved_imgs).run()
 
 
 def _resume_debounce(ws, state: TurnState) -> None:
@@ -1165,9 +1195,196 @@ async def _emit_wake_detected(ws, state: TurnState, segment_id):
         "turnId": state.turn_id, "ts": time.time()})
 
 
+async def _stt_transcribe_segment(ws, state: TurnState, pcm_bytes, segment_id):
+    """STT for one committed segment. Returns ``(text, no_speech_prob, stt_ms)``
+    or None when STT failed (transcript.error sent, debounce resumed)."""
+    try:
+        t_stt = time.time()
+        text = await STT.transcribe(pcm_bytes, SAMPLE_RATE)
+        no_speech_prob = getattr(STT, "last_no_speech_prob", None)
+        stt_ms = int((time.time() - t_stt) * 1000)
+    except Exception as exc:
+        LOG.exception("STT failed for segment %s", segment_id)
+        await ws.send_json({"type": "transcript.error", "segmentId": segment_id,
+                            "turnId": state.turn_id, "error": str(exc), "ts": time.time()})
+        # Nothing was cancelled yet (the barge-in is deferred past the ghost
+        # filter), but resume defensively like every other drop path — the
+        # guards inside make it a no-op while a timer ticks / a turn runs.
+        _resume_debounce(ws, state)
+        return None
+    LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
+    return text, no_speech_prob, stt_ms
+
+
+async def _apply_ghost_filter(ws, state: TurnState, *, text, no_speech_prob,
+                              duration_s, segment_id, stt_ms, t0):
+    """Whisper-hallucination filter. Returns the (possibly pruned) text, or
+    None when the whole segment was a hallucination (filtered transcript
+    event sent, debounce resumed — the caller just drops the segment)."""
+    # Embedded first: a ghost sentence Whisper appended at a mid-segment pause
+    # ("… reingeredet. Vielen Dank. Okay …") is pruned without dropping the
+    # genuine rest.
+    if text and GHOST:
+        _stripped = GHOST.strip_ghost_sentences(text)
+        if _stripped != text:
+            LOG.info("ghost sentence stripped seg=%s %r → %r",
+                     segment_id, text[:80], _stripped[:80])
+            text = _stripped
+    if text and GHOST and GHOST.is_hallucination(
+            text, no_speech_prob=no_speech_prob, duration_s=duration_s):
+        LOG.info("ghost filtered seg=%s text=%r", segment_id, text)
+        await ws.send_json({
+            "type": "transcript", "segmentId": segment_id, "turnId": state.turn_id,
+            "text": "", "filtered": "hallucination", "filteredText": text,
+            "sttMs": stt_ms, "totalMs": int((time.time() - t0) * 1000), "ts": time.time(),
+        })
+        _resume_debounce(ws, state)
+        return None
+    return text
+
+
+async def _apply_wake_gate(ws, state: TurnState, *, segment_id, text,
+                           speech_start_ts):
+    """Wake-word gate (prefix match). Returns the command text to dispatch,
+    or None when the segment was fully consumed by the gate (ignored /
+    wake-word-only "armed" / stop command). On the command path the
+    conversation window is refreshed and the running turn is coalesce-
+    cancelled — the returned text is ready for dispatch."""
+    now = time.time()
+    # Manually closed + still running / guard → ignore the segment entirely.
+    # NO wake match (no fuzzy matches either), NO cancel of the running
+    # reply. This way nothing can reopen the window during processing.
+    if _wake_closed_active(state, now):
+        LOG.info("wake: closed → ignored seg=%s text=%r", segment_id, text)
+        await ws.send_json({
+            "type": "transcript.ignored", "segmentId": segment_id,
+            "turnId": state.turn_id, "text": text,
+            "reason": "wake_closed", "ts": time.time()})
+        _resume_debounce(ws, state)
+        return None
+    # Measure "window open?" at SPEECH START, not at commit time:
+    # if someone starts speaking within the window, their (possibly long)
+    # sentence may still pass even if the window lapses during speaking
+    # or transcription (otherwise a race: input recognized but discarded).
+    # speech_start_ts is already clock-skew corrected (server time);
+    # fall back to now if no timestamp is available.
+    ref_ts = speech_start_ts if speech_start_ts is not None else now
+    if ref_ts < state.wake_until:
+        # Conversation window was open at speech start → follow-up passes.
+        command_text = text
+    else:
+        matched, remainder = wake.match_wake(
+            text, CFG.wake_word, fuzzy=CFG.wake_word_fuzzy,
+            anywhere=CFG.wake_word_anywhere, ratio=CFG.wake_word_ratio)
+        if not matched:
+            LOG.info("wake: ignored seg=%s text=%r", segment_id, text)
+            await ws.send_json({
+                "type": "transcript.ignored", "segmentId": segment_id,
+                "turnId": state.turn_id, "text": text,
+                "reason": "no_wake_word", "ts": time.time()})
+            _resume_debounce(ws, state)
+            return None
+        # Wake detected → emit the early cue if needed (in case no partial
+        # already sent it), strip the wake word.
+        await _emit_wake_detected(ws, state, segment_id)
+        command_text = remainder if CFG.wake_word_strip else text
+        if not (command_text or "").strip():
+            # Only the wake word was said → "armed", Antonia waits (idle) for
+            # the command → idle timer runs on the client (reason=armed).
+            await _open_wake_window(ws, state, now, reason="armed")
+            await ws.send_json({
+                "type": "wake.armed", "turnId": state.turn_id,
+                "windowS": CFG.wake_word_window_s, "ts": time.time()})
+            return None
+
+    # Stop command ("stop", "ok stopp", …) → stop the running reply and
+    # close the conversation window (the wake word is needed again).
+    if wake.is_stop_command(command_text):
+        await _cancel_in_flight(state, ws)
+        # "Stop" also discards whatever was composed but not yet
+        # dispatched — otherwise it silently rides into the NEXT accepted
+        # turn minutes later.
+        state.pending_resume = ""
+        state.pending_texts.clear()
+        state.pending_segment_ids.clear()
+        state.pending_text_parts.clear()
+        state.pending_image_urls.clear()
+        state.wake_until = 0.0
+        state.wake_detected_seg = None
+        LOG.info("wake: stop seg=%s → window closed", segment_id)
+        await ws.send_json({
+            "type": "wake.closed", "turnId": state.turn_id,
+            "reason": "stop_command", "ts": time.time()})
+        return None
+
+    # Command to the AI → refresh the window; a reply is coming, so the
+    # idle timer does NOT run (reason=command). Then clear the running turn
+    # — coalescing (not a plain cancel): a follow-up spoken before the
+    # reply became audible must carry the committed input over, exactly
+    # like the VAD/speaker-gated paths.
+    await _open_wake_window(ws, state, now, reason="command")
+    await _coalesce_cancel(state, ws)
+    return command_text
+
+
+async def _identify_house_speaker(pcm_bytes, segment_id, speech_start_ts,
+                                  force_hold):
+    """Speaker-ID (House-Mode, optional, failsafe). Returns the speaker info
+    dict for the transcript event, or None (disabled / failed)."""
+    identifier = get_speaker_identifier()
+    if identifier is None:
+        return None
+    try:
+        audio = audio_utils.pcm_bytes_to_float32_array(pcm_bytes)
+        res = await asyncio.to_thread(
+            identifier.identify, audio, SAMPLE_RATE, None, speech_start_ts, force_hold)
+        return {
+            "name": res.name, "role": res.role,
+            "relation": getattr(res, "relation", ""),
+            "score": round(res.score, 4), "known": res.known, "held": res.held,
+        }
+    except Exception:
+        LOG.exception("speaker-id failed for segment %s (ignored)", segment_id)
+        return None
+
+
+async def _queue_segment_and_arm_debounce(ws, state: TurnState, *, text, segment_id,
+                                          speaker_info, t0, ptt):
+    """Append the accepted transcript to the pending turn input, set the
+    latency/debounce anchors, notify the client and (re)arm the debounce."""
+    state.pending_texts.append(_speaker_tag(text, speaker_info))
+    state.pending_segment_ids.append(segment_id)
+    # E2E anchor: receive time of this (last) segment. With coalescing the
+    # respective last segment wins → measurement from "user last spoke".
+    state.speech_end_ts = t0
+    # Debounce anchor: a VAD-committed segment arrives only AFTER the client
+    # held ~0.8×debounce of silence (redemption) — credit that silence so the
+    # total pause before dispatch stays ≈ debounce_ms instead of ~1.8× it.
+    # PTT commits are a deliberate button release → no silence to credit.
+    redemption_s = 0.0
+    if not ptt:
+        vp = vad_params_for_debounce(state.debounce_ms)
+        redemption_s = vp["redemptionFrames"] * vp["frameMs"] / 1000.0
+    state.debounce_anchor = t0 - redemption_s
+    await _send_turn_pending(ws, state)
+    # (Re)arm the debounce. Two segments can be in STT concurrently — both
+    # would arm a timer and the SAME pending input would dispatch twice.
+    # Cancel a ticking timer first; never touch a slot that already runs the
+    # turn (the gates above own that decision — see _resume_debounce).
+    if state.agent_task and not state.agent_task.done():
+        return
+    if state.debounce_task and not state.debounce_task.done():
+        state.debounce_task.cancel()
+    state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+
+
 async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, peer,
                                 speech_start_ts=None, barge_in=False,
                                 ptt=False):
+    """One committed voice segment, end to end: STT → ghost filter → barge-in
+    policy → speaker gate → wake gate → transcript event → pending queue +
+    debounce. Each gate either passes (possibly rewriting the text) or fully
+    consumes the segment (event sent, debounce resumed) and we stop."""
     num_samples = len(pcm_bytes) // 4
     duration_s = num_samples / SAMPLE_RATE
     force_hold = bool(state.has_pending() or barge_in)
@@ -1200,41 +1417,15 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
             SPEAKER.verify, pcm_bytes, SAMPLE_RATE, duration_s))
         verify_task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
-    # STT
-    try:
-        t_stt = time.time()
-        text = await STT.transcribe(pcm_bytes, SAMPLE_RATE)
-        no_speech_prob = getattr(STT, "last_no_speech_prob", None)
-        stt_ms = int((time.time() - t_stt) * 1000)
-    except Exception as exc:
-        LOG.exception("STT failed for segment %s", segment_id)
-        await ws.send_json({"type": "transcript.error", "segmentId": segment_id,
-                            "turnId": state.turn_id, "error": str(exc), "ts": time.time()})
-        # Nothing was cancelled yet (the barge-in is deferred past the ghost
-        # filter), but resume defensively like every other drop path — the
-        # guards inside make it a no-op while a timer ticks / a turn runs.
-        _resume_debounce(ws, state)
+    stt_res = await _stt_transcribe_segment(ws, state, pcm_bytes, segment_id)
+    if stt_res is None:
         return
-    LOG.info("stt seg=%s text=%r (%dms)", segment_id, text, stt_ms)
+    text, no_speech_prob, stt_ms = stt_res
 
-    # Hallucination filter — embedded first: a ghost sentence Whisper appended
-    # at a mid-segment pause ("… reingeredet. Vielen Dank. Okay …") is pruned
-    # without dropping the genuine rest.
-    if text and GHOST:
-        _stripped = GHOST.strip_ghost_sentences(text)
-        if _stripped != text:
-            LOG.info("ghost sentence stripped seg=%s %r → %r",
-                     segment_id, text[:80], _stripped[:80])
-            text = _stripped
-    if text and GHOST and GHOST.is_hallucination(
-            text, no_speech_prob=no_speech_prob, duration_s=duration_s):
-        LOG.info("ghost filtered seg=%s text=%r", segment_id, text)
-        await ws.send_json({
-            "type": "transcript", "segmentId": segment_id, "turnId": state.turn_id,
-            "text": "", "filtered": "hallucination", "filteredText": text,
-            "sttMs": stt_ms, "totalMs": int((time.time() - t0) * 1000), "ts": time.time(),
-        })
-        _resume_debounce(ws, state)
+    text = await _apply_ghost_filter(
+        ws, state, text=text, no_speech_prob=no_speech_prob,
+        duration_s=duration_s, segment_id=segment_id, stt_ms=stt_ms, t0=t0)
+    if text is None:
         return
 
     # Plain-VAD barge-in — deferred to HERE (past STT + ghost filter) so that
@@ -1244,7 +1435,7 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     if text and not (wake_gating or speaker_gating):
         await _coalesce_cancel(state, ws)
 
-    # --- Speaker lock (voice gate) at commit — the full decision lives in
+    # Speaker lock (voice gate) at commit — the full decision lives in
     # plauder.speaker_gate.apply_commit_gate (reject / trim / continuity).
     # Voice only (typed input bypasses this path entirely).
     speaker_score = None
@@ -1263,100 +1454,17 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         speaker_full_text = gate["full_text"]
         stt_ms += gate["stt_ms"]
 
-    # --- Wake-word gate (prefix). Voice only; typed input is always intended.
+    # Wake-word gate (prefix). Voice only; typed input is always intended.
     if wake_gating and text:
-        now = time.time()
-        # Manually closed + still running / guard → ignore the segment entirely.
-        # NO wake match (no fuzzy matches either), NO cancel of the running
-        # reply. This way nothing can reopen the window during processing.
-        if _wake_closed_active(state, now):
-            LOG.info("wake: closed → ignored seg=%s text=%r", segment_id, text)
-            await ws.send_json({
-                "type": "transcript.ignored", "segmentId": segment_id,
-                "turnId": state.turn_id, "text": text,
-                "reason": "wake_closed", "ts": time.time()})
-            _resume_debounce(ws, state)
-            return
-        # Measure "window open?" at SPEECH START, not at commit time:
-        # if someone starts speaking within the window, their (possibly long)
-        # sentence may still pass even if the window lapses during speaking
-        # or transcription (otherwise a race: input recognized but discarded).
-        # speech_start_ts is already clock-skew corrected (server time);
-        # fall back to now if no timestamp is available.
-        ref_ts = speech_start_ts if speech_start_ts is not None else now
-        if ref_ts < state.wake_until:
-            # Conversation window was open at speech start → follow-up passes.
-            command_text = text
-        else:
-            matched, remainder = wake.match_wake(
-                text, CFG.wake_word, fuzzy=CFG.wake_word_fuzzy,
-                anywhere=CFG.wake_word_anywhere, ratio=CFG.wake_word_ratio)
-            if not matched:
-                LOG.info("wake: ignored seg=%s text=%r", segment_id, text)
-                await ws.send_json({
-                    "type": "transcript.ignored", "segmentId": segment_id,
-                    "turnId": state.turn_id, "text": text,
-                    "reason": "no_wake_word", "ts": time.time()})
-                _resume_debounce(ws, state)
-                return
-            # Wake detected → emit the early cue if needed (in case no partial
-            # already sent it), strip the wake word.
-            await _emit_wake_detected(ws, state, segment_id)
-            command_text = remainder if CFG.wake_word_strip else text
-            if not (command_text or "").strip():
-                # Only the wake word was said → "armed", Antonia waits (idle) for
-                # the command → idle timer runs on the client (reason=armed).
-                await _open_wake_window(ws, state, now, reason="armed")
-                await ws.send_json({
-                    "type": "wake.armed", "turnId": state.turn_id,
-                    "windowS": CFG.wake_word_window_s, "ts": time.time()})
-                return
-
-        # Stop command ("stop", "ok stopp", …) → stop the running reply and
-        # close the conversation window (the wake word is needed again).
-        if wake.is_stop_command(command_text):
-            await _cancel_in_flight(state, ws)
-            # "Stop" also discards whatever was composed but not yet
-            # dispatched — otherwise it silently rides into the NEXT accepted
-            # turn minutes later.
-            state.pending_resume = ""
-            state.pending_texts.clear()
-            state.pending_segment_ids.clear()
-            state.pending_text_parts.clear()
-            state.pending_image_urls.clear()
-            state.wake_until = 0.0
-            state.wake_detected_seg = None
-            LOG.info("wake: stop seg=%s → window closed", segment_id)
-            await ws.send_json({
-                "type": "wake.closed", "turnId": state.turn_id,
-                "reason": "stop_command", "ts": time.time()})
+        text = await _apply_wake_gate(ws, state, segment_id=segment_id,
+                                      text=text, speech_start_ts=speech_start_ts)
+        if text is None:
             return
 
-        # Command to the AI → refresh the window; a reply is coming, so the
-        # idle timer does NOT run (reason=command). Then clear the running turn
-        # — coalescing (not a plain cancel): a follow-up spoken before the
-        # reply became audible must carry the committed input over, exactly
-        # like the VAD/speaker-gated paths.
-        await _open_wake_window(ws, state, now, reason="command")
-        text = command_text
-        await _coalesce_cancel(state, ws)
-
-    # Speaker-ID (House-Mode, optional, failsafe)
     speaker_info = None
     if text:
-        identifier = get_speaker_identifier()
-        if identifier is not None:
-            try:
-                audio = audio_utils.pcm_bytes_to_float32_array(pcm_bytes)
-                res = await asyncio.to_thread(
-                    identifier.identify, audio, SAMPLE_RATE, None, speech_start_ts, force_hold)
-                speaker_info = {
-                    "name": res.name, "role": res.role,
-                    "relation": getattr(res, "relation", ""),
-                    "score": round(res.score, 4), "known": res.known, "held": res.held,
-                }
-            except Exception:
-                LOG.exception("speaker-id failed for segment %s (ignored)", segment_id)
+        speaker_info = await _identify_house_speaker(
+            pcm_bytes, segment_id, speech_start_ts, force_hold)
 
     transcript_evt = {
         "type": "transcript", "segmentId": segment_id, "turnId": state.turn_id,
@@ -1376,30 +1484,8 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
         _resume_debounce(ws, state)
         return
 
-    state.pending_texts.append(_speaker_tag(text, speaker_info))
-    state.pending_segment_ids.append(segment_id)
-    # E2E anchor: receive time of this (last) segment. With coalescing the
-    # respective last segment wins → measurement from "user last spoke".
-    state.speech_end_ts = t0
-    # Debounce anchor: a VAD-committed segment arrives only AFTER the client
-    # held ~0.8×debounce of silence (redemption) — credit that silence so the
-    # total pause before dispatch stays ≈ debounce_ms instead of ~1.8× it.
-    # PTT commits are a deliberate button release → no silence to credit.
-    redemption_s = 0.0
-    if not ptt:
-        vp = vad_params_for_debounce(state.debounce_ms)
-        redemption_s = vp["redemptionFrames"] * vp["frameMs"] / 1000.0
-    state.debounce_anchor = t0 - redemption_s
-    await _send_turn_pending(ws, state)
-    # (Re)arm the debounce. Two segments can be in STT concurrently — both
-    # would arm a timer and the SAME pending input would dispatch twice.
-    # Cancel a ticking timer first; never touch a slot that already runs the
-    # turn (the gates above own that decision — see _resume_debounce).
-    if state.agent_task and not state.agent_task.done():
-        return
-    if state.debounce_task and not state.debounce_task.done():
-        state.debounce_task.cancel()
-    state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+    await _queue_segment_and_arm_debounce(ws, state, text=text, segment_id=segment_id,
+                                          speaker_info=speaker_info, t0=t0, ptt=ptt)
 
 
 # ============================================================================ #
