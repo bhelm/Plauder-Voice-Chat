@@ -48,12 +48,16 @@ curl http://127.0.0.1:8319/healthz       # 200 + active backends
 There is **no lint step** and no pytest config file; tests rely on `tests/conftest.py`.
 
 The browser client is hand-written with **no build step**: `static/index.html`
-(markup + the stateful app logic as inline JS) plus classic scripts under
-`static/js/` (`i18n.js` string table, `markdown.js` renderer, `vct.js` binary
-frame parsers) and `static/style.css`. The split files are plain classic
-scripts loaded before the main inline block — top-level `const`/`function`
-bindings are shared through the global lexical scope, so no
-import/export/window wiring. After editing client JS run
+(markup + chat/protocol/UI logic as inline JS) plus classic scripts under
+`static/js/` — `i18n.js` (string table), `markdown.js` (renderer + escapeHtml),
+`vct.js` (binary frame parsers), `playback.js` (audio OUTPUT: stream player,
+WAV playback, replay cache, volume/duck) and `mic.js` (audio INPUT: mic/VAD
+capture, opus uplink, timed enrollment/clone recorder, PTT) — and
+`static/style.css`. The split files are plain classic scripts loaded before
+the main inline block — top-level `const`/`let`/`function` bindings are shared
+through the global lexical scope (call-time resolution), so no
+import/export/window wiring; each cluster's state lives at the top of its
+file and must not be redeclared elsewhere. After editing client JS run
 `.venv/bin/python -m pytest tests/test_client_js.py -q`: it `node --check`s
 every file and inline block and unit-tests the pure modules
 (`tests/client/pure_modules.test.mjs`).
