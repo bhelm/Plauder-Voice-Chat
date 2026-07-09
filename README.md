@@ -310,11 +310,13 @@ audio — and manage a whole library of them from the browser. Enable with
   at the recording edges — which the model would reproduce as noise — are
   removed and edge silence is trimmed, so talking over the start/end of the
   recording window no longer ruins the clone.
-- **Manage** — name, rename, delete, and 🔊 preview each voice. A built-in
-  default voice always exists and can't be deleted.
-- **Pick the active voice** — the assistant speaks in it for **every** connected
-  device, and the choice **persists across restarts and new sessions** (stored
-  in `ACTIVE_VOICE_STATE_PATH`, default `./.active_voice`).
+- **Manage** — a compact dropdown picks the voice; icon buttons next to it
+  🔊 preview, ✏️ rename and 🗑 delete the selected one. A built-in default
+  voice always exists and can't be renamed or deleted.
+- **Pick the active voice** — the dropdown choice is the active voice: the
+  assistant speaks in it for **every** connected device, and it **persists
+  across restarts and new sessions** (stored in `ACTIVE_VOICE_STATE_PATH`,
+  default `./.active_voice`).
 
 **Requires the OmniVoice wrapper behind TTS** — voice cloning is an OmniVoice
 capability, so `TTS_BACKEND=openai` must point at

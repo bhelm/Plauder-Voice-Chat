@@ -153,7 +153,14 @@
           <div data-i18n="voices.help" style="font-size: 11px; color: var(--muted);">
             Record a short sample or upload an audio file to clone a voice, then pick which voice the assistant speaks in. The choice applies to every device and is kept across sessions.
           </div>
-          <div class="voices-list" id="voicesList"></div>
+          <div class="voices-picker">
+            <select id="voiceSelect" class="voice-select" data-i18n-title="voices.pick_title"></select>
+            <div class="voices-actions">
+              <button id="voicePreviewBtn" data-i18n-title="voices.preview">🔊</button>
+              <button id="voiceRenameBtn" data-i18n-title="voices.rename">✏️</button>
+              <button id="voiceDeleteBtn" class="danger" data-i18n-title="voices.delete">🗑</button>
+            </div>
+          </div>
           <div class="voices-add">
             <button id="recordVoiceBtn" class="vlock-enroll">
               <span class="vlock-prog" id="voiceRecProg"></span>
@@ -435,7 +442,10 @@
     const voiceLockToggle    = document.getElementById('voiceLockToggle');
     const voicesCard       = document.getElementById('voicesCard');
     const voicesChip       = document.getElementById('voicesChip');
-    const voicesList       = document.getElementById('voicesList');
+    const voiceSelect      = document.getElementById('voiceSelect');
+    const voicePreviewBtn  = document.getElementById('voicePreviewBtn');
+    const voiceRenameBtn   = document.getElementById('voiceRenameBtn');
+    const voiceDeleteBtn   = document.getElementById('voiceDeleteBtn');
     const recordVoiceBtn   = document.getElementById('recordVoiceBtn');
     const recordVoiceLabel = document.getElementById('recordVoiceLabel');
     const voiceRecProg     = document.getElementById('voiceRecProg');
@@ -2141,14 +2151,6 @@
     /* ===== Voice library (cloned voices) ===== */
     function voiceSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
-    function mkVoiceBtn(label, onClick, danger) {
-      const b = document.createElement('button');
-      b.textContent = label;
-      if (danger) b.className = 'danger';
-      b.addEventListener('click', onClick);
-      return b;
-    }
-
     function updateVoicesUi() {
       if (!voicesCard) return;
       const avail = !!(serverVoiceClone && serverVoiceClone.available);
@@ -2158,47 +2160,53 @@
       const active = serverVoiceClone.active || 'default';
       const activeVoice = list.find(v => v.id === active);
       if (voicesChip) voicesChip.textContent = (activeVoice && activeVoice.name) || t('voices.chip_none');
-      if (!voicesList) return;
-      voicesList.innerHTML = '';
+      if (!voiceSelect) return;
+      // Compact picker (the old per-voice button rows overflowed with long
+      // localized labels): the dropdown IS the active-voice choice, the icon
+      // buttons next to it act on the selected (= active) voice.
+      voiceSelect.innerHTML = '';
       if (!list.length) {
-        const e = document.createElement('div');
-        e.className = 'voices-empty'; e.textContent = t('voices.empty');
-        voicesList.appendChild(e);
-        return;
+        const o = document.createElement('option');
+        o.value = ''; o.textContent = t('voices.empty');
+        voiceSelect.appendChild(o);
+      } else {
+        for (const v of list) {
+          const o = document.createElement('option');
+          o.value = v.id;
+          o.textContent = (v.name || v.id) + (v.isDefault ? ` (${t('voices.builtin')})` : '');
+          if (v.id === active) o.selected = true;
+          voiceSelect.appendChild(o);
+        }
       }
-      list.forEach(v => {
-        const row = document.createElement('div');
-        row.className = 'voices-row' + (v.id === active ? ' active' : '');
-        const nm = document.createElement('span');
-        nm.className = 'vname'; nm.textContent = v.name || v.id;
-        row.appendChild(nm);
-        if (v.isDefault) {
-          const b = document.createElement('span');
-          b.className = 'vbuiltin'; b.textContent = t('voices.builtin');
-          row.appendChild(b);
-        }
-        if (v.id === active) {
-          const tg = document.createElement('span');
-          tg.className = 'vtag'; tg.textContent = t('voices.active');
-          row.appendChild(tg);
-        }
-        const acts = document.createElement('div');
-        acts.className = 'voices-actions';
-        if (v.id !== active) acts.appendChild(mkVoiceBtn(t('voices.select'), () => voiceSend({ type: 'voice.select', id: v.id })));
-        acts.appendChild(mkVoiceBtn(t('voices.preview'), () => voiceSend({ type: 'voice.preview', id: v.id })));
-        if (!v.isDefault) {
-          acts.appendChild(mkVoiceBtn(t('voices.rename'), () => {
-            const name = prompt(t('voices.rename_prompt'), v.name || '');
-            if (name && name.trim()) voiceSend({ type: 'voice.rename', id: v.id, name: name.trim() });
-          }));
-          acts.appendChild(mkVoiceBtn(t('voices.delete'), () => {
-            if (confirm(t('voices.delete_confirm', { name: v.name || v.id }))) voiceSend({ type: 'voice.delete', id: v.id });
-          }, true));
-        }
-        row.appendChild(acts);
-        voicesList.appendChild(row);
-      });
+      voiceSelect.disabled = !list.length;
+      if (voicePreviewBtn) voicePreviewBtn.disabled = !list.length;
+      // The built-in default voice can be neither renamed nor deleted.
+      const canEdit = !!(activeVoice && !activeVoice.isDefault);
+      if (voiceRenameBtn) voiceRenameBtn.disabled = !canEdit;
+      if (voiceDeleteBtn) voiceDeleteBtn.disabled = !canEdit;
     }
+
+    function _selectedVoice() {
+      const id = voiceSelect ? voiceSelect.value : '';
+      return (serverVoiceClone.voices || []).find(v => v.id === id) || null;
+    }
+    if (voiceSelect) voiceSelect.addEventListener('change', () => {
+      if (voiceSelect.value) voiceSend({ type: 'voice.select', id: voiceSelect.value });
+    });
+    if (voicePreviewBtn) voicePreviewBtn.addEventListener('click', () => {
+      if (voiceSelect && voiceSelect.value) voiceSend({ type: 'voice.preview', id: voiceSelect.value });
+    });
+    if (voiceRenameBtn) voiceRenameBtn.addEventListener('click', () => {
+      const v = _selectedVoice();
+      if (!v || v.isDefault) return;
+      const name = prompt(t('voices.rename_prompt'), v.name || '');
+      if (name && name.trim()) voiceSend({ type: 'voice.rename', id: v.id, name: name.trim() });
+    });
+    if (voiceDeleteBtn) voiceDeleteBtn.addEventListener('click', () => {
+      const v = _selectedVoice();
+      if (!v || v.isDefault) return;
+      if (confirm(t('voices.delete_confirm', { name: v.name || v.id }))) voiceSend({ type: 'voice.delete', id: v.id });
+    });
 
     function playPreviewAudio(b64, mime) {
       try {

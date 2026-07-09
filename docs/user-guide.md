@@ -140,9 +140,10 @@ the voice the assistant speaks in.
 - **⬆️ Upload** — pick an audio file (any format). The spoken words are detected
   automatically; if that fails you're asked to type them. The same edge cleanup
   is applied when the file can be decoded.
-- Each voice row has **Use** (make it the active voice), **🔊 Preview** (hear a
-  test sentence), **Rename**, and **Delete**. The built-in default voice can't be
-  deleted.
+- The **dropdown picks the active voice** (changing it switches immediately);
+  the icon buttons next to it act on the selected voice: **🔊 preview** (hear a
+  test sentence), **✏️ rename**, **🗑 delete**. The built-in default voice can't
+  be renamed or deleted (buttons grey out).
 - The **active** voice is used for **every** connected device and is remembered
   across restarts and new sessions — pick once, it sticks.
 
