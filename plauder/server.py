@@ -32,6 +32,7 @@ from aiohttp import WSMsgType, web
 from . import audio as audio_utils
 from . import opus_codec
 from . import sanitizer
+from . import speaker_gate
 from . import voice_clone
 from . import voices as voices_mod
 from . import wake
@@ -40,7 +41,6 @@ from .config import SAMPLE_RATE, Config
 from .hermes_history import fetch_history
 from .images import _resolve_image_urls
 from .session import ConversationManager
-from .speaker_verify import foreign_regions, keep_regions
 from .telegram_bridge import TelegramBridge
 from .turn_state import (TurnState, current_hermes_session_id,
                          rotate_hermes_session_id, vad_params_for_debounce)
@@ -1244,197 +1244,24 @@ async def _handle_audio_segment(ws, state: TurnState, pcm_bytes, segment_id, pee
     if text and not (wake_gating or speaker_gating):
         await _coalesce_cancel(state, ws)
 
-    # --- Speaker lock (voice gate). Hard lock: only the enrolled owner voice is
-    # transcribed; any other voice is dropped here, before the wake gate / LLM.
+    # --- Speaker lock (voice gate) at commit — the full decision lives in
+    # plauder.speaker_gate.apply_commit_gate (reject / trim / continuity).
     # Voice only (typed input bypasses this path entirely).
     speaker_score = None
     speaker_trimmed = False
     speaker_full_text = None
     if speaker_gating and text:
-        async def _reject(score):
-            LOG.info("speaker: rejected seg=%s score=%.3f text=%r",
-                     segment_id, score, text[:80])
-            await _spk_dump(segment_id, pcm_bytes, score, "rej")
-            await ws.send_json({
-                "type": "transcript.ignored", "segmentId": segment_id,
-                "turnId": state.turn_id, "text": text,
-                "reason": "speaker_mismatch", "speakerScore": round(score, 4),
-                "ts": time.time()})
-            _resume_debounce(ws, state)
-
-        # PTT is a deliberate button press — never hard-reject those segments.
-        # The windowed rescue below still cleans foreign background out of them;
-        # only the "drop everything" outcome turns into fail-open.
-        fail_open = bool(ptt)
-
-        # The commit gate ALWAYS re-verifies the full segment — even when the
-        # early barge-in check confirmed the owner mid-stream. Prefix scores
-        # are unreliable (a video prefix once hit 0.547 and its whole
-        # transcript sailed through unchecked); a wrongly cancelled reply is
-        # recoverable via continuity/coalescing, leaked foreign text is not.
-        # PRIMARY decision: full-segment verification. Windowed scores are
-        # deliberately NOT allowed to veto a segment — measured on real
-        # speech, ~1 s windows of the SAME voice scatter far below the
-        # full-segment score (a hard windowed gate rejected everything).
-        # Windows only assist below, as a RESCUE for mixed segments.
-        # (Started before STT — see verify_task above — so both overlap.)
-        res = await verify_task
-        speaker_score = round(res.score, 4)
-        matched = res.matched
-        # Temporal continuity: the owner was just heard (strict match) —
-        # judge this segment relative to that score instead of the absolute
-        # threshold. Fixes sentence tails split off by the owner-watch
-        # scoring a hair under the slider while foreign stays far below.
-        if (not matched and res.reason == "mismatch"
-                and state.speaker_last_own > 0
-                and time.time() - state.speaker_last_own_ts <= SPEAKER_CONT_WINDOW_S):
-            # The anchor's FRESHNESS decides WHETHER continuity applies;
-            # the bar itself is a fixed relaxation of the threshold. (The
-            # earlier `anchor − Δ` formula backfired: the better the last
-            # match, the LESS it helped — a 0.63 anchor left the bar at the
-            # full threshold and a 0.495 follow-up died by 0.005.)
-            eff = max(SPEAKER_CONT_FLOOR,
-                      SPEAKER.threshold - SPEAKER_TRIM_REL_DELTA)
-            if res.score >= eff:
-                matched = True
-                LOG.info("speaker: continuity accept seg=%s score=%.3f "
-                         "(last own %.3f, bar %.2f)",
-                         segment_id, res.score, state.speaker_last_own, eff)
-        # Sentence-level short-pass: a short segment while the owner is
-        # actively COMPOSING (input pending, no reply being generated) passes
-        # regardless of its score — single words neither falsify the
-        # transcript nor score reliably (also covers reason "too_short"), and
-        # a false reject here lets the debounce fire mid-thought (premature
-        # submit). Deliberately NOT while a reply is in flight (a foreign word
-        # must not cancel it) and NOT standalone (a lone foreign word must not
-        # start its own turn).
-        if (not matched and duration_s < SPEAKER_SHORT_SEG_S
-                and state.has_pending()
-                and not (state.agent_task and not state.agent_task.done())):
-            matched = True
-            LOG.info("speaker: short segment passes while composing seg=%s "
-                     "dur=%.1fs score=%.3f", segment_id, duration_s, res.score)
-        if res.matched and res.reason == "match":
-            # Only STRICT matches refresh the continuity anchor (a chain of
-            # continuity accepts must not drift the reference downwards; a
-            # fail-open verify — reason "error"/"no_profile", score 0.0 —
-            # must not zero the anchor either).
-            state.speaker_last_own = res.score
-            state.speaker_last_own_ts = time.time()
-
-        blocks = []
-        if CFG.speaker_trim and duration_s >= SPEAKER_TRIM_MIN_S:
-            # Equal-length 3 s block scores on a fixed grid — the ONLY scale on
-            # which "who is this?" comparisons are valid (the model is heavily
-            # length-sensitive; window/prefix scores misled every earlier
-            # iteration of this gate).
-            blocks = await asyncio.to_thread(SPEAKER.analyze_blocks, pcm_bytes, SAMPLE_RATE)
-            if CFG.speaker_debug and blocks:
-                LOG.info("spk-debug seg=%s full=%.3f matched=%s blocks=[%s]",
-                         segment_id, res.score, matched,
-                         " ".join(f"{s0:.1f}-{e0:.1f}:{sc:.2f}" for s0, e0, sc in blocks))
-
-        async def _crop_and_restt(spans, span_total):
-            """Crop to the given spans + re-transcribe; '' when unusable.
-            The cropped audio goes through the ghost filter too (short
-            snippets are prime Whisper-hallucination bait)."""
-            nonlocal stt_ms
-            cropped = audio_utils.crop_f32_spans(pcm_bytes, SAMPLE_RATE, spans)
-            t_stt2 = time.time()
-            try:
-                t2 = (await STT.transcribe(cropped, SAMPLE_RATE) or "").strip()
-            except Exception:
-                LOG.exception("speaker trim: re-STT failed seg=%s", segment_id)
-                t2 = ""
-            stt_ms += int((time.time() - t_stt2) * 1000)
-            if t2 and GHOST and GHOST.is_hallucination(
-                    t2, no_speech_prob=getattr(STT, "last_no_speech_prob", None),
-                    duration_s=span_total):
-                t2 = ""
-            if t2 and GHOST:
-                t2 = GHOST.strip_ghost_sentences(t2)
-            return t2
-
-        async def _trim_foreign(best_hint, veto_bar=None):
-            """Cut sustained foreign regions (block-relative) + re-transcribe
-            the kept audio. Returns True when the text was replaced.
-            ``veto_bar`` overrides the second-opinion bar (default: the full
-            accept threshold)."""
-            nonlocal text, speaker_score, speaker_trimmed, speaker_full_text
-            foreign, keep = foreign_regions(
-                blocks, duration_s, delta=SPEAKER_BLOCK_DELTA,
-                min_region_s=SPEAKER_TRIM_MIN_FOREIGN_S,
-                abs_floor=SPEAKER.threshold)
-            if not foreign or not keep:
-                return False
-            # Second opinion before cutting: re-embed each candidate region as
-            # ONE contiguous piece (contiguous multi-second audio behaves like
-            # a full segment, unlike the noisy grid blocks). A region that
-            # still scores like the owner is vetoed — field sessions showed
-            # the relative rule cutting the owner's own sentences.
-            bar = SPEAKER.threshold if veto_bar is None else veto_bar
-            confirmed = []
-            for a, b in foreign:
-                sc = await asyncio.to_thread(
-                    SPEAKER.score_region, pcm_bytes, SAMPLE_RATE, a, b)
-                if sc >= bar:
-                    LOG.info("speaker: trim veto seg=%s region=%.1f-%.1f "
-                             "score=%.3f (owner)", segment_id, a, b, sc)
-                else:
-                    confirmed.append((a, b))
-            if not confirmed:
-                return False
-            if len(confirmed) < len(foreign):
-                foreign = confirmed
-                keep = keep_regions(foreign, duration_s)
-            keep_total = sum(e - s for s, e in keep)
-            if keep_total < SPEAKER.min_dur_s:
-                return False
-            text2 = await _crop_and_restt(keep, keep_total)
-            if not text2 or text2 == text:
-                return False
-            LOG.info("speaker: block trim seg=%s foreign=%s %r → %r",
-                     segment_id,
-                     ",".join(f"{a:.1f}-{b:.1f}" for a, b in foreign),
-                     text[:60], text2[:60])
-            speaker_full_text = text
-            text = text2
-            speaker_trimmed = True
-            speaker_score = round(max(speaker_score or 0.0, best_hint), 4)
-            return True
-
-        if matched:
-            # Owner confirmed — but a sustained foreign passage may still ride
-            # along in the transcript. Blocks scoring far below the segment's
-            # best SAME-LENGTH block are someone else; cut only whole
-            # sentences (sentence-level policy), keep the text when in doubt.
-            # Inside a MATCHED segment the veto uses the low FLOOR, not the
-            # accept threshold: the doubt belongs to the owner here.
-            if len(blocks) >= 2:
-                await _trim_foreign(
-                    max(sc for _, _, sc in blocks),
-                    veto_bar=min(SPEAKER.threshold, SPEAKER_TRIM_VETO_FLOOR))
-        else:
-            rescued = False
-            # Mixed segment where the foreign part dominates? → rescue the
-            # owner's regions. Anchor: the best block must clear the floor
-            # (owner present at all); regions are then judged relative to it.
-            if len(blocks) >= 2:
-                best = max(sc for _, _, sc in blocks)
-                if best >= SPEAKER.window_threshold:
-                    rescued = await _trim_foreign(best)
-            if not rescued and not fail_open:
-                await _reject(res.score)
-                return
-        await _spk_dump(segment_id, pcm_bytes, res.score,
-                        "trim" if speaker_trimmed else "ok")
-        # Owner confirmed → this segment may barge in. When the up-front cancel
-        # was deferred purely for the speaker gate (pure VAD, no wake word), do
-        # it now so the owner can interrupt a running reply. (No-op if the early
-        # mid-stream check already cancelled it.) If the reply has not started
-        # playing yet, the cancelled turn's input is carried over (coalescing).
-        if not wake_gating:
-            await _coalesce_cancel(state, ws)
+        gate = await speaker_gate.apply_commit_gate(
+            ws, state, segment_id=segment_id, pcm_bytes=pcm_bytes, text=text,
+            duration_s=duration_s, ptt=ptt, verify_task=verify_task,
+            wake_gating=wake_gating)
+        if gate is None:   # rejected (transcript.ignored sent, debounce resumed)
+            return
+        text = gate["text"]
+        speaker_score = gate["score"]
+        speaker_trimmed = gate["trimmed"]
+        speaker_full_text = gate["full_text"]
+        stt_ms += gate["stt_ms"]
 
     # --- Wake-word gate (prefix). Voice only; typed input is always intended.
     if wake_gating and text:
@@ -1636,276 +1463,9 @@ def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
 
 
 # ============================================================================ #
-# Voice-lock barge-in: early speaker check on the streaming segment.
-#
-# With the speaker lock engaged the client does NOT stop playback on VAD speech
-# (any voice would trigger that — the whole point of the lock is that foreign
-# voices must not interrupt). Instead, while a segment streams in (B1) and a
-# reply is in flight, the growing buffer is verified against the owner profile
-# as soon as enough audio exists; only a CONFIRMED owner voice cancels the
-# running reply. Foreign voices leave it playing.
+# Voice-lock barge-in / owner-watch / commit gate → plauder.speaker_gate
+# (reads the runtime state above via `server.<name>` at call time).
 # ============================================================================ #
-SPEAKER_BARGE_MIN_S = 1.5      # audio needed before the first early check —
-                               # short prefixes overscore (field: a video prefix
-                               # hit 0.547 while full blocks of the SAME video
-                               # scored 0.14–0.36)
-SPEAKER_BARGE_MAX_CHECKS = 2   # one retry with 2× audio (first window may be echo-mixed)
-SPEAKER_BARGE_MARGIN = 0.03    # interrupt needs threshold + margin (destructive)
-# Segments at least this long get the windowed mixed-voice analysis (trimming)
-# instead of one full-segment verify; shorter ones can't meaningfully mix.
-# (1.6 s = two 1.2 s windows at 0.6 s hop — the minimum for a mixed decision.)
-SPEAKER_TRIM_MIN_S = 1.6
-# Relative trim: absolute window scores shift wildly with recording conditions,
-# but the relative ORDER within one segment is stable — windows scoring this far
-# below the segment's own best window are someone else. Field-calibrated from
-# spk-debug data: owner windows ~0.24–0.33 vs foreign ~0.09–0.21 in the same
-# segment → a 0.12 gap separates them; 0.30 (the first guess) never fired.
-SPEAKER_TRIM_REL_DELTA = 0.12
-# Sentence-level policy: only SUSTAINED foreign speech (a train announcement,
-# a kid telling a story) is worth cutting/rejecting — a single word neither
-# falsifies the transcript nor deserves the risk: a false cut mangles the
-# owner's sentence, a false reject triggers premature submits. Short-audio
-# embeddings are erratic anyway (measured: same-voice 1.2 s clips score
-# 0.19–0.31 vs 0.91 for the full sentence; tiling the clip inflates OWN and
-# FOREIGN scores alike, so it cannot rescue short-clip scoring).
-SPEAKER_TRIM_MIN_FOREIGN_S = 2.5   # minimum foreign block worth cutting
-SPEAKER_SHORT_SEG_S = 2.5          # shorter segments pass mid-conversation
-# Relative bar between EQUAL-LENGTH 3 s blocks of the same segment (the only
-# scale on which speaker comparisons are valid — see analyze_blocks).
-SPEAKER_BLOCK_DELTA = 0.15
-# Second-opinion veto floor for cutting inside a MATCHED segment: the cut
-# candidate's contiguous re-score must look genuinely foreign before it is
-# cut. Field data (2026-07-06): real foreign passages re-score 0.05–0.15,
-# the owner's quiet sentence tails 0.30–0.34 — the accept threshold (0.4)
-# sat between the two and let the owner's own sentences be cut. The RESCUE
-# path (full verify failed) keeps the strict threshold: there the segment
-# is NOT confirmed as the owner, so the doubt goes toward cutting.
-SPEAKER_TRIM_VETO_FLOOR = 0.25
-# Temporal continuity: after a strict owner match, follow-up segments within
-# this window are judged RELATIVE to that score (last_own − Δ, floored) —
-# sentence tails after an owner-watch split score slightly lower than the
-# head, while foreign voices stay far below.
-SPEAKER_CONT_WINDOW_S = 30.0
-SPEAKER_CONT_FLOOR = 0.30
-
-
-def _spk_dump_sync(dump_dir, tag, pcm_bytes, score, decision, keep=200):
-    """Write a gated segment / enrollment take as a 16-bit WAV into
-    SPEAKER_DUMP_DIR so gate decisions can be replayed offline against the
-    verifier with the REAL audio. Filename: <ts>_<tag>_<decision>_<score>.wav;
-    only the newest `keep` files survive (disk cap). Blocking — call via
-    asyncio.to_thread."""
-    d = Path(dump_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tag))
-    name = f"{ts}-{int(now % 1 * 1000):03d}_{safe}_{decision}_{score:.3f}.wav"
-    arr = audio_utils.pcm_bytes_to_float32_array(pcm_bytes)
-    (d / name).write_bytes(audio_utils.float32_to_pcm16_wav_bytes(arr, SAMPLE_RATE))
-    for p in sorted(d.glob("*.wav"))[:-keep]:
-        try:
-            p.unlink()
-        except OSError:
-            pass
-
-
-async def _spk_dump(tag, pcm_bytes, score, decision):
-    if not (CFG and CFG.speaker_dump_dir):
-        return
-    try:
-        await asyncio.to_thread(_spk_dump_sync, CFG.speaker_dump_dir, tag,
-                                pcm_bytes, score, decision)
-    except Exception:
-        LOG.exception("speaker dump failed (%s)", tag)
-
-
-async def _do_speaker_barge(ws, state: TurnState, seg: dict, pcm: bytes):
-    try:
-        duration_s = (len(pcm) // 4) / SAMPLE_RATE
-        res = await asyncio.to_thread(SPEAKER.verify, pcm, SAMPLE_RATE, duration_s)
-        matched, score = res.matched, res.score
-        # Interrupting is destructive AND prefix scores are flaky → demand a
-        # margin above the plain accept threshold. A false positive here only
-        # cancels the reply; the commit gate re-verifies the full segment.
-        if matched and score < SPEAKER.threshold + SPEAKER_BARGE_MARGIN:
-            matched = False
-        if not matched:
-            # Mixed prefix (kids talking over/next to the owner) dilutes the
-            # full-buffer score. Fall back to windows: a single CLEAR owner
-            # window above the margined bar suffices.
-            wa = await asyncio.to_thread(SPEAKER.analyze_windows, pcm, SAMPLE_RATE)
-            if wa is not None and wa.score >= SPEAKER.threshold + SPEAKER_BARGE_MARGIN:
-                matched, score = True, wa.score
-    except Exception:
-        LOG.exception("speaker barge check failed seg=%s", seg.get("id"))
-        matched, score = None, 0.0
-    finally:
-        seg["spk_running"] = False
-    # Segment already committed/aborted → the commit path decides, not us.
-    if matched is None or seg.get("done"):
-        return
-    if matched:
-        seg["spk_owner"] = True
-        seg["spk_score"] = round(score, 4)
-        LOG.info("speaker: owner confirmed mid-stream seg=%s score=%.3f → barge-in",
-                 seg.get("id"), score)
-        await _coalesce_cancel(state, ws)
-    else:
-        LOG.debug("speaker: mid-stream check not owner seg=%s score=%.3f (reply keeps playing)",
-                  seg.get("id"), score)
-
-
-def _maybe_spawn_speaker_barge(ws, state: TurnState, seg: dict):
-    """Throttle check + start of an early speaker verification (see above).
-    Sync — spawns a task when needed, does not block the frame loop.
-
-    Wake mode is deliberately excluded: there the wake gate at commit decides
-    what may interrupt (deferred cancel), and an open-window follow-up already
-    passes both gates at commit."""
-    if SPEAKER is None or not SPEAKER.active():
-        return
-    if not CFG or getattr(state, "wake_word_enabled", False):
-        return
-    if seg.get("spk_owner") or seg.get("spk_running") or seg.get("done"):
-        return
-    if seg.get("spk_checks", 0) >= SPEAKER_BARGE_MAX_CHECKS:
-        return
-    # Only worth checking early when there is something to interrupt — which
-    # includes audio the client is still PLAYING from its buffer long after
-    # all chunks were sent (fast TTS: audio_ids empties within ~1-2 s).
-    in_flight = ((state.agent_task and not state.agent_task.done())
-                 or bool(state.audio_ids) or state.client_playing)
-    if not in_flight:
-        return
-    min_s = max(getattr(SPEAKER, "min_dur_s", 0.0), SPEAKER_BARGE_MIN_S)
-    need = int(SAMPLE_RATE * 4 * min_s) * (seg.get("spk_checks", 0) + 1)
-    if len(seg["buf"]) < need:
-        return
-    seg["spk_checks"] = seg.get("spk_checks", 0) + 1
-    seg["spk_running"] = True
-    _spawn_tracked(state, _do_speaker_barge(ws, state, seg, bytes(seg["buf"])))
-
-
-# ============================================================================ #
-# Owner-watch: server-side end-of-owner detection (segmentation fix).
-#
-# The browser VAD is speaker-agnostic: it closes a segment on SILENCE, not when
-# the OWNER stops. If other voices keep talking (kids), the client segment never
-# ends and the owner's utterance would sit in the buffer indefinitely. With the
-# speaker lock engaged, the server therefore scores the streaming buffer in
-# ~1.2 s windows; once the owner HAS spoken and then hasn't been heard for the
-# debounce time, the buffered audio is committed as the owner's utterance and
-# the stream is re-armed as a fresh virtual segment — the foreign tail is then
-# judged on its own at the real client commit (and rejected by the gate).
-# ============================================================================ #
-OWNER_WATCH_WIN_S = 1.2    # window fed to the embedding model
-OWNER_WATCH_HOP_S = 0.6    # step between scored windows
-
-
-def _maybe_spawn_owner_watch(ws, state: TurnState, seg: dict, peer):
-    """Throttle check + start of one owner-watch window score. Sync — spawns a
-    task when a full new window of audio is available."""
-    if SPEAKER is None or not SPEAKER.active() or not CFG:
-        return
-    if seg.get("done") or seg.get("own_running"):
-        return
-    win = int(SAMPLE_RATE * 4 * OWNER_WATCH_WIN_S)
-    hop = int(SAMPLE_RATE * 4 * OWNER_WATCH_HOP_S)
-    next_off = seg.get("own_next_off", 0)
-    if len(seg["buf"]) < next_off + win:
-        return
-    seg["own_running"] = True
-    pcm = bytes(seg["buf"][next_off:next_off + win])
-    seg["own_next_off"] = next_off + hop
-    _spawn_tracked(state, _owner_watch_step(ws, state, seg, pcm, next_off + win, peer))
-
-
-async def _owner_watch_step(ws, state: TurnState, seg: dict, pcm: bytes,
-                            end_off: int, peer):
-  # The own_running guard spans the WHOLE step including the veto embeds —
-  # otherwise a parallel step could double-commit the same buffer.
-  try:
-    try:
-        res = await asyncio.to_thread(SPEAKER.window_is_owner, pcm, SAMPLE_RATE)
-    except Exception:
-        LOG.exception("owner-watch failed seg=%s", seg.get("id"))
-        res = None
-    if seg.get("done"):
-        return
-    if res is True:
-        seg["own_seen"] = True
-        seg["own_last_end"] = end_off / (SAMPLE_RATE * 4.0)
-    # Only cut once the owner HAS spoken in this segment and has since been
-    # quiet (foreign voices / noise) for the user's pause tolerance.
-    if not seg.get("own_seen"):
-        return
-    buf_s = len(seg["buf"]) / (SAMPLE_RATE * 4.0)
-    quiet_s = buf_s - seg.get("own_last_end", 0.0)
-    # Deliberately LAZIER than the debounce: true silence closes the segment
-    # client-side anyway (VAD redemption ≈ 0.8×debounce) — the watch only has
-    # to cut when FOREIGN sound keeps the mic open. A tight bound here cut the
-    # owner mid-sentence whenever one trailing word scored foreign.
-    if quiet_s < max(2.0, state.debounce_ms / 1000.0 + 0.8):
-        return
-    # Block-level VETO before cutting: single window scores routinely dip
-    # below the bar mid-sentence (field logs: a cut fired after 2.4 s while
-    # the owner was still talking). Confirm with reliable block embeddings —
-    # head [0, cut] vs tail [cut, end]; cut only when the tail is clearly NOT
-    # the head's speaker (same relative rule as the trim logic).
-    cut_s = seg.get("own_last_end", 0.0)
-    pcm_all = bytes(seg["buf"])
-    head_sc = await asyncio.to_thread(SPEAKER.score_region, pcm_all, SAMPLE_RATE, 0.0, cut_s)
-    tail_sc = await asyncio.to_thread(SPEAKER.score_region, pcm_all, SAMPLE_RATE, cut_s, None)
-    if seg.get("done"):
-        return
-    if head_sc < SPEAKER.window_threshold or tail_sc >= head_sc - SPEAKER_TRIM_REL_DELTA:
-        # Same speaker trailing on (or head not owner-ish) → no split. Count
-        # the tail as owner activity so the veto doesn't re-run every hop.
-        seg["own_last_end"] = len(seg["buf"]) / (SAMPLE_RATE * 4.0)
-        if CFG and CFG.speaker_debug:
-            LOG.info("owner-watch veto seg=%s head=%.3f tail=%.3f (no cut)",
-                     seg.get("id"), head_sc, tail_sc)
-        return
-    buf_s = len(seg["buf"]) / (SAMPLE_RATE * 4.0)   # may have grown during embeds
-    pcm_all = bytes(seg["buf"])
-    # Commit ONLY the owner's head [0, cut+pad]: the block veto just confirmed
-    # the tail is a DIFFERENT speaker, and at ~2-2.6 s it is too short for the
-    # commit gate's trim (min foreign region 2.5 s) — committing the whole
-    # buffer leaked exactly the foreign words the watch exists to keep out.
-    cut_bytes = min(len(pcm_all),
-                    int((cut_s + 0.25) * SAMPLE_RATE) * 4)
-    pcm_head = pcm_all[:cut_bytes]
-    seg_id = seg["id"]
-    LOG.info("owner-watch: auto-commit seg=%s (%.1fs of %.1fs audio, owner "
-             "quiet %.1fs, head=%.2f tail=%.2f)", seg_id,
-             len(pcm_head) / (SAMPLE_RATE * 4.0), buf_s, quiet_s, head_sc, tail_sc)
-    speech_start = seg.get("speech_start_ts")
-    barge = seg.get("barge_in", False)
-    # Re-arm the stream as a FRESH virtual segment seeded with the tail: the
-    # client keeps streaming; whatever follows (the kids' tail, or the owner
-    # speaking again — possibly already begun inside the tail) is judged on
-    # its own at the real commit / the next auto-commit.
-    seg["own_cuts"] = seg.get("own_cuts", 0) + 1
-    seg["id"] = f"{seg_id}-c{seg['own_cuts']}"
-    seg["buf"] = bytearray(pcm_all[cut_bytes:])
-    seg["speech_start_ts"] = None
-    seg["barge_in"] = False
-    seg["last_partial_len"] = 0
-    seg["last_partial_ts"] = 0.0
-    seg["partial_text"] = ""
-    seg["spk_checks"] = 0
-    seg["spk_owner"] = False
-    seg["spk_score"] = None
-    seg["own_next_off"] = 0
-    seg["own_seen"] = False
-    seg["own_last_end"] = 0.0
-    _spawn_tracked(state, _handle_audio_segment(
-        ws, state, pcm_head, seg_id, peer,
-        speech_start_ts=speech_start, barge_in=barge))
-  finally:
-    seg["own_running"] = False
-
 
 # ============================================================================ #
 # WebSocket handler
@@ -2186,10 +1746,10 @@ async def ws_handler(request):
                         # B2: partial throttle state.
                         "partial_running": False, "last_partial_ts": 0.0,
                         "last_partial_len": 0, "partial_text": "", "done": False,
-                        # Voice-lock early barge-in state (_maybe_spawn_speaker_barge).
+                        # Voice-lock early barge-in state (speaker_gate.maybe_spawn_speaker_barge).
                         "spk_checks": 0, "spk_running": False,
                         "spk_owner": False, "spk_score": None,
-                        # Owner-watch state (_maybe_spawn_owner_watch).
+                        # Owner-watch state (speaker_gate.maybe_spawn_owner_watch).
                         "own_next_off": 0, "own_running": False,
                         "own_seen": False, "own_last_end": 0.0, "own_cuts": 0,
                     }
@@ -2236,7 +1796,7 @@ async def ws_handler(request):
                             status = await asyncio.to_thread(SPEAKER.enroll, buf, SAMPLE_RATE)
                             LOG.info("speaker: enrolled take (count=%d, sampleScore=%s)",
                                      status.get("count"), status.get("sampleScore"))
-                            await _spk_dump(f"enroll{status.get('count', 0)}", buf,
+                            await speaker_gate.spk_dump(f"enroll{status.get('count', 0)}", buf,
                                             float(status.get("sampleScore") or 0.0),
                                             "enroll")
                             await ws.send_json({"type": "speaker.enroll.ack", "ok": True,
@@ -2490,8 +2050,8 @@ async def ws_handler(request):
                     else:
                         active_stream["buf"].extend(msg.data)
                     _maybe_spawn_partial(ws, state, active_stream)
-                    _maybe_spawn_speaker_barge(ws, state, active_stream)
-                    _maybe_spawn_owner_watch(ws, state, active_stream, peer)
+                    speaker_gate.maybe_spawn_speaker_barge(ws, state, active_stream)
+                    speaker_gate.maybe_spawn_owner_watch(ws, state, active_stream, peer)
                     continue
                 if pending_segment_meta:
                     _meta = pending_segment_meta.popleft()

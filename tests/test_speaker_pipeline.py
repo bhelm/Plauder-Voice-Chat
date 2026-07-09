@@ -8,6 +8,7 @@ import dataclasses
 from aiohttp.test_utils import TestClient, TestServer
 
 from plauder import server as srv
+from plauder import speaker_gate
 from plauder.config import Config
 from plauder.sanitizer import HallucinationFilter
 from plauder.session import ConversationManager
@@ -872,7 +873,7 @@ def test_playback_done_refreshes_continuity_window():
 
             # The reply took longer than the window → anchor timestamp stale.
             state = next(iter(srv.WS_CLIENTS.values()))
-            state.speaker_last_own_ts -= srv.SPEAKER_CONT_WINDOW_S + 30
+            state.speaker_last_own_ts -= speaker_gate.SPEAKER_CONT_WINDOW_S + 30
 
             # Playback just ended → window restarts now.
             await ws.send_json({"type": "playback.done"})
@@ -903,7 +904,7 @@ def test_stale_continuity_anchor_without_playback_done_rejects():
             assert (await _drain_until(ws, "reply"))[0] is not None
 
             state = next(iter(srv.WS_CLIENTS.values()))
-            state.speaker_last_own_ts -= srv.SPEAKER_CONT_WINDOW_S + 30
+            state.speaker_last_own_ts -= speaker_gate.SPEAKER_CONT_WINDOW_S + 30
 
             await _send_voice(ws, "s2")
             ig, seen = await _drain_until(ws, "transcript.ignored")

@@ -78,6 +78,10 @@ auto-reload.
   recorded-sample commit, hello capability block, active-voice lookup. Reads
   `server.*` at call time (same pattern as `app.py`); the wrapper CRUD client
   is `voices.py` (`VoiceLibrary`).
+- **`speaker_gate.py`** — speaker-lock gating POLICY (commit gate incl.
+  foreign-passage trim, early barge-in check, owner-watch auto-commit) plus
+  all its field-calibrated tunables. Reads `server.*` at call time; the
+  scoring itself (embeddings/thresholds) is `speaker_verify.py`.
 - **`backends/{stt,tts,llm}/`** — each has a `base.py` abstract class with a
   `from_config()` factory dispatching on `STT_BACKEND`/`TTS_BACKEND`/`LLM_BACKEND`.
   **Heavy GPU deps (`faster_whisper`, `torch`, `omnivoice`) are imported only inside
