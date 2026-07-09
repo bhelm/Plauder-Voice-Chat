@@ -287,6 +287,96 @@ def test_ws_settings_ack():
             ack, _, _ = await _drain_until(ws, "settings.ack")
             assert ack["speed"] == 1.2
             assert ack["debounceMs"] == 800
+            assert ack["echoMode"] is False   # start default: normal replies
+            await ws.close()
+
+    asyncio.run(run())
+
+
+class _ExplodingLLM:
+    """Any call proves a turn leaked into the LLM despite echo mode."""
+    loaded = True
+
+    async def chat(self, messages, system_hint=None):
+        raise AssertionError("LLM must not be called in echo mode")
+
+    async def chat_stream(self, messages, system_hint=None):
+        raise AssertionError("LLM must not be called in echo mode")
+        yield  # pragma: no cover — makes this an async generator
+
+    def describe(self):
+        return {"engine": "exploding-llm", "model": "fake", "ready": True}
+
+
+def _configure_echo(streaming: bool) -> ConversationManager:
+    cfg = dataclasses.replace(Config.from_env(), debounce_ms=30, streaming=streaming)
+    conv = ConversationManager(_ExplodingLLM(), system_prompt="sys")
+    srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(), conv=conv, bridge=None,
+                  ghost=HallucinationFilter(enabled=False))
+    return conv
+
+
+def test_ws_echo_mode_repeats_input_without_llm():
+    conv = _configure_echo(streaming=True)
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "settings", "echoMode": True})
+            ack, _, _ = await _drain_until(ws, "settings.ack")
+            assert ack["echoMode"] is True
+            await ws.send_json({"type": "text.message", "text": "Hallo Echo."})
+            reply, seen, b1 = await _drain_until(ws, "reply")
+            assert reply["text"] == "Hallo Echo."
+            assert reply["echo"] is True
+            assert "reply.start" in seen
+            end, _, b2 = await _drain_until(ws, "audio.end")
+            assert end is not None and end["chunks"] >= 1
+            assert (b1 or b2)[:4] == b"VCT2"
+            await ws.close()
+
+    asyncio.run(run())
+    assert conv._history == {}   # echo turns never touch the conversation
+
+
+def test_ws_echo_mode_works_with_streaming_off():
+    # Echo bypasses the LLM entirely, so it streams TTS even when the
+    # classic (STREAMING=0) reply path is configured.
+    _configure_echo(streaming=False)
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "settings", "echoMode": True})
+            await _drain_until(ws, "settings.ack")
+            await ws.send_json({"type": "text.message", "text": "Nur ein Test"})
+            reply, _, _ = await _drain_until(ws, "reply")
+            assert reply["text"] == "Nur ein Test"
+            end, _, _ = await _drain_until(ws, "audio.end")
+            assert end is not None
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_ws_echo_mode_off_restores_llm_replies():
+    _configure_streaming_llm(["Echte Antwort."])
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "settings", "echoMode": True})
+            await _drain_until(ws, "settings.ack")
+            await ws.send_json({"type": "settings", "echoMode": False})
+            ack, _, _ = await _drain_until(ws, "settings.ack")
+            assert ack["echoMode"] is False
+            await ws.send_json({"type": "text.message", "text": "Hi"})
+            reply, _, _ = await _drain_until(ws, "reply")
+            assert reply["text"] == "Echte Antwort."
+            assert "echo" not in reply
             await ws.close()
 
     asyncio.run(run())

@@ -172,6 +172,10 @@ const I18N = {
     "voices.edge_speech": "Speech was cut off at the start/end of the recording — record again and leave a short pause before and after speaking.",
     "voices.unavailable": "Voice cloning is not available.",
     "voices.error": "Voice operation failed: {err}",
+    "voices.echo_label": "🔁 Echo mode",
+    "voices.echo_title": "Repeat everything you say in the active voice — no assistant reply (try out a cloned voice live)",
+    "voices.echo_on": "🔁 Echo mode on — everything you say is repeated in the active voice.",
+    "voices.echo_off": "Echo mode off — back to normal replies.",
     // Speaker button
     "speaker.tip": "Click: play / pause · Hold: from the start",
     "speaker.no_audio": "No audio (e.g. after reloading the page)",
@@ -376,6 +380,10 @@ const I18N = {
     "voices.edge_speech": "Die Sprache war am Anfang/Ende der Aufnahme abgeschnitten — bitte neu aufnehmen und vor und nach dem Sprechen kurz pausieren.",
     "voices.unavailable": "Stimmen-Klonen ist nicht verfügbar.",
     "voices.error": "Stimmen-Aktion fehlgeschlagen: {err}",
+    "voices.echo_label": "🔁 Echo-Modus",
+    "voices.echo_title": "Wiederholt alles, was du sagst, in der aktiven Stimme — keine Antwort der Assistentin (geklonte Stimme live ausprobieren)",
+    "voices.echo_on": "🔁 Echo-Modus an — alles, was du sagst, wird in der aktiven Stimme wiederholt.",
+    "voices.echo_off": "Echo-Modus aus — wieder normale Antworten.",
     // Speaker button
     "speaker.tip": "Klick: Abspielen / Pause · Gedrückt halten: von vorn",
     "speaker.no_audio": "Kein Audio (z.B. nach Neuladen der Seite)",

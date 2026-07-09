@@ -414,6 +414,23 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
         "segmentIds": segment_ids, "source": source,
         "imageCount": len(resolved_imgs), "ts": time.time(),
     })
+
+    # Echo mode (voice-clone playground): repeat the user's words verbatim in
+    # the active voice — no LLM call, no conversation history, and no
+    # cross-device/Telegram mirroring (it is a local test mode, not a turn of
+    # the shared session). Uses the streaming TTS machinery regardless of
+    # CFG.streaming: the "token stream" is just the user's own text.
+    if state.echo_mode:
+        if not combined:
+            return
+        reply_id = f"reply-{turn_id}"
+        await ws.send_json({"type": "reply.start", "turnId": turn_id,
+                            "replyId": reply_id, "echo": True, "ts": time.time()})
+        await _stream_reply_and_tts(ws, state, turn_id, reply_id,
+                                    combined=combined, resolved_imgs=[],
+                                    echo=True)
+        return
+
     # Mirror the committed user input to other connected devices.
     if combined or resolved_imgs:
         _broadcast_peers_bg(ws, {
@@ -593,13 +610,16 @@ class _StreamingReply:
     """
 
     def __init__(self, ws, state: TurnState, turn_id, reply_id, *,
-                 combined, resolved_imgs):
+                 combined, resolved_imgs, echo=False):
         self.ws = ws
         self.state = state
         self.turn_id = turn_id
         self.reply_id = reply_id
         self.combined = combined
         self.resolved_imgs = resolved_imgs
+        # Echo mode: the "LLM stream" is the user's own text (no CONV involved),
+        # and the finished reply is not mirrored to peers/Telegram.
+        self.echo = echo
 
         self.pron = CFG.pronunciations_file if CFG else None
         # Cloned voice for this whole reply, resolved once (None = backend default).
@@ -810,16 +830,22 @@ class _StreamingReply:
                 await self.sentence_q.put(cleaned)
                 self.flushed_any = True
 
+    async def _echo_stream(self):
+        yield self.combined
+
     async def _consume_stream(self):
-        # Re-apply THIS connection's Hermes session id right before the call:
-        # it lives on the process-wide LLM singleton, and awaits between turn
-        # start and request build let a concurrent connection overwrite it
-        # (cross-session contamination). This shrinks the race window to the
-        # request build itself.
-        _apply_hermes_headers(self.state)
-        agen = CONV.chat_stream(
-            self.combined, user_key=self.state.session_user or _default_user(),
-            image_urls=self.resolved_imgs if self.resolved_imgs else None)
+        if self.echo:
+            agen = self._echo_stream()
+        else:
+            # Re-apply THIS connection's Hermes session id right before the call:
+            # it lives on the process-wide LLM singleton, and awaits between turn
+            # start and request build let a concurrent connection overwrite it
+            # (cross-session contamination). This shrinks the race window to the
+            # request build itself.
+            _apply_hermes_headers(self.state)
+            agen = CONV.chat_stream(
+                self.combined, user_key=self.state.session_user or _default_user(),
+                image_urls=self.resolved_imgs if self.resolved_imgs else None)
         async for delta in agen:
             if self.t_first is None:
                 self.t_first = time.time()
@@ -892,7 +918,9 @@ class _StreamingReply:
                 self.held.append(self.pending.strip())
             full_reply = "".join(self.parts).strip()
             llm_ms = int((time.time() - self.t_llm) * 1000)
-            meta = dict(getattr(CONV, "last_stream_meta", {}) or {})
+            # Echo turns never touched CONV — its meta is stale (previous turn).
+            meta = ({} if self.echo
+                    else dict(getattr(CONV, "last_stream_meta", {}) or {}))
 
             if sanitizer.is_no_reply(full_reply):
                 await _drain_tts()
@@ -909,16 +937,21 @@ class _StreamingReply:
             await self._emit_text()               # remaining text to the client
             cleaned_full = sanitizer.sanitize_for_tts(full_reply,
                                                       pronunciations_file=self.pron)
-            LOG.info("turn=%s agent ok llm=%dms text=%r (stream)", turn_id, llm_ms, full_reply[:120])
-            await ws.send_json({
+            LOG.info("turn=%s %s ok llm=%dms text=%r (stream)", turn_id,
+                     "echo" if self.echo else "agent", llm_ms, full_reply[:120])
+            reply_evt = {
                 "type": "reply", "turnId": turn_id, "replyId": reply_id,
                 "text": full_reply, "cleanedText": cleaned_full, "llmMs": llm_ms,
                 "finishReason": meta.get("finish_reason"), "usage": meta.get("usage"),
-                "streamed": True, "ts": time.time()})
-            _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
-                                     "text": full_reply, "ts": time.time()})
+                "streamed": True, "ts": time.time()}
+            if self.echo:
+                reply_evt["echo"] = True
+            await ws.send_json(reply_evt)
+            if not self.echo:
+                _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
+                                         "text": full_reply, "ts": time.time()})
 
-            if BRIDGE and BRIDGE.enabled and cleaned_full:
+            if BRIDGE and BRIDGE.enabled and cleaned_full and not self.echo:
                 BRIDGE.remember_self_sent(full_reply)
                 asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
 
@@ -940,10 +973,10 @@ class _StreamingReply:
 
 
 async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
-                                combined, resolved_imgs):
+                                combined, resolved_imgs, echo=False):
     """Streaming turn (A1+A2) — see _StreamingReply."""
-    await _StreamingReply(ws, state, turn_id, reply_id,
-                          combined=combined, resolved_imgs=resolved_imgs).run()
+    await _StreamingReply(ws, state, turn_id, reply_id, combined=combined,
+                          resolved_imgs=resolved_imgs, echo=echo).run()
 
 
 def _resume_debounce(ws, state: TurnState) -> None:
@@ -2034,6 +2067,9 @@ async def _ws_settings(conn: WsConn, data):
         # Leaving wake mode → close an open conversation window.
         if was_on and not state.wake_word_enabled:
             state.wake_until = 0.0
+    if "echoMode" in data:
+        # Voice-clone playground: repeat the user's words instead of answering.
+        state.echo_mode = bool(data["echoMode"])
     if "speakerThreshold" in data and SPEAKER is not None:
         # Voice-lock strictness, tunable live from the UI (process-
         # wide on the shared verifier; fine for a single-owner setup).
@@ -2053,13 +2089,14 @@ async def _ws_settings(conn: WsConn, data):
                              and _opus_active() else "pcm")
     # hermesMode from client is ignored (fixed to 'separate').
     vad_params = vad_params_for_debounce(state.debounce_ms)
-    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s codec=%s",
+    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s codec=%s echo=%s",
              state.speed, state.debounce_ms, state.wake_word_enabled,
-             state.audio_codec)
+             state.audio_codec, state.echo_mode)
     await ws.send_json({
         "type": "settings.ack", "speed": state.speed,
         "debounceMs": state.debounce_ms,
         "wakeWordEnabled": state.wake_word_enabled,
+        "echoMode": state.echo_mode,
         "audioCodec": state.audio_codec,
         "hermesMode": "separate",
         "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),

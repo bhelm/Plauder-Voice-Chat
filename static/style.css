@@ -526,6 +526,10 @@
   }
   .bubble.pending { opacity: 0.7; border: 1px dashed rgba(255,255,255,.15); }
   .bubble.partial { font-style: italic; opacity: 0.8; }
+  /* Echo mode: the reply is just the user's own words repeated in the active
+     voice — mark it so it doesn't read like a real assistant answer. */
+  .bubble.agent.echo { font-style: italic; opacity: 0.85; }
+  .bubble.agent.echo .md::before { content: "🔁 "; }
   .bubble.wake-ignored { opacity: 0.5; font-size: 0.85em; font-style: italic; background: transparent; border: 1px dashed rgba(255,255,255,.12); }
   /* Voice lock: realtime segment feed. Each recognized segment shows up as a
      colored chip — green = your voice (accepted), amber = mixed & trimmed,

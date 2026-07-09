@@ -317,6 +317,11 @@ audio — and manage a whole library of them from the browser. Enable with
   assistant speaks in it for **every** connected device, and it **persists
   across restarts and new sessions** (stored in `ACTIVE_VOICE_STATE_PATH`,
   default `./.active_voice`).
+- **🔁 Echo mode** — a toggle in the Voices card to try a cloned voice live:
+  while on, the assistant skips the LLM and simply **repeats whatever you say**
+  in the active voice. Echo turns don't touch the conversation history and
+  aren't mirrored to other devices or Telegram. Per browser tab, and off again
+  after a reload — so a forgotten toggle can't look like a broken assistant.
 
 **Requires the OmniVoice wrapper behind TTS** — voice cloning is an OmniVoice
 capability, so `TTS_BACKEND=openai` must point at

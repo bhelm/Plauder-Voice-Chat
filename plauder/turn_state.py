@@ -119,6 +119,10 @@ class TurnState:
     # off, the connection runs like pure VAD/PTT without a gate. Initial value =
     # CFG.wake_word_enabled (start default), then toggleable via 'settings'.
     wake_word_enabled: bool = False
+    # Echo mode (voice-clone playground): the server skips the LLM entirely and
+    # simply repeats the user's words in the active voice. Per-connection,
+    # toggled via 'settings' (echoMode); never persisted server-side.
+    echo_mode: bool = False
     # Wake word: up to this point in time (time.time()) the conversation window
     # is open → segments without a wake word are let through (follow-up questions).
     wake_until: float = 0.0

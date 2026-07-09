@@ -169,6 +169,15 @@
             <button id="uploadVoiceBtn" class="vlock-enroll voices-upload" data-i18n="voices.upload">⬆︎ Upload</button>
             <input id="uploadVoiceInput" type="file" accept="audio/*" style="display:none;" />
           </div>
+          <!-- Echo mode: the server skips the LLM and repeats whatever you say
+               in the active voice — a playground to hear a cloned voice live. -->
+          <div class="vlock-toggle" data-i18n-title="voices.echo_title">
+            <span data-i18n="voices.echo_label">🔁 Echo mode</span>
+            <label class="switch">
+              <input type="checkbox" id="echoModeToggle" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </label>
+          </div>
         </div>
       </details>
 
@@ -451,6 +460,7 @@
     const voiceRecProg     = document.getElementById('voiceRecProg');
     const uploadVoiceBtn   = document.getElementById('uploadVoiceBtn');
     const uploadVoiceInput = document.getElementById('uploadVoiceInput');
+    const echoModeToggle   = document.getElementById('echoModeToggle');
 
     /* ===== Persistent UI settings (survive a reload) =====
        Mode, VAD threshold, wake-cue volume and panel state are already
@@ -1402,6 +1412,11 @@
       'settings.ack': (m) => {
         applyServerVadParams(m.vad);
         if (m.audioCodec) console.log('[opus] downlink codec ack: ' + m.audioCodec);
+        // Keep the echo toggle honest if the server state ever drifts.
+        if ('echoMode' in m) {
+          echoMode = !!m.echoMode;
+          if (echoModeToggle) echoModeToggle.checked = echoMode;
+        }
       },
       'voice.state': (m) => {
         serverVoiceClone = { available: true, active: m.active || 'default', voices: m.voices || [] };
@@ -1713,7 +1728,8 @@
         persistMsg('user', m.text);   // remember for reload restoration
       },
       'reply.start': (m) => {
-        addPendingAgentBubble(m.turnId);
+        const bub = addPendingAgentBubble(m.turnId);
+        if (m.echo) bub.classList.add('echo');   // echo turn: styled as a repeat
         turnReplyText.delete(m.turnId);
         // Antonia is now working/answering → pause the window-expiry timer.
         // It only restarts when she is done (playback.done, or on
@@ -1872,6 +1888,7 @@
       };
       if (speakerThreshold != null) s.speakerThreshold = speakerThreshold;
       s.speakerLockEnabled = speakerLockOn;
+      s.echoMode = echoMode;
       // Downlink codec wish: opus when both sides support it (see opusSupport).
       s.audioCodec = opusDownlinkActive() ? 'opus' : 'pcm';
       ws.send(JSON.stringify(s));
@@ -2150,6 +2167,18 @@
 
     /* ===== Voice library (cloned voices) ===== */
     function voiceSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+    /* Echo mode: the server repeats what you say in the active voice instead
+       of answering (voice-clone playground). Deliberately NOT persisted — a
+       reload always starts in normal mode, so a forgotten toggle can't look
+       like "the assistant stopped answering". Re-sent on every (re)connect
+       via sendSettings(). */
+    let echoMode = false;
+    if (echoModeToggle) echoModeToggle.addEventListener('change', () => {
+      echoMode = !!echoModeToggle.checked;
+      sendSettings();
+      addBubble('sys', t(echoMode ? 'voices.echo_on' : 'voices.echo_off'));
+    });
 
     function updateVoicesUi() {
       if (!voicesCard) return;

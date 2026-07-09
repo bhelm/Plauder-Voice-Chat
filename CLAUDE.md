@@ -197,6 +197,15 @@ finalizing on `audio.end`. Defense in depth: an opus `segment.stream.start`
 without a usable server codec is answered with `transcript.error` and the
 segment is dropped.
 
+**Echo mode** (voice-clone playground): `settings.echoMode` (echoed in
+`settings.ack`) → `TurnState.echo_mode`, toggled from the Voices card
+(client-side state, deliberately not persisted — a reload always starts in
+normal mode). While on, `_run_turn_inner` short-circuits after `turn.commit`:
+no LLM/CONV call, no history, no peer/Telegram mirroring — the committed user
+text is fed through the streaming TTS machinery as-is (works with
+`STREAMING=0` too, since no LLM stream is needed) and `reply.start`/`reply`
+carry `echo:true` (the client styles the bubble with a 🔁 marker).
+
 **Latency stats:** `audio.start` carries the time-to-first-audio breakdown —
 `e2eMs` (last segment received → first audio sent; **includes** the debounce
 wait, `debounceMs` is sent alongside so the client can split pause vs. system
