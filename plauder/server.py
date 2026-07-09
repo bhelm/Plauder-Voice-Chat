@@ -1470,39 +1470,597 @@ def _maybe_spawn_partial(ws, state: TurnState, seg: dict):
 # ============================================================================ #
 # WebSocket handler
 # ============================================================================ #
-async def ws_handler(request):
-    ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_MSG_BYTES)
-    await ws.prepare(request)
-    peer = request.remote
-    LOG.info("ws connect: %s", peer)
+class WsConn:
+    """Per-connection CHANNEL state owned by the WS loop (turn state lives in
+    TurnState). Message handlers receive this and mutate the binary-channel
+    mode: which consumer the next binary frame belongs to (enrollment /
+    clone recording / streamed segment / full segment)."""
 
-    state = TurnState()
-    state.session_user = _default_user()
-    state.speed = CFG.tts_speed if CFG else 1.0
-    state.debounce_ms = CFG.debounce_ms if CFG else 1200
-    # Start default of the wake mode; the client toggles it via 'settings'.
-    state.wake_word_enabled = bool(CFG.wake_word_enabled) if CFG else False
-    # Bounded: pairs a `segment.start` with the next binary frame (FIFO, normally
-    # depth 1). The cap stops a client that sends starts without frames from
-    # growing it without limit.
-    pending_segment_meta: deque = deque(maxlen=64)
-    # B1: streamed input segment (frames arrive while speaking). None = no active
-    # stream segment → binary frames are full segments.
-    active_stream: dict | None = None
-    # Speaker-lock enrollment: while set, incoming binary frames are the owner's
-    # enrollment recording (NOT a segment) and are buffered here until commit.
-    enroll_stream: bytearray | None = None
-    # Voice-clone recording: same idea as enroll_stream — while set, binary frames
-    # are the reference sample for a new cloned voice, buffered until commit.
-    clone_stream: bytearray | None = None
+    __slots__ = ("ws", "state", "peer", "pending_segment_meta",
+                 "active_stream", "enroll_stream", "clone_stream")
 
-    if BRIDGE is not None:
-        BRIDGE.register_broadcast(ws)
-    WS_CLIENTS[ws] = state
-    # A browser just connected → speech is likely soon; warm the STT endpoint
-    # now so a cold remote model doesn't stall the first real segment.
-    _maybe_warmup_stt()
+    def __init__(self, ws, state: TurnState, peer):
+        self.ws = ws
+        self.state = state
+        self.peer = peer
+        # Bounded: pairs a `segment.start` with the next binary frame (FIFO,
+        # normally depth 1). The cap stops a client that sends starts without
+        # frames from growing it without limit.
+        self.pending_segment_meta: deque = deque(maxlen=64)
+        # B1: streamed input segment (frames arrive while speaking). None = no
+        # active stream segment → binary frames are full segments.
+        self.active_stream: dict | None = None
+        # Speaker-lock enrollment: while set, incoming binary frames are the
+        # owner's enrollment recording (NOT a segment), buffered until commit.
+        self.enroll_stream: bytearray | None = None
+        # Voice-clone recording: same idea as enroll_stream — while set, binary
+        # frames are the reference sample for a new cloned voice.
+        self.clone_stream: bytearray | None = None
 
+
+def _client_speech_start_ts(data) -> float | None:
+    """Map the client's speechStartTs/clientNow (client clock, ms) onto the
+    server clock; None when the client didn't send usable values."""
+    sst = data.get("speechStartTs")
+    cnow = data.get("clientNow")
+    if isinstance(sst, (int, float)) and isinstance(cnow, (int, float)):
+        return time.time() - (float(cnow) - float(sst)) / 1000.0
+    return None
+
+
+async def _ws_ping(conn: WsConn, data):
+    await conn.ws.send_json({"type": "ack", "received": data, "ts": time.time()})
+
+
+async def _ws_playback_done(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    # Client finished playing its buffered reply audio → there
+    # is nothing left to barge into.
+    state.client_playing = False
+    # Wake word: reply fully spoken → (re)open the conversation
+    # window; only now does the idle timer run.
+    # Exception: the user closed the channel themselves in the
+    # meantime → do not reopen (reset the flag once).
+    if CFG and state.wake_word_enabled:
+        if state.wake_suppress_reopen:
+            # Manually closed during the reply: do not reopen.
+            # Short trailing guard, so the echo right after the
+            # reply doesn't reopen the window after all.
+            state.wake_suppress_reopen = False
+            state.wake_closed_until = max(
+                state.wake_closed_until, time.time() + WAKE_CLOSE_GUARD_S)
+        elif _wake_oneshot():
+            # Alexa mode: close the window immediately after the
+            # reply, a new command needs the wake word again.
+            state.wake_until = 0.0
+            state.wake_detected_seg = None
+            await ws.send_json({
+                "type": "wake.closed", "turnId": state.turn_id,
+                "reason": "oneshot", "ts": time.time()})
+        else:
+            await _open_wake_window(ws, state, reason="done")
+    # Voice lock, temporal continuity: restart the follow-up
+    # window at the END of the reply playback (same "done"
+    # pattern as the wake window above). Anchored at the
+    # user's segment the window was always expired by the
+    # time they could answer — LLM + TTS + playback routinely
+    # exceed SPEAKER_CONT_WINDOW_S. Only the timestamp moves;
+    # the SCORE anchor still requires a strict match.
+    if (SPEAKER is not None and SPEAKER.active()
+            and state.speaker_last_own > 0):
+        state.speaker_last_own_ts = time.time()
+    ident = get_speaker_identifier()
+    if ident is not None:
+        try:
+            ident.mark_playback_finished()
+        except Exception:
+            LOG.exception("mark_playback_finished failed (ignored)")
+
+
+async def _ws_barge_in(conn: WsConn, data):
+    ws, state, peer = conn.ws, conn.state, conn.peer
+    reason = (data.get("reason") or "speech")
+    # Voice lock: an unverified voice must not interrupt. VAD-
+    # triggered barge-ins are ignored — the interruption happens
+    # server-side once the streamed segment's speaker is confirmed
+    # as the owner (speaker_gate). Defense in depth: current
+    # clients don't even send these while the lock is engaged.
+    # Deliberate user actions (stop button, PTT press) still pass.
+    if (SPEAKER is not None and SPEAKER.active()
+            and reason not in ("manual", "ptt-press")):
+        LOG.info("barge-in ignored (speaker lock) from %s (reason=%s)",
+                 peer, reason)
+    # Wake mode + manually closed/guard: the speech is NOT directed
+    # at Antonia → do NOT cancel the running reply.
+    elif CFG and state.wake_word_enabled and _wake_closed_active(state):
+        LOG.info("barge-in ignored (wake closed) from %s (reason=%s)", peer, reason)
+    else:
+        in_flight = ((state.agent_task and not state.agent_task.done())
+                     or bool(state.audio_ids) or state.client_playing)
+        if in_flight:
+            LOG.info("barge-in from %s (reason=%s)", peer, reason)
+            await _cancel_in_flight(state, ws)
+        # Whoever interrupts a RUNNING reply (server-side in-flight
+        # OR still playing client-side) continues the conversation
+        # → keep the window open, so the following (interrupting)
+        # input isn't discarded as "no wake word". NOT for mere
+        # noise without a running reply (otherwise no gate ever again).
+        if CFG and state.wake_word_enabled and (in_flight or bool(data.get("playing"))):
+            await _open_wake_window(ws, state, reason="command")
+
+
+async def _ws_wake_close(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    # Close the voice channel (conversation window) manually, WITHOUT
+    # cancelling running processing (that's what 'barge_in' does).
+    # After this the wake word is needed again.
+    if CFG and state.wake_word_enabled:
+        in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
+        state.wake_until = 0.0
+        state.wake_detected_seg = None
+        # Short guard: trailing partials/echo must not reopen the
+        # window right now.
+        state.wake_closed_until = time.time() + WAKE_CLOSE_GUARD_S
+        # If a reply is still running (server-side in_flight OR the
+        # client is still playing the tail), a playback.done will
+        # follow that would otherwise reopen the window → suppress it.
+        state.wake_suppress_reopen = bool(in_flight or data.get("playing"))
+        LOG.info("wake: manually closed (%s, in_flight=%s)", conn.peer, in_flight)
+        await ws.send_json({
+            "type": "wake.closed", "turnId": state.turn_id,
+            "reason": "manual", "ts": time.time()})
+
+
+async def _ws_segment_start(conn: WsConn, data):
+    conn.pending_segment_meta.append({
+        "id": data.get("segmentId") or _short_id(),
+        "speech_start_ts": _client_speech_start_ts(data),
+        "barge_in": bool(data.get("bargeIn")),
+        "ptt": bool(data.get("ptt")),
+    })
+
+
+async def _ws_segment_stream_start(conn: WsConn, data):
+    ws = conn.ws
+    # While the owner is recording an enrollment or voice-clone
+    # take, VAD segments are ignored entirely — their frames
+    # would race with the recording frames for the binary channel.
+    if conn.enroll_stream is not None or conn.clone_stream is not None:
+        return
+    # B1: start of a streamed segment. Following binary frames
+    # (raw f32le) are appended until segment.stream.commit arrives.
+    # Uplink codec: codec:"opus" → binary frames are framed opus
+    # packets, decoded on arrival to 16 kHz f32 so every
+    # downstream consumer (partials, speaker gates, owner-watch,
+    # commit STT) keeps seeing plain PCM. Defense in depth: a
+    # client should only request opus when hello advertised it;
+    # if the codec is unusable anyway, the segment is dropped
+    # (frames discarded, commit becomes a no-op) and the client
+    # is told via transcript.error so its pending-STT UI clears.
+    _codec = str(data.get("codec") or "pcm").lower()
+    _opus_dec = None
+    if _codec == "opus":
+        if _opus_active():
+            try:
+                _opus_dec = opus_codec.OpusDecoder(SAMPLE_RATE)
+            except Exception:
+                LOG.exception("opus decoder init failed")
+        if _opus_dec is None:
+            LOG.warning("segment %s requested opus but codec is "
+                        "unavailable — segment dropped",
+                        data.get("segmentId"))
+            await ws.send_json({
+                "type": "transcript.error",
+                "segmentId": data.get("segmentId"),
+                "error": "opus codec unavailable on server",
+                "ts": time.time()})
+    conn.active_stream = {
+        "id": data.get("segmentId") or _short_id(),
+        "buf": bytearray(),
+        "codec": _codec, "opus_dec": _opus_dec,
+        "speech_start_ts": _client_speech_start_ts(data),
+        "barge_in": bool(data.get("bargeIn")),
+        "ptt": bool(data.get("ptt")),
+        # B2: partial throttle state.
+        "partial_running": False, "last_partial_ts": 0.0,
+        "last_partial_len": 0, "partial_text": "", "done": False,
+        # Voice-lock early barge-in state (speaker_gate.maybe_spawn_speaker_barge).
+        "spk_checks": 0, "spk_running": False,
+        "spk_owner": False, "spk_score": None,
+        # Owner-watch state (speaker_gate.maybe_spawn_owner_watch).
+        "own_next_off": 0, "own_running": False,
+        "own_seen": False, "own_last_end": 0.0, "own_cuts": 0,
+    }
+
+
+async def _ws_segment_stream_commit(conn: WsConn, data):
+    if conn.active_stream is None:
+        return
+    _seg = conn.active_stream
+    _seg["done"] = True       # suppress late partials
+    conn.active_stream = None
+    pcm = bytes(_seg["buf"])
+    if pcm:
+        _spawn_tracked(conn.state, _handle_audio_segment(
+            conn.ws, conn.state, pcm, _seg["id"], conn.peer,
+            speech_start_ts=_seg.get("speech_start_ts"),
+            barge_in=_seg.get("barge_in", False),
+            ptt=_seg.get("ptt", False)))
+
+
+async def _ws_segment_stream_abort(conn: WsConn, data):
+    if conn.active_stream is not None:
+        conn.active_stream["done"] = True
+    conn.active_stream = None
+
+
+async def _ws_speaker_enroll_start(conn: WsConn, data):
+    # Begin buffering the owner's enrollment recording. Drop any
+    # half-streamed segment so its frames don't leak into it,
+    # and any queued segment.start metas — they would pair with
+    # the wrong binary frame after enrollment (FIFO desync).
+    if conn.active_stream is not None:
+        conn.active_stream["done"] = True
+        conn.active_stream = None
+    conn.pending_segment_meta.clear()
+    conn.enroll_stream = bytearray() if (SPEAKER and SPEAKER.loaded) else None
+    if SPEAKER is None or not SPEAKER.loaded:
+        await conn.ws.send_json({"type": "speaker.enroll.ack", "ok": False,
+                                 "error": "unavailable", "ts": time.time()})
+
+
+async def _ws_speaker_enroll_commit(conn: WsConn, data):
+    ws = conn.ws
+    buf = bytes(conn.enroll_stream) if conn.enroll_stream is not None else b""
+    conn.enroll_stream = None
+    if not (SPEAKER and SPEAKER.loaded):
+        await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
+                            "error": "unavailable", "ts": time.time()})
+    elif len(buf) < int(SAMPLE_RATE * 4 * SPEAKER.min_dur_s):
+        await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
+                            "error": "too_short", "ts": time.time()})
+    else:
+        try:
+            status = await asyncio.to_thread(SPEAKER.enroll, buf, SAMPLE_RATE)
+            LOG.info("speaker: enrolled take (count=%d, sampleScore=%s)",
+                     status.get("count"), status.get("sampleScore"))
+            await speaker_gate.spk_dump(f"enroll{status.get('count', 0)}", buf,
+                                        float(status.get("sampleScore") or 0.0),
+                                        "enroll")
+            await ws.send_json({"type": "speaker.enroll.ack", "ok": True,
+                                **status, "ts": time.time()})
+        except Exception as exc:
+            LOG.exception("speaker enroll failed")
+            await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
+                                "error": str(exc), "ts": time.time()})
+
+
+async def _ws_speaker_enroll_abort(conn: WsConn, data):
+    conn.enroll_stream = None
+
+
+async def _ws_speaker_enroll_clear(conn: WsConn, data):
+    if SPEAKER is not None:
+        SPEAKER.clear_profile()
+    await conn.ws.send_json({
+        "type": "speaker.status",
+        "available": bool(SPEAKER is not None and SPEAKER.loaded),
+        "enrolled": bool(SPEAKER is not None and SPEAKER.has_profile()),
+        "count": (SPEAKER._count if SPEAKER is not None else 0),
+        "ts": time.time()})
+
+
+async def _ws_voice_clone_start(conn: WsConn, data):
+    # Begin buffering a voice-clone reference recording. Same
+    # channel discipline as enrollment: drop any half-streamed
+    # segment + queued metas so their frames can't leak in.
+    if not voice_clone.clone_active():
+        await conn.ws.send_json({"type": "voice.clone.ack", "ok": False,
+                                 "error": "unavailable", "ts": time.time()})
+    else:
+        if conn.active_stream is not None:
+            conn.active_stream["done"] = True
+            conn.active_stream = None
+        conn.pending_segment_meta.clear()
+        conn.clone_stream = bytearray()
+
+
+async def _ws_voice_clone_commit(conn: WsConn, data):
+    ws = conn.ws
+    buf = bytes(conn.clone_stream) if conn.clone_stream is not None else b""
+    conn.clone_stream = None
+    name = (data.get("name") or "").strip()
+    if not voice_clone.clone_active():
+        await ws.send_json({"type": "voice.clone.ack", "ok": False,
+                            "error": "unavailable", "ts": time.time()})
+    else:
+        ack = await voice_clone.clone_commit(buf, name)
+        await ws.send_json({"type": "voice.clone.ack", **ack,
+                            "ts": time.time()})
+        if ack.get("ok"):
+            await voice_clone.emit_voice_state(ws)
+
+
+async def _ws_voice_clone_abort(conn: WsConn, data):
+    conn.clone_stream = None
+
+
+async def _ws_voice_list(conn: WsConn, data):
+    if voice_clone.clone_active():
+        await voice_clone.emit_voice_state(conn.ws)
+
+
+async def _ws_voice_select(conn: WsConn, data):
+    if voice_clone.clone_active():
+        VOICES.set_active(str(data.get("id") or "").strip())
+        await voice_clone.emit_voice_state(conn.ws)
+
+
+async def _ws_voice_rename(conn: WsConn, data):
+    if voice_clone.clone_active():
+        try:
+            await VOICES.rename(str(data.get("id") or ""),
+                                str(data.get("name") or "").strip())
+            await voice_clone.emit_voice_state(conn.ws)
+        except Exception as exc:  # noqa: BLE001
+            await conn.ws.send_json({"type": "voice.error", "op": "rename",
+                                     "error": str(exc), "ts": time.time()})
+
+
+async def _ws_voice_delete(conn: WsConn, data):
+    if voice_clone.clone_active():
+        vid = str(data.get("id") or "")
+        try:
+            await VOICES.delete(vid)
+            # If the deleted voice was active, fall back to default.
+            if VOICES.get_active() == vid:
+                VOICES.set_active(voices_mod.DEFAULT_VOICE_ID)
+            await voice_clone.emit_voice_state(conn.ws)
+        except Exception as exc:  # noqa: BLE001
+            await conn.ws.send_json({"type": "voice.error", "op": "delete",
+                                     "error": str(exc), "ts": time.time()})
+
+
+async def _ws_voice_preview(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    if voice_clone.clone_active():
+        vid = str(data.get("id") or voices_mod.DEFAULT_VOICE_ID)
+        ptext = (data.get("text") or voice_clone.preview_sentence()).strip()
+        try:
+            pcm, sr = await TTS.synth(ptext, speed=state.speed, voice=vid)
+            wav = await asyncio.to_thread(
+                audio_utils.pcm16_to_wav_bytes, pcm, sr)
+            await ws.send_json({
+                "type": "voice.preview.audio", "id": vid, "mime": "audio/wav",
+                "audioB64": base64.b64encode(wav).decode("ascii"),
+                "ts": time.time()})
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("voice preview failed")
+            await ws.send_json({"type": "voice.error", "op": "preview",
+                                "error": str(exc), "ts": time.time()})
+
+
+async def _ws_text_message(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    text_val = (data.get("text") or "").strip()
+    img_urls = data.get("imageUrls") or []
+    if not isinstance(img_urls, list):
+        img_urls = []
+    img_urls = [str(u) for u in img_urls if u]
+    if not text_val and not img_urls:
+        return
+    if state.agent_task and not state.agent_task.done():
+        await _coalesce_cancel(state, ws)
+    if text_val:
+        state.pending_text_parts.append(text_val)
+    if img_urls:
+        state.pending_image_urls.extend(img_urls)
+    await _send_turn_pending(ws, state)
+    if state.debounce_task and not state.debounce_task.done():
+        state.debounce_task.cancel()
+    state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
+
+
+async def _ws_session_reset(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    await _cancel_in_flight(state, ws)
+    state.pending_resume = ""
+    state.pending_texts.clear()
+    state.pending_segment_ids.clear()
+    # Typed text / attached images composed before the reset
+    # must not ride into the fresh session either.
+    state.pending_text_parts.clear()
+    state.pending_image_urls.clear()
+    state.speech_end_ts = 0.0
+    conn.pending_segment_meta.clear()
+    if conn.active_stream is not None:
+        conn.active_stream["done"] = True
+    conn.active_stream = None
+    state.turn_id = _short_id()
+    _ident = get_speaker_identifier()
+    if _ident is not None:
+        try:
+            _ident.reset()
+        except Exception:
+            LOG.exception("speaker identifier reset failed (ignored)")
+    new_user = f"{_default_user()}-{_short_id()}"
+    state.session_user = new_user
+    if CONV is not None:
+        CONV.reset(new_user)
+    # Rotate the Hermes session ID so X-Hermes-Session-Id
+    # points to a fresh conversation thread (new voice session).
+    # Persisted server-side: without that, every reconnect /
+    # page reload would re-derive the stable pre-reset ID and
+    # silently continue the OLD Hermes session.
+    state.hermes_session_id_separate = rotate_hermes_session_id()
+    LOG.info("session reset for %s: user=%s", conn.peer, new_user)
+    await ws.send_json({
+        "type": "session.reset.ack", "sessionUser": new_user,
+        "sessionKey": _session_key_for_user(new_user),
+        "hermesMode": "separate",
+        "sharedWithTelegram": False, "ts": time.time(),
+    })
+    # The session is shared across devices → the reset applies
+    # everywhere at once: cancel other connections' in-flight
+    # turns, move them onto the fresh CONV user key + session
+    # ID and tell their UIs to clear.
+    for peer_ws, peer_state in list(WS_CLIENTS.items()):
+        if peer_ws is ws:
+            continue
+        try:
+            await _cancel_in_flight(peer_state, peer_ws)
+        except Exception:
+            LOG.exception("peer cancel on session reset failed (ignored)")
+        peer_state.session_user = new_user
+        peer_state.hermes_session_id_separate = state.hermes_session_id_separate
+    await _broadcast_peers(ws, {"type": "session.reset.remote",
+                                "ts": time.time()})
+
+
+async def _ws_settings(conn: WsConn, data):
+    ws, state = conn.ws, conn.state
+    if "speed" in data:
+        try:
+            state.speed = max(0.5, min(3.0, float(data["speed"])))
+        except (TypeError, ValueError):
+            pass
+    if "debounceMs" in data:
+        try:
+            state.debounce_ms = max(CFG.debounce_ms_min,
+                                    min(CFG.debounce_ms_max, int(data["debounceMs"])))
+        except (TypeError, ValueError):
+            pass
+    if "wakeWordEnabled" in data:
+        was_on = state.wake_word_enabled
+        state.wake_word_enabled = bool(data["wakeWordEnabled"])
+        # Leaving wake mode → close an open conversation window.
+        if was_on and not state.wake_word_enabled:
+            state.wake_until = 0.0
+    if "speakerThreshold" in data and SPEAKER is not None:
+        # Voice-lock strictness, tunable live from the UI (process-
+        # wide on the shared verifier; fine for a single-owner setup).
+        try:
+            SPEAKER.threshold = max(0.2, min(0.95, float(data["speakerThreshold"])))
+        except (TypeError, ValueError):
+            pass
+    if "speakerLockEnabled" in data and SPEAKER is not None:
+        # Temporary on/off of the whole voice-lock gate (profile kept).
+        SPEAKER.enabled = bool(data["speakerLockEnabled"])
+    if "audioCodec" in data:
+        # Downlink codec request. Only honor "opus" when the
+        # codec is actually usable — otherwise fall back to raw
+        # PCM and say so in the ack (the client adapts).
+        want = str(data.get("audioCodec") or "").lower()
+        state.audio_codec = ("opus" if want == "opus"
+                             and _opus_active() else "pcm")
+    # hermesMode from client is ignored (fixed to 'separate').
+    vad_params = vad_params_for_debounce(state.debounce_ms)
+    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s codec=%s",
+             state.speed, state.debounce_ms, state.wake_word_enabled,
+             state.audio_codec)
+    await ws.send_json({
+        "type": "settings.ack", "speed": state.speed,
+        "debounceMs": state.debounce_ms,
+        "wakeWordEnabled": state.wake_word_enabled,
+        "audioCodec": state.audio_codec,
+        "hermesMode": "separate",
+        "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),
+        "speakerLockEnabled": (SPEAKER.enabled if SPEAKER is not None else None),
+        "vad": vad_params, "ts": time.time(),
+    })
+
+
+# JSON message dispatch. Every handler is `async (conn, data)`; unknown types
+# fall through to a debug log in the WS loop. Adding a type here usually means
+# handling it in static/index.html too.
+_WS_TEXT_HANDLERS = {
+    "ping": _ws_ping,
+    "playback.done": _ws_playback_done,
+    "barge_in": _ws_barge_in,
+    "wake.close": _ws_wake_close,
+    "segment.start": _ws_segment_start,
+    "segment.stream.start": _ws_segment_stream_start,
+    "segment.stream.commit": _ws_segment_stream_commit,
+    "segment.stream.abort": _ws_segment_stream_abort,
+    "speaker.enroll.start": _ws_speaker_enroll_start,
+    "speaker.enroll.commit": _ws_speaker_enroll_commit,
+    "speaker.enroll.abort": _ws_speaker_enroll_abort,
+    "speaker.enroll.clear": _ws_speaker_enroll_clear,
+    "voice.clone.start": _ws_voice_clone_start,
+    "voice.clone.commit": _ws_voice_clone_commit,
+    "voice.clone.abort": _ws_voice_clone_abort,
+    "voice.list": _ws_voice_list,
+    "voice.select": _ws_voice_select,
+    "voice.rename": _ws_voice_rename,
+    "voice.delete": _ws_voice_delete,
+    "voice.preview": _ws_voice_preview,
+    "text.message": _ws_text_message,
+    "session.reset": _ws_session_reset,
+    "settings": _ws_settings,
+}
+
+
+async def _ws_binary(conn: WsConn, raw: bytes):
+    """Route one binary frame to whatever currently owns the binary channel:
+    enrollment / clone recording buffer, the active streamed segment (B1), or
+    — with a queued segment.start meta — a full one-shot segment."""
+    ws, state = conn.ws, conn.state
+    if conn.enroll_stream is not None:
+        # Owner enrollment recording — buffer, don't treat as a segment.
+        conn.enroll_stream.extend(raw)
+        return
+    if conn.clone_stream is not None:
+        # Voice-clone reference recording — buffer until commit.
+        conn.clone_stream.extend(raw)
+        return
+    if conn.active_stream is not None:
+        # B1: frame of a streamed segment — append. The final
+        # transcription happens at commit; B2 pushes in partials
+        # (throttled) in between; the voice-lock early barge-in
+        # checks the speaker as soon as enough audio streamed in.
+        active_stream = conn.active_stream
+        if active_stream.get("opus_dec") is not None:
+            # Opus uplink: decode packets ON ARRIVAL to 16 kHz f32
+            # so the buffer stays plain PCM for every consumer.
+            # Decode errors drop the packet, never the WS loop.
+            try:
+                _pkts = audio_utils.parse_opus_uplink_packets(raw)
+            except ValueError as exc:
+                LOG.warning("malformed opus uplink frame dropped "
+                            "(%d bytes): %s", len(raw), exc)
+                _pkts = []
+            for _pkt in _pkts:
+                try:
+                    active_stream["buf"].extend(
+                        active_stream["opus_dec"].decode_packet(_pkt))
+                except Exception as exc:
+                    LOG.warning("opus packet decode failed "
+                                "(%d bytes): %s — packet dropped",
+                                len(_pkt), exc)
+        elif active_stream.get("codec") == "opus":
+            # Opus requested but no decoder (unsupported race):
+            # frames are opus packets — unusable, drop them.
+            return
+        else:
+            active_stream["buf"].extend(raw)
+        _maybe_spawn_partial(ws, state, active_stream)
+        speaker_gate.maybe_spawn_speaker_barge(ws, state, active_stream)
+        speaker_gate.maybe_spawn_owner_watch(ws, state, active_stream, conn.peer)
+        return
+    if conn.pending_segment_meta:
+        _meta = conn.pending_segment_meta.popleft()
+    else:
+        _meta = {"id": _short_id(), "speech_start_ts": None, "barge_in": False}
+    _spawn_tracked(state, _handle_audio_segment(
+        ws, state, raw, _meta["id"], conn.peer,
+        speech_start_ts=_meta.get("speech_start_ts"),
+        barge_in=_meta.get("barge_in", False),
+        ptt=_meta.get("ptt", False)))
+
+
+async def _send_hello(ws, state: TurnState) -> None:
+    """Advertise server capabilities + session identity right after connect
+    (the client adapts its features to this frame)."""
     clone_caps = await voice_clone.voice_clone_hello()
     await ws.send_json({
         "type": "hello", "stage": STAGE,
@@ -1561,29 +2119,57 @@ async def ws_handler(request):
         "ts": time.time(),
     })
 
-    # --- Load conversation history from Hermes backend (cross-device) ------
-    # Only when a Hermes session key is actually configured: without it the
-    # session id would be probed against a NON-Hermes endpoint (e.g. Fireworks)
-    # — a real, authenticated HTTP call per connect for nothing.
-    if CFG and CONV is not None and CFG.hermes_session_key_separate:
-        try:
-            history = await fetch_history(
-                base_url=CFG.llm_base_url,
-                api_key=CFG.llm_api_key,
-                session_id=state.hermes_session_id_separate,
-                max_messages=CFG.llm_history_turns * 2,
-            )
-            if history:
-                CONV.seed_history(state.session_user, history)
-                # Send displayable history to the client (user/assistant only).
-                await ws.send_json({
-                    "type": "history",
-                    "messages": history,
-                    "sessionId": state.hermes_session_id_separate[:16],
-                    "ts": time.time(),
-                })
-        except Exception as exc:
-            LOG.warning("history load failed for %s: %s", peer, exc)
+
+async def _load_history(ws, state: TurnState, peer) -> None:
+    """Seed the conversation from the Hermes backend (cross-device history).
+    Only when a Hermes session key is actually configured: without it the
+    session id would be probed against a NON-Hermes endpoint (e.g. Fireworks)
+    — a real, authenticated HTTP call per connect for nothing."""
+    if not (CFG and CONV is not None and CFG.hermes_session_key_separate):
+        return
+    try:
+        history = await fetch_history(
+            base_url=CFG.llm_base_url,
+            api_key=CFG.llm_api_key,
+            session_id=state.hermes_session_id_separate,
+            max_messages=CFG.llm_history_turns * 2,
+        )
+        if history:
+            CONV.seed_history(state.session_user, history)
+            # Send displayable history to the client (user/assistant only).
+            await ws.send_json({
+                "type": "history",
+                "messages": history,
+                "sessionId": state.hermes_session_id_separate[:16],
+                "ts": time.time(),
+            })
+    except Exception as exc:
+        LOG.warning("history load failed for %s: %s", peer, exc)
+
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT_S, max_msg_size=WS_MAX_MSG_BYTES)
+    await ws.prepare(request)
+    peer = request.remote
+    LOG.info("ws connect: %s", peer)
+
+    state = TurnState()
+    state.session_user = _default_user()
+    state.speed = CFG.tts_speed if CFG else 1.0
+    state.debounce_ms = CFG.debounce_ms if CFG else 1200
+    # Start default of the wake mode; the client toggles it via 'settings'.
+    state.wake_word_enabled = bool(CFG.wake_word_enabled) if CFG else False
+    conn = WsConn(ws, state, peer)
+
+    if BRIDGE is not None:
+        BRIDGE.register_broadcast(ws)
+    WS_CLIENTS[ws] = state
+    # A browser just connected → speech is likely soon; warm the STT endpoint
+    # now so a cold remote model doesn't stall the first real segment.
+    _maybe_warmup_stt()
+
+    await _send_hello(ws, state)
+    await _load_history(ws, state, peer)
 
     try:
         async for msg in ws:
@@ -1593,475 +2179,13 @@ async def ws_handler(request):
                 except json.JSONDecodeError:
                     LOG.warning("ws non-json text from %s: %r", peer, msg.data)
                     continue
-                t = data.get("type")
-                if t == "ping":
-                    await ws.send_json({"type": "ack", "received": data, "ts": time.time()})
-                elif t == "playback.done":
-                    # Client finished playing its buffered reply audio → there
-                    # is nothing left to barge into.
-                    state.client_playing = False
-                    # Wake word: reply fully spoken → (re)open the conversation
-                    # window; only now does the idle timer run.
-                    # Exception: the user closed the channel themselves in the
-                    # meantime → do not reopen (reset the flag once).
-                    if CFG and state.wake_word_enabled:
-                        if state.wake_suppress_reopen:
-                            # Manually closed during the reply: do not reopen.
-                            # Short trailing guard, so the echo right after the
-                            # reply doesn't reopen the window after all.
-                            state.wake_suppress_reopen = False
-                            state.wake_closed_until = max(
-                                state.wake_closed_until, time.time() + WAKE_CLOSE_GUARD_S)
-                        elif _wake_oneshot():
-                            # Alexa mode: close the window immediately after the
-                            # reply, a new command needs the wake word again.
-                            state.wake_until = 0.0
-                            state.wake_detected_seg = None
-                            await ws.send_json({
-                                "type": "wake.closed", "turnId": state.turn_id,
-                                "reason": "oneshot", "ts": time.time()})
-                        else:
-                            await _open_wake_window(ws, state, reason="done")
-                    # Voice lock, temporal continuity: restart the follow-up
-                    # window at the END of the reply playback (same "done"
-                    # pattern as the wake window above). Anchored at the
-                    # user's segment the window was always expired by the
-                    # time they could answer — LLM + TTS + playback routinely
-                    # exceed SPEAKER_CONT_WINDOW_S. Only the timestamp moves;
-                    # the SCORE anchor still requires a strict match.
-                    if (SPEAKER is not None and SPEAKER.active()
-                            and state.speaker_last_own > 0):
-                        state.speaker_last_own_ts = time.time()
-                    ident = get_speaker_identifier()
-                    if ident is not None:
-                        try:
-                            ident.mark_playback_finished()
-                        except Exception:
-                            LOG.exception("mark_playback_finished failed (ignored)")
-                elif t == "barge_in":
-                    reason = (data.get("reason") or "speech")
-                    # Voice lock: an unverified voice must not interrupt. VAD-
-                    # triggered barge-ins are ignored — the interruption happens
-                    # server-side once the streamed segment's speaker is confirmed
-                    # as the owner (_do_speaker_barge). Defense in depth: current
-                    # clients don't even send these while the lock is engaged.
-                    # Deliberate user actions (stop button, PTT press) still pass.
-                    if (SPEAKER is not None and SPEAKER.active()
-                            and reason not in ("manual", "ptt-press")):
-                        LOG.info("barge-in ignored (speaker lock) from %s (reason=%s)",
-                                 peer, reason)
-                    # Wake mode + manually closed/guard: the speech is NOT directed
-                    # at Antonia → do NOT cancel the running reply.
-                    elif CFG and state.wake_word_enabled and _wake_closed_active(state):
-                        LOG.info("barge-in ignored (wake closed) from %s (reason=%s)", peer, reason)
-                    else:
-                        in_flight = ((state.agent_task and not state.agent_task.done())
-                                     or bool(state.audio_ids) or state.client_playing)
-                        if in_flight:
-                            LOG.info("barge-in from %s (reason=%s)", peer, reason)
-                            await _cancel_in_flight(state, ws)
-                        # Whoever interrupts a RUNNING reply (server-side in-flight
-                        # OR still playing client-side) continues the conversation
-                        # → keep the window open, so the following (interrupting)
-                        # input isn't discarded as "no wake word". NOT for mere
-                        # noise without a running reply (otherwise no gate ever again).
-                        if CFG and state.wake_word_enabled and (in_flight or bool(data.get("playing"))):
-                            await _open_wake_window(ws, state, reason="command")
-                elif t == "wake.close":
-                    # Close the voice channel (conversation window) manually, WITHOUT
-                    # cancelling running processing (that's what 'barge_in' does).
-                    # After this the wake word is needed again.
-                    if CFG and state.wake_word_enabled:
-                        in_flight = (state.agent_task and not state.agent_task.done()) or bool(state.audio_ids)
-                        state.wake_until = 0.0
-                        state.wake_detected_seg = None
-                        # Short guard: trailing partials/echo must not reopen the
-                        # window right now.
-                        state.wake_closed_until = time.time() + WAKE_CLOSE_GUARD_S
-                        # If a reply is still running (server-side in_flight OR the
-                        # client is still playing the tail), a playback.done will
-                        # follow that would otherwise reopen the window → suppress it.
-                        state.wake_suppress_reopen = bool(in_flight or data.get("playing"))
-                        LOG.info("wake: manually closed (%s, in_flight=%s)", peer, in_flight)
-                        await ws.send_json({
-                            "type": "wake.closed", "turnId": state.turn_id,
-                            "reason": "manual", "ts": time.time()})
-                elif t == "segment.start":
-                    _sst = data.get("speechStartTs")
-                    _cnow = data.get("clientNow")
-                    speech_start_ts = None
-                    if isinstance(_sst, (int, float)) and isinstance(_cnow, (int, float)):
-                        speech_start_ts = time.time() - (float(_cnow) - float(_sst)) / 1000.0
-                    pending_segment_meta.append({
-                        "id": data.get("segmentId") or _short_id(),
-                        "speech_start_ts": speech_start_ts,
-                        "barge_in": bool(data.get("bargeIn")),
-                        "ptt": bool(data.get("ptt")),
-                    })
-                elif t == "segment.stream.start":
-                    # While the owner is recording an enrollment or voice-clone
-                    # take, VAD segments are ignored entirely — their frames
-                    # would race with the recording frames for the binary channel.
-                    if enroll_stream is not None or clone_stream is not None:
-                        continue
-                    # B1: start of a streamed segment. Following binary frames
-                    # (raw f32le) are appended until segment.stream.commit arrives.
-                    _sst = data.get("speechStartTs")
-                    _cnow = data.get("clientNow")
-                    speech_start_ts = None
-                    if isinstance(_sst, (int, float)) and isinstance(_cnow, (int, float)):
-                        speech_start_ts = time.time() - (float(_cnow) - float(_sst)) / 1000.0
-                    # Uplink codec: codec:"opus" → binary frames are framed opus
-                    # packets, decoded on arrival to 16 kHz f32 so every
-                    # downstream consumer (partials, speaker gates, owner-watch,
-                    # commit STT) keeps seeing plain PCM. Defense in depth: a
-                    # client should only request opus when hello advertised it;
-                    # if the codec is unusable anyway, the segment is dropped
-                    # (frames discarded, commit becomes a no-op) and the client
-                    # is told via transcript.error so its pending-STT UI clears.
-                    _codec = str(data.get("codec") or "pcm").lower()
-                    _opus_dec = None
-                    if _codec == "opus":
-                        if _opus_active():
-                            try:
-                                _opus_dec = opus_codec.OpusDecoder(SAMPLE_RATE)
-                            except Exception:
-                                LOG.exception("opus decoder init failed")
-                        if _opus_dec is None:
-                            LOG.warning("segment %s requested opus but codec is "
-                                        "unavailable — segment dropped",
-                                        data.get("segmentId"))
-                            await ws.send_json({
-                                "type": "transcript.error",
-                                "segmentId": data.get("segmentId"),
-                                "error": "opus codec unavailable on server",
-                                "ts": time.time()})
-                    active_stream = {
-                        "id": data.get("segmentId") or _short_id(),
-                        "buf": bytearray(),
-                        "codec": _codec, "opus_dec": _opus_dec,
-                        "speech_start_ts": speech_start_ts,
-                        "barge_in": bool(data.get("bargeIn")),
-                        "ptt": bool(data.get("ptt")),
-                        # B2: partial throttle state.
-                        "partial_running": False, "last_partial_ts": 0.0,
-                        "last_partial_len": 0, "partial_text": "", "done": False,
-                        # Voice-lock early barge-in state (speaker_gate.maybe_spawn_speaker_barge).
-                        "spk_checks": 0, "spk_running": False,
-                        "spk_owner": False, "spk_score": None,
-                        # Owner-watch state (speaker_gate.maybe_spawn_owner_watch).
-                        "own_next_off": 0, "own_running": False,
-                        "own_seen": False, "own_last_end": 0.0, "own_cuts": 0,
-                    }
-                elif t == "segment.stream.commit":
-                    if active_stream is not None:
-                        _seg = active_stream
-                        _seg["done"] = True       # suppress late partials
-                        active_stream = None
-                        pcm = bytes(_seg["buf"])
-                        if pcm:
-                            _spawn_tracked(state, _handle_audio_segment(
-                                ws, state, pcm, _seg["id"], peer,
-                                speech_start_ts=_seg.get("speech_start_ts"),
-                                barge_in=_seg.get("barge_in", False),
-                                ptt=_seg.get("ptt", False)))
-                elif t == "segment.stream.abort":
-                    if active_stream is not None:
-                        active_stream["done"] = True
-                    active_stream = None
-                elif t == "speaker.enroll.start":
-                    # Begin buffering the owner's enrollment recording. Drop any
-                    # half-streamed segment so its frames don't leak into it,
-                    # and any queued segment.start metas — they would pair with
-                    # the wrong binary frame after enrollment (FIFO desync).
-                    if active_stream is not None:
-                        active_stream["done"] = True
-                        active_stream = None
-                    pending_segment_meta.clear()
-                    enroll_stream = bytearray() if (SPEAKER and SPEAKER.loaded) else None
-                    if SPEAKER is None or not SPEAKER.loaded:
-                        await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
-                                            "error": "unavailable", "ts": time.time()})
-                elif t == "speaker.enroll.commit":
-                    buf = bytes(enroll_stream) if enroll_stream is not None else b""
-                    enroll_stream = None
-                    if not (SPEAKER and SPEAKER.loaded):
-                        await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
-                                            "error": "unavailable", "ts": time.time()})
-                    elif len(buf) < int(SAMPLE_RATE * 4 * SPEAKER.min_dur_s):
-                        await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
-                                            "error": "too_short", "ts": time.time()})
-                    else:
-                        try:
-                            status = await asyncio.to_thread(SPEAKER.enroll, buf, SAMPLE_RATE)
-                            LOG.info("speaker: enrolled take (count=%d, sampleScore=%s)",
-                                     status.get("count"), status.get("sampleScore"))
-                            await speaker_gate.spk_dump(f"enroll{status.get('count', 0)}", buf,
-                                            float(status.get("sampleScore") or 0.0),
-                                            "enroll")
-                            await ws.send_json({"type": "speaker.enroll.ack", "ok": True,
-                                                **status, "ts": time.time()})
-                        except Exception as exc:
-                            LOG.exception("speaker enroll failed")
-                            await ws.send_json({"type": "speaker.enroll.ack", "ok": False,
-                                                "error": str(exc), "ts": time.time()})
-                elif t == "speaker.enroll.abort":
-                    enroll_stream = None
-                elif t == "speaker.enroll.clear":
-                    if SPEAKER is not None:
-                        SPEAKER.clear_profile()
-                    await ws.send_json({
-                        "type": "speaker.status",
-                        "available": bool(SPEAKER is not None and SPEAKER.loaded),
-                        "enrolled": bool(SPEAKER is not None and SPEAKER.has_profile()),
-                        "count": (SPEAKER._count if SPEAKER is not None else 0),
-                        "ts": time.time()})
-                elif t == "voice.clone.start":
-                    # Begin buffering a voice-clone reference recording. Same
-                    # channel discipline as enrollment: drop any half-streamed
-                    # segment + queued metas so their frames can't leak in.
-                    if not voice_clone.clone_active():
-                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                                            "error": "unavailable", "ts": time.time()})
-                    else:
-                        if active_stream is not None:
-                            active_stream["done"] = True
-                            active_stream = None
-                        pending_segment_meta.clear()
-                        clone_stream = bytearray()
-                elif t == "voice.clone.commit":
-                    buf = bytes(clone_stream) if clone_stream is not None else b""
-                    clone_stream = None
-                    name = (data.get("name") or "").strip()
-                    if not voice_clone.clone_active():
-                        await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                                            "error": "unavailable", "ts": time.time()})
-                    else:
-                        ack = await voice_clone.clone_commit(buf, name)
-                        await ws.send_json({"type": "voice.clone.ack", **ack,
-                                            "ts": time.time()})
-                        if ack.get("ok"):
-                            await voice_clone.emit_voice_state(ws)
-                elif t == "voice.clone.abort":
-                    clone_stream = None
-                elif t == "voice.list":
-                    if voice_clone.clone_active():
-                        await voice_clone.emit_voice_state(ws)
-                elif t == "voice.select":
-                    if voice_clone.clone_active():
-                        VOICES.set_active(str(data.get("id") or "").strip())
-                        await voice_clone.emit_voice_state(ws)
-                elif t == "voice.rename":
-                    if voice_clone.clone_active():
-                        try:
-                            await VOICES.rename(str(data.get("id") or ""),
-                                                str(data.get("name") or "").strip())
-                            await voice_clone.emit_voice_state(ws)
-                        except Exception as exc:  # noqa: BLE001
-                            await ws.send_json({"type": "voice.error", "op": "rename",
-                                                "error": str(exc), "ts": time.time()})
-                elif t == "voice.delete":
-                    if voice_clone.clone_active():
-                        vid = str(data.get("id") or "")
-                        try:
-                            await VOICES.delete(vid)
-                            # If the deleted voice was active, fall back to default.
-                            if VOICES.get_active() == vid:
-                                VOICES.set_active(voices_mod.DEFAULT_VOICE_ID)
-                            await voice_clone.emit_voice_state(ws)
-                        except Exception as exc:  # noqa: BLE001
-                            await ws.send_json({"type": "voice.error", "op": "delete",
-                                                "error": str(exc), "ts": time.time()})
-                elif t == "voice.preview":
-                    if voice_clone.clone_active():
-                        vid = str(data.get("id") or voices_mod.DEFAULT_VOICE_ID)
-                        ptext = (data.get("text") or voice_clone.preview_sentence()).strip()
-                        try:
-                            pcm, sr = await TTS.synth(ptext, speed=state.speed, voice=vid)
-                            wav = await asyncio.to_thread(
-                                audio_utils.pcm16_to_wav_bytes, pcm, sr)
-                            await ws.send_json({
-                                "type": "voice.preview.audio", "id": vid, "mime": "audio/wav",
-                                "audioB64": base64.b64encode(wav).decode("ascii"),
-                                "ts": time.time()})
-                        except Exception as exc:  # noqa: BLE001
-                            LOG.exception("voice preview failed")
-                            await ws.send_json({"type": "voice.error", "op": "preview",
-                                                "error": str(exc), "ts": time.time()})
-                elif t == "text.message":
-                    text_val = (data.get("text") or "").strip()
-                    img_urls = data.get("imageUrls") or []
-                    if not isinstance(img_urls, list):
-                        img_urls = []
-                    img_urls = [str(u) for u in img_urls if u]
-                    if not text_val and not img_urls:
-                        continue
-                    if state.agent_task and not state.agent_task.done():
-                        await _coalesce_cancel(state, ws)
-                    if text_val:
-                        state.pending_text_parts.append(text_val)
-                    if img_urls:
-                        state.pending_image_urls.extend(img_urls)
-                    await _send_turn_pending(ws, state)
-                    if state.debounce_task and not state.debounce_task.done():
-                        state.debounce_task.cancel()
-                    state.debounce_task = asyncio.create_task(_debounce_then_run(ws, state))
-                elif t == "session.reset":
-                    await _cancel_in_flight(state, ws)
-                    state.pending_resume = ""
-                    state.pending_texts.clear()
-                    state.pending_segment_ids.clear()
-                    # Typed text / attached images composed before the reset
-                    # must not ride into the fresh session either.
-                    state.pending_text_parts.clear()
-                    state.pending_image_urls.clear()
-                    state.speech_end_ts = 0.0
-                    pending_segment_meta.clear()
-                    if active_stream is not None:
-                        active_stream["done"] = True
-                    active_stream = None
-                    state.turn_id = _short_id()
-                    _ident = get_speaker_identifier()
-                    if _ident is not None:
-                        try:
-                            _ident.reset()
-                        except Exception:
-                            LOG.exception("speaker identifier reset failed (ignored)")
-                    new_user = f"{_default_user()}-{_short_id()}"
-                    state.session_user = new_user
-                    if CONV is not None:
-                        CONV.reset(new_user)
-                    # Rotate the Hermes session ID so X-Hermes-Session-Id
-                    # points to a fresh conversation thread (new voice session).
-                    # Persisted server-side: without that, every reconnect /
-                    # page reload would re-derive the stable pre-reset ID and
-                    # silently continue the OLD Hermes session.
-                    state.hermes_session_id_separate = rotate_hermes_session_id()
-                    LOG.info("session reset for %s: user=%s", peer, new_user)
-                    await ws.send_json({
-                        "type": "session.reset.ack", "sessionUser": new_user,
-                        "sessionKey": _session_key_for_user(new_user),
-                        "hermesMode": "separate",
-                        "sharedWithTelegram": False, "ts": time.time(),
-                    })
-                    # The session is shared across devices → the reset applies
-                    # everywhere at once: cancel other connections' in-flight
-                    # turns, move them onto the fresh CONV user key + session
-                    # ID and tell their UIs to clear.
-                    for peer_ws, peer_state in list(WS_CLIENTS.items()):
-                        if peer_ws is ws:
-                            continue
-                        try:
-                            await _cancel_in_flight(peer_state, peer_ws)
-                        except Exception:
-                            LOG.exception("peer cancel on session reset failed (ignored)")
-                        peer_state.session_user = new_user
-                        peer_state.hermes_session_id_separate = state.hermes_session_id_separate
-                    await _broadcast_peers(ws, {"type": "session.reset.remote",
-                                                "ts": time.time()})
-                elif t == "settings":
-                    if "speed" in data:
-                        try:
-                            state.speed = max(0.5, min(3.0, float(data["speed"])))
-                        except (TypeError, ValueError):
-                            pass
-                    if "debounceMs" in data:
-                        try:
-                            state.debounce_ms = max(CFG.debounce_ms_min,
-                                                    min(CFG.debounce_ms_max, int(data["debounceMs"])))
-                        except (TypeError, ValueError):
-                            pass
-                    if "wakeWordEnabled" in data:
-                        was_on = state.wake_word_enabled
-                        state.wake_word_enabled = bool(data["wakeWordEnabled"])
-                        # Leaving wake mode → close an open conversation window.
-                        if was_on and not state.wake_word_enabled:
-                            state.wake_until = 0.0
-                    if "speakerThreshold" in data and SPEAKER is not None:
-                        # Voice-lock strictness, tunable live from the UI (process-
-                        # wide on the shared verifier; fine for a single-owner setup).
-                        try:
-                            SPEAKER.threshold = max(0.2, min(0.95, float(data["speakerThreshold"])))
-                        except (TypeError, ValueError):
-                            pass
-                    if "speakerLockEnabled" in data and SPEAKER is not None:
-                        # Temporary on/off of the whole voice-lock gate (profile kept).
-                        SPEAKER.enabled = bool(data["speakerLockEnabled"])
-                    if "audioCodec" in data:
-                        # Downlink codec request. Only honor "opus" when the
-                        # codec is actually usable — otherwise fall back to raw
-                        # PCM and say so in the ack (the client adapts).
-                        want = str(data.get("audioCodec") or "").lower()
-                        state.audio_codec = ("opus" if want == "opus"
-                                             and _opus_active() else "pcm")
-                    # hermesMode from client is ignored (fixed to 'separate').
-                    vad_params = vad_params_for_debounce(state.debounce_ms)
-                    LOG.info("settings updated: speed=%.2f debounce=%dms wake=%s codec=%s",
-                             state.speed, state.debounce_ms, state.wake_word_enabled,
-                             state.audio_codec)
-                    await ws.send_json({
-                        "type": "settings.ack", "speed": state.speed,
-                        "debounceMs": state.debounce_ms,
-                        "wakeWordEnabled": state.wake_word_enabled,
-                        "audioCodec": state.audio_codec,
-                        "hermesMode": "separate",
-                        "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),
-                        "speakerLockEnabled": (SPEAKER.enabled if SPEAKER is not None else None),
-                        "vad": vad_params, "ts": time.time(),
-                    })
+                handler = _WS_TEXT_HANDLERS.get(data.get("type"))
+                if handler is not None:
+                    await handler(conn, data)
                 else:
                     LOG.debug("ws text: %r", data)
             elif msg.type == WSMsgType.BINARY:
-                if enroll_stream is not None:
-                    # Owner enrollment recording — buffer, don't treat as a segment.
-                    enroll_stream.extend(msg.data)
-                    continue
-                if clone_stream is not None:
-                    # Voice-clone reference recording — buffer until commit.
-                    clone_stream.extend(msg.data)
-                    continue
-                if active_stream is not None:
-                    # B1: frame of a streamed segment — append. The final
-                    # transcription happens at commit; B2 pushes in partials
-                    # (throttled) in between; the voice-lock early barge-in
-                    # checks the speaker as soon as enough audio streamed in.
-                    if active_stream.get("opus_dec") is not None:
-                        # Opus uplink: decode packets ON ARRIVAL to 16 kHz f32
-                        # so the buffer stays plain PCM for every consumer.
-                        # Decode errors drop the packet, never the WS loop.
-                        try:
-                            _pkts = audio_utils.parse_opus_uplink_packets(msg.data)
-                        except ValueError as exc:
-                            LOG.warning("malformed opus uplink frame dropped "
-                                        "(%d bytes): %s", len(msg.data), exc)
-                            _pkts = []
-                        for _pkt in _pkts:
-                            try:
-                                active_stream["buf"].extend(
-                                    active_stream["opus_dec"].decode_packet(_pkt))
-                            except Exception as exc:
-                                LOG.warning("opus packet decode failed "
-                                            "(%d bytes): %s — packet dropped",
-                                            len(_pkt), exc)
-                    elif active_stream.get("codec") == "opus":
-                        # Opus requested but no decoder (unsupported race):
-                        # frames are opus packets — unusable, drop them.
-                        continue
-                    else:
-                        active_stream["buf"].extend(msg.data)
-                    _maybe_spawn_partial(ws, state, active_stream)
-                    speaker_gate.maybe_spawn_speaker_barge(ws, state, active_stream)
-                    speaker_gate.maybe_spawn_owner_watch(ws, state, active_stream, peer)
-                    continue
-                if pending_segment_meta:
-                    _meta = pending_segment_meta.popleft()
-                else:
-                    _meta = {"id": _short_id(), "speech_start_ts": None, "barge_in": False}
-                _spawn_tracked(state, _handle_audio_segment(
-                    ws, state, msg.data, _meta["id"], peer,
-                    speech_start_ts=_meta.get("speech_start_ts"),
-                    barge_in=_meta.get("barge_in", False),
-                    ptt=_meta.get("ptt", False)))
+                await _ws_binary(conn, msg.data)
             elif msg.type == WSMsgType.ERROR:
                 LOG.warning("ws error from %s: %s", peer, ws.exception())
                 break
