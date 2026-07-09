@@ -1749,8 +1749,8 @@
     */
     const MD_PLACEHOLDER_RE = /\u0000MD(\d+)\u0000/g;
     function escapeHtml(s) {
-      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-              .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      return String(s).replace(/[&<>"']/g,
+        c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
     function safeUrl(url) {
       // Allows http(s)://, mailto:, and relative #anchor / /path
@@ -2201,9 +2201,7 @@
        Per turn we keep an HTML snippet per segment (kept text plain, cut parts
        wrapped in .seg-cut); the bubble renders the joined snippets. */
     const turnVoiceHtml = new Map();   // turnId -> [htmlSnippet, ...]
-    function escHtml(s) {
-      return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    }
+    const escHtml = escapeHtml;   // single HTML-escape impl for both spellings
     // Word-level LCS diff between a fuller base text (server fullText before a
     // trim, or the last live partial) and the FINAL kept text. Output = the
     // final text verbatim, with base-only runs (the vanished speech) struck in
@@ -3388,502 +3386,508 @@
       }, RECONNECT_MAX_MS);
     }
 
-    function handleMessage(m) {
-      switch (m.type) {
-        case 'hello':
-          // The server can confirm/change the language in hello (robustness; the
-          // server-side language injection normally already matches).
-          if (m.lang) setLang(m.lang);
-          if (m.agent_name) applyAgentName(m.agent_name);
-          else if (m.agent && m.agent.name) applyAgentName(m.agent.name);
-          serverStreaming = !!m.streaming;
-          streamInputEnabled = !!m.streamInput;
-          serverAudioCaps = m.audio || { opusIn: false, opusOut: false };
-          console.log('[opus] negotiated: uplink=' + (opusUplinkActive() ? 'opus' : 'pcm')
-            + ' downlink=' + (opusDownlinkActive() ? 'opus' : 'pcm')
-            + ' (server opusIn=' + !!serverAudioCaps.opusIn
-            + ' opusOut=' + !!serverAudioCaps.opusOut + ')');
-          serverWake = m.wakeWord || { available: false, enabled: false };
-          if (m.speakerLock) serverSpeaker = m.speakerLock;
-          updateVoiceLockUi();
-          if (m.voiceClone) serverVoiceClone = {
-            available: !!m.voiceClone.available,
-            active: m.voiceClone.active || 'default',
-            voices: m.voiceClone.voices || [],
-          };
-          updateVoicesUi();
-          addBubble('sys', `🟢 ${m.msg}`);
-          // On the first hello, set the start mode: the user's remembered choice
-          // (localStorage) takes precedence, otherwise the server default (wakeWord.enabled).
-          if (!helloSeen) {
-            if (STORED_MODE) {
-              selectInputMode(STORED_MODE);
-            } else if (serverWake.enabled) {
-              selectInputMode('wake');
-            }
-            if (inputMode === 'wake') {
-              addBubble('sys', t('sys.wake_mode_active', { word: serverWake.word, name: AGENT_NAME }));
-            }
+    /* ===== WS protocol dispatch =====
+       One handler per server event type (same table pattern as the server's
+       _WS_TEXT_HANDLERS). Unknown types are ignored. Adding a server event
+       means adding an entry here AND handling it server-side. */
+    const MSG_HANDLERS = {
+      'hello': (m) => {
+        // The server can confirm/change the language in hello (robustness; the
+        // server-side language injection normally already matches).
+        if (m.lang) setLang(m.lang);
+        if (m.agent_name) applyAgentName(m.agent_name);
+        else if (m.agent && m.agent.name) applyAgentName(m.agent.name);
+        serverStreaming = !!m.streaming;
+        streamInputEnabled = !!m.streamInput;
+        serverAudioCaps = m.audio || { opusIn: false, opusOut: false };
+        console.log('[opus] negotiated: uplink=' + (opusUplinkActive() ? 'opus' : 'pcm')
+          + ' downlink=' + (opusDownlinkActive() ? 'opus' : 'pcm')
+          + ' (server opusIn=' + !!serverAudioCaps.opusIn
+          + ' opusOut=' + !!serverAudioCaps.opusOut + ')');
+        serverWake = m.wakeWord || { available: false, enabled: false };
+        if (m.speakerLock) serverSpeaker = m.speakerLock;
+        updateVoiceLockUi();
+        if (m.voiceClone) serverVoiceClone = {
+          available: !!m.voiceClone.available,
+          active: m.voiceClone.active || 'default',
+          voices: m.voiceClone.voices || [],
+        };
+        updateVoicesUi();
+        addBubble('sys', `🟢 ${m.msg}`);
+        // On the first hello, set the start mode: the user's remembered choice
+        // (localStorage) takes precedence, otherwise the server default (wakeWord.enabled).
+        if (!helloSeen) {
+          if (STORED_MODE) {
+            selectInputMode(STORED_MODE);
+          } else if (serverWake.enabled) {
+            selectInputMode('wake');
           }
-          helloSeen = true;
-          updateInputModeHint();
-          if (m.turn) {
-            // Adjust the slider to the server range if needed
-            if (Number.isFinite(m.turn.debounce_ms_min)) debounce.min = String(m.turn.debounce_ms_min);
-            if (Number.isFinite(m.turn.debounce_ms_max)) debounce.max = String(m.turn.debounce_ms_max);
-            // Only adopt the server default if the user has not stored their own
-            // value (otherwise the reload would overwrite the remembered setting).
-            // Our setting is sent via sendSettings().
-            const savedDebounce = loadSavedSetting('debounce');
-            if (Number.isFinite(m.turn.debounce_ms) && (savedDebounce === null || savedDebounce === '')) {
-              debounce.value = String(m.turn.debounce_ms);
-              debounceLabel.textContent = (m.turn.debounce_ms / 1000).toFixed(1) + 's';
-            }
-            applyServerVadParams(m.turn.vad);
+          if (inputMode === 'wake') {
+            addBubble('sys', t('sys.wake_mode_active', { word: serverWake.word, name: AGENT_NAME }));
           }
-          // The on-open settings went out BEFORE hello (codec caps unknown) —
-          // re-announce now so audioCodec reaches the server.
-          sendSettings();
-          break;
-        case 'settings.ack':
-          applyServerVadParams(m.vad);
-          if (m.audioCodec) console.log('[opus] downlink codec ack: ' + m.audioCodec);
-          break;
-        case 'voice.state':
-          serverVoiceClone = { available: true, active: m.active || 'default', voices: m.voices || [] };
-          updateVoicesUi();
-          break;
-        case 'voice.clone.ack':
-          if (m.ok) {
-            addBubble('sys', t('voices.saved', { name: (m.voice && m.voice.name) || t('voices.default_name') }));
-          } else {
-            const emap = { too_short: 'voices.too_short', no_speech: 'voices.no_speech', edge_speech: 'voices.edge_speech', unavailable: 'voices.unavailable' };
-            addBubble('err', t(emap[m.error] || 'voices.error', { err: m.error }));
-          }
-          break;
-        case 'voice.preview.audio':
-          playPreviewAudio(m.audioB64, m.mime);
-          break;
-        case 'voice.error':
-          addBubble('err', t('voices.error', { err: m.error }));
-          break;
-        case 'session.reset.ack':
-          newSessionBtn.disabled = false;
-          addBubble('sys', t('sys.new_session_active', { key: (m.sessionKey || '').slice(-12) }));
-          break;
-        case 'chat.remote': {
-          // Another device of the shared session sent/received this message —
-          // mirror it so every device shows the same conversation.
-          if (m.role === 'assistant') {
-            const el = document.createElement('div');
-            el.className = 'bubble agent';
-            const md = document.createElement('div'); md.className = 'md';
-            md.innerHTML = renderMarkdown(m.text || '');
-            el.appendChild(md);
-            chatLog.appendChild(el);
-            chatLog.scrollTop = chatLog.scrollHeight;
-            persistMsg('agent', m.text);
-          } else {
-            let txt = m.text || '';
-            if (m.imageCount) txt = (txt ? txt + ' · ' : '') + '📷'.repeat(Math.min(m.imageCount, 3));
-            addBubble('user', txt);
-            persistMsg('user', txt);
-          }
-          break;
         }
-        case 'session.reset.remote':
-          // "New session" was clicked on another device — the shared session
-          // is reset for everyone, so clear this UI too.
-          stopCurrentAudio();
-          clearChatUi();
-          addBubble('sys', t('sys.new_session_remote'));
-          break;
-        case 'history':
-          // Backend-loaded conversation history (cross-device).
-          // Replaces localStorage transcript when available.
-          if (m.messages && m.messages.length) {
-            clearTranscript();
-            chatLog.innerHTML = '';
-            // Alle Bubble-Maps zeigen jetzt auf detached DOM-Knoten — leeren,
-            // sonst updaten Events eines laufenden Turns unsichtbare Bubbles.
-            turnUserBubble.clear(); turnAgentBubble.clear();
-            turnVoiceHtml.clear(); turnReplyText.clear();
-            turnPendingText.clear(); segPartialText.clear();
-            _lastSegFeed = null; _lastIgnoredBubble = null; _coalesceCarry = null;
-            addBubble('sys', t('sys.previous_session'));
-            for (const msg of m.messages) {
-              if (msg.role === 'assistant') {
-                const el = document.createElement('div');
-                el.className = 'bubble agent';
-                const md = document.createElement('div'); md.className = 'md';
-                md.innerHTML = renderMarkdown(msg.content || '');
-                el.appendChild(md);
-                chatLog.appendChild(el);
-                persistMsg('agent', msg.content);
-              } else if (msg.role === 'user') {
-                addBubble('user', msg.content || '');
-                persistMsg('user', msg.content);
-              }
+        helloSeen = true;
+        updateInputModeHint();
+        if (m.turn) {
+          // Adjust the slider to the server range if needed
+          if (Number.isFinite(m.turn.debounce_ms_min)) debounce.min = String(m.turn.debounce_ms_min);
+          if (Number.isFinite(m.turn.debounce_ms_max)) debounce.max = String(m.turn.debounce_ms_max);
+          // Only adopt the server default if the user has not stored their own
+          // value (otherwise the reload would overwrite the remembered setting).
+          // Our setting is sent via sendSettings().
+          const savedDebounce = loadSavedSetting('debounce');
+          if (Number.isFinite(m.turn.debounce_ms) && (savedDebounce === null || savedDebounce === '')) {
+            debounce.value = String(m.turn.debounce_ms);
+            debounceLabel.textContent = (m.turn.debounce_ms / 1000).toFixed(1) + 's';
+          }
+          applyServerVadParams(m.turn.vad);
+        }
+        // The on-open settings went out BEFORE hello (codec caps unknown) —
+        // re-announce now so audioCodec reaches the server.
+        sendSettings();
+      },
+      'settings.ack': (m) => {
+        applyServerVadParams(m.vad);
+        if (m.audioCodec) console.log('[opus] downlink codec ack: ' + m.audioCodec);
+      },
+      'voice.state': (m) => {
+        serverVoiceClone = { available: true, active: m.active || 'default', voices: m.voices || [] };
+        updateVoicesUi();
+      },
+      'voice.clone.ack': (m) => {
+        if (m.ok) {
+          addBubble('sys', t('voices.saved', { name: (m.voice && m.voice.name) || t('voices.default_name') }));
+        } else {
+          const emap = { too_short: 'voices.too_short', no_speech: 'voices.no_speech', edge_speech: 'voices.edge_speech', unavailable: 'voices.unavailable' };
+          addBubble('err', t(emap[m.error] || 'voices.error', { err: m.error }));
+        }
+      },
+      'voice.preview.audio': (m) => {
+        playPreviewAudio(m.audioB64, m.mime);
+      },
+      'voice.error': (m) => {
+        addBubble('err', t('voices.error', { err: m.error }));
+      },
+      'session.reset.ack': (m) => {
+        newSessionBtn.disabled = false;
+        addBubble('sys', t('sys.new_session_active', { key: (m.sessionKey || '').slice(-12) }));
+      },
+      'chat.remote': (m) => {
+        // Another device of the shared session sent/received this message —
+        // mirror it so every device shows the same conversation.
+        if (m.role === 'assistant') {
+          const el = document.createElement('div');
+          el.className = 'bubble agent';
+          const md = document.createElement('div'); md.className = 'md';
+          md.innerHTML = renderMarkdown(m.text || '');
+          el.appendChild(md);
+          chatLog.appendChild(el);
+          chatLog.scrollTop = chatLog.scrollHeight;
+          persistMsg('agent', m.text);
+        } else {
+          let txt = m.text || '';
+          if (m.imageCount) txt = (txt ? txt + ' · ' : '') + '📷'.repeat(Math.min(m.imageCount, 3));
+          addBubble('user', txt);
+          persistMsg('user', txt);
+        }
+      },
+      'session.reset.remote': (m) => {
+        // "New session" was clicked on another device — the shared session
+        // is reset for everyone, so clear this UI too.
+        stopCurrentAudio();
+        clearChatUi();
+        addBubble('sys', t('sys.new_session_remote'));
+      },
+      'history': (m) => {
+        // Backend-loaded conversation history (cross-device).
+        // Replaces localStorage transcript when available.
+        if (m.messages && m.messages.length) {
+          clearTranscript();
+          chatLog.innerHTML = '';
+          // Alle Bubble-Maps zeigen jetzt auf detached DOM-Knoten — leeren,
+          // sonst updaten Events eines laufenden Turns unsichtbare Bubbles.
+          turnUserBubble.clear(); turnAgentBubble.clear();
+          turnVoiceHtml.clear(); turnReplyText.clear();
+          turnPendingText.clear(); segPartialText.clear();
+          _lastSegFeed = null; _lastIgnoredBubble = null; _coalesceCarry = null;
+          addBubble('sys', t('sys.previous_session'));
+          for (const msg of m.messages) {
+            if (msg.role === 'assistant') {
+              const el = document.createElement('div');
+              el.className = 'bubble agent';
+              const md = document.createElement('div'); md.className = 'md';
+              md.innerHTML = renderMarkdown(msg.content || '');
+              el.appendChild(md);
+              chatLog.appendChild(el);
+              persistMsg('agent', msg.content);
+            } else if (msg.role === 'user') {
+              addBubble('user', msg.content || '');
+              persistMsg('user', msg.content);
+            }
+          }
+          chatLog.scrollTop = chatLog.scrollHeight;
+        }
+      },
+      'segment.received': (_m) => {
+        // Optional: level tick in the UI
+      },
+      'transcript.partial': (m) => {
+        // B2: interim transcript while still speaking → live into the
+        // User-Bubble (provisorisch). Wird vom finalen transcript/turn.pending
+        // overwritten. Remember it per segment: speech that vanishes in the
+        // final pass is rendered struck-red from this base.
+        if (m.segmentId && m.text) segPartialText.set(m.segmentId, m.text);
+        showPartialUserBubble(m.turnId, m.text);
+        if (micActive) setMicUi('collecting');
+      },
+      'transcript.ignored': (m) => {
+        // Segment discarded: no wake word, or (speaker lock) not the owner voice.
+        sttDone(m.segmentId);
+        if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: rejected voice
+        setDuck(false);   // foreign voice → playback back to full volume
+        if (m.reason === 'speaker_mismatch') {
+          // Foreign voice: struck red IN the transcript flow — no duplicated
+          // sentence line below the bubble.
+          const cutHtml = `<span class="seg-cut" title="${t('seg.rej_title', {
+            score: (typeof m.speakerScore === 'number' ? m.speakerScore.toFixed(2) : '?') })}">${escHtml(m.text || '')}</span>`;
+          if (turnUserBubble.has(m.turnId)) {
+            pushVoiceHtml(m.turnId, cutHtml);
+            setBubbleText(turnUserBubble.get(m.turnId), m.turnId, '');
+            turnUserBubble.get(m.turnId).classList.remove('partial');
+          } else {
+            // No open turn: minimal red line (the text appears exactly once).
+            if (_lastSegFeed && _lastSegFeed.parentNode && chatLog.lastElementChild === _lastSegFeed) {
+              const box = _lastSegFeed.querySelector('.vtext-feed');
+              if (box) box.insertAdjacentHTML('beforeend', ' ' + cutHtml);
+            } else {
+              const line = document.createElement('div');
+              line.className = 'bubble seg-feed';
+              line.innerHTML = `<span class="vtext-feed" style="font-size:12px;">${cutHtml}</span>`;
+              chatLog.appendChild(line);
+              _lastSegFeed = line;
             }
             chatLog.scrollTop = chatLog.scrollHeight;
           }
-          break;
-        case 'segment.received':
-          // Optional: level tick in the UI
-          break;
-        case 'transcript.partial':
-          // B2: interim transcript while still speaking → live into the
-          // User-Bubble (provisorisch). Wird vom finalen transcript/turn.pending
-          // overwritten. Remember it per segment: speech that vanishes in the
-          // final pass is rendered struck-red from this base.
-          if (m.segmentId && m.text) segPartialText.set(m.segmentId, m.text);
-          showPartialUserBubble(m.turnId, m.text);
-          if (micActive) setMicUi('collecting');
-          break;
-        case 'transcript.ignored':
-          // Segment discarded: no wake word, or (speaker lock) not the owner voice.
-          sttDone(m.segmentId);
-          if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: rejected voice
-          setDuck(false);   // foreign voice → playback back to full volume
-          if (m.reason === 'speaker_mismatch') {
-            // Foreign voice: struck red IN the transcript flow — no duplicated
-            // sentence line below the bubble.
-            const cutHtml = `<span class="seg-cut" title="${t('seg.rej_title', {
-              score: (typeof m.speakerScore === 'number' ? m.speakerScore.toFixed(2) : '?') })}">${escHtml(m.text || '')}</span>`;
-            if (turnUserBubble.has(m.turnId)) {
-              pushVoiceHtml(m.turnId, cutHtml);
-              setBubbleText(turnUserBubble.get(m.turnId), m.turnId, '');
-              turnUserBubble.get(m.turnId).classList.remove('partial');
-            } else {
-              // No open turn: minimal red line (the text appears exactly once).
-              if (_lastSegFeed && _lastSegFeed.parentNode && chatLog.lastElementChild === _lastSegFeed) {
-                const box = _lastSegFeed.querySelector('.vtext-feed');
-                if (box) box.insertAdjacentHTML('beforeend', ' ' + cutHtml);
-              } else {
-                const line = document.createElement('div');
-                line.className = 'bubble seg-feed';
-                line.innerHTML = `<span class="vtext-feed" style="font-size:12px;">${cutHtml}</span>`;
-                chatLog.appendChild(line);
-                _lastSegFeed = line;
-              }
-              chatLog.scrollTop = chatLog.scrollHeight;
-            }
-          } else {
-            showIgnoredBubble(m.text, m.reason);
-            clearStalePartial(m.turnId);
-          }
-          if (m.segmentId) segPartialText.delete(m.segmentId);
-          if (micActive) setMicUi('listening');
-          break;
-        case 'speaker.enroll.ack':
-          if (m.ok) {
-            serverSpeaker.available = true;
-            serverSpeaker.enrolled = true;
-            serverSpeaker.count = m.count || (serverSpeaker.count + 1);
-            updateVoiceLockUi();
-            addBubble('sys', t('voicelock.saved'));
-          } else if (m.error === 'too_short') {
-            updateVoiceLockUi();
-            addBubble('err', t('voicelock.too_short'));
-          } else if (m.error === 'unavailable') {
-            addBubble('err', t('voicelock.unavailable'));
-          } else {
-            updateVoiceLockUi();
-            addBubble('err', t('voicelock.error', { err: m.error || '?' }));
-          }
-          break;
-        case 'speaker.status':
-          serverSpeaker.available = !!m.available;
-          serverSpeaker.enrolled = !!m.enrolled;
-          serverSpeaker.count = m.count || 0;
+        } else {
+          showIgnoredBubble(m.text, m.reason);
+          clearStalePartial(m.turnId);
+        }
+        if (m.segmentId) segPartialText.delete(m.segmentId);
+        if (micActive) setMicUi('listening');
+      },
+      'speaker.enroll.ack': (m) => {
+        if (m.ok) {
+          serverSpeaker.available = true;
+          serverSpeaker.enrolled = true;
+          serverSpeaker.count = m.count || (serverSpeaker.count + 1);
           updateVoiceLockUi();
-          break;
-        case 'wake.detected':
-          // Wake word detected (possibly already in the partial) → chime + mic turns red/active.
-          // Ignore right after a manual close (race with trailing segments).
-          if (Date.now() < wakeCloseGuardUntil) break;
-          setWakeWindowActive(true);
-          playCue('on');
-          break;
-        case 'wake.window':
-          // Window open → mic red/active. Only start the idle-expiry timer when
-          // Antonia is waiting/done ('armed'/'done'); on an incoming command
-          // ('command') a reply follows → stop the timer so the window does
-          // not expire DURING the reply, only afterwards.
-          if (Date.now() < wakeCloseGuardUntil) break;
-          setWakeWindowActive(true);
-          if (m.reason === 'armed' || m.reason === 'done') armWakeWindowTimer(m.windowS);
-          else cancelWakeWindowTimer();
-          break;
-        case 'wake.closed':
-          // Window ended (stop command / manual / Alexa one-shot) → timer
-          // off + closing cue. In one-shot mode this happens after EVERY
-          // reply → no bubble (otherwise spam), just the subtle cue.
-          // Ein Stopp-Kommando muss auch die CLIENTSEITIG noch gepufferten
-          // Audio-Sekunden stoppen: der Server kann nach audio.end kein
-          // audio.stop mehr für diese Id senden (audio_ids bereits geräumt).
-          if (m.reason === 'stop_command') { stopCurrentAudio(); stopStreamPlayback(); }
-          cancelWakeWindowTimer();
-          setWakeWindowActive(false);
-          playCue('off');
-          if (m.reason !== 'oneshot') addBubble('sys', t('sys.wake_window_ended'));
-          break;
-        case 'wake.armed':
-          // Only the wake word was said → the AI is now listening (conversation window).
-          addBubble('sys wake-armed', t('sys.agent_listening', { name: AGENT_NAME }));
-          if (micActive) setMicUi('listening');
-          break;
-        case 'transcript':
-          sttDone(m.segmentId);
-          // We write the text directly into the pending user bubble
-          // (overwritten by turn.pending below, but for edge cases)
-          lastLatency.textContent = `${m.sttMs}ms`;
-          if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: owner accepted
-          // Voice lock: inline coloring — vanished speech stays visible, struck
-          // red in place. Base for the diff: the server's pre-trim full text,
-          // or (when Whisper's final pass silently dropped speech a partial had
-          // shown) the last live partial. Server-confirmed trims strike from
-          // 1 word; partial-based diffs only strike runs ≥ 3 words so ordinary
-          // Whisper revisions don't masquerade as cuts.
-          if (m.text && typeof m.speakerScore === 'number') {
-            let html;
-            if (m.speakerTrimmed && m.speakerFullText) {
-              html = diffKeptHtml(m.speakerFullText, m.text, 1);
-            } else {
-              const partialBase = m.segmentId ? segPartialText.get(m.segmentId) : null;
-              html = partialBase ? diffKeptHtml(partialBase, m.text, 3) : escHtml(m.text);
-            }
-            pushVoiceHtml(m.turnId, html);
-            const kind = m.speakerTrimmed ? 'trim' : 'own';
-            const label = (m.speakerTrimmed ? '✂️ ' : '✓ ') + m.speakerScore.toFixed(2);
-            addSegChip(m.turnId, kind, label,
-                       m.speakerTrimmed ? t('seg.trimmed_title', { full: m.speakerFullText || '' })
-                                        : t('seg.own_title'));
-          }
-          if (m.segmentId) segPartialText.delete(m.segmentId);
-          if (!m.text) {
-            // Segment dropped (leer/ghost) — turn.pending kommt nicht; eine
-            // evtl. vom Partial erzeugte Bubble darf nicht hängen bleiben.
-            clearStalePartial(m.turnId);
-          }
-          break;
-        case 'turn.pending':
-          turnPendingText.set(m.turnId, m.text);
-          updateUserBubble(m.turnId, m.text, m.debounceMs);
-          if (micActive) setMicUi('collecting');
-          break;
-        case 'turn.discarded':
-          if (m.coalesced) {
-            if (m.requeued === false) {
-              // The backend (Hermes) keeps the interrupted turn's user message
-              // as its OWN entry — mirror that: the committed bubble STAYS as
-              // its own message (incl. its speaker chips), exactly like a
-              // reload restores it. The follow-up speech gets a fresh bubble.
-              const ub = turnUserBubble.get(m.turnId);
-              if (ub) {
-                // Drop any partial suffix of the FOLLOW-UP speech that was
-                // rendered into this bubble while the old turn was in flight.
-                setBubbleText(ub, m.turnId, m.coalescedText || '');
-                ub.classList.remove('pending', 'collecting', 'partial');
-                setMeta(ub, t('turn.meta', { id: m.turnId.substr(0,4) }));
-                turnUserBubble.delete(m.turnId);   // freeze: next turn = new bubble
-              }
-              turnVoiceHtml.delete(m.turnId);
-            } else {
-              // Re-queued server-side: the text rides back inside the NEXT
-              // turn.pending → merge VISUALLY (carry the colored voice HTML
-              // over as its own paragraph) and drop the old bubble.
-              _coalesceCarry = (turnVoiceHtml.get(m.turnId) || []).slice();
-              const ub = turnUserBubble.get(m.turnId);
-              if (ub) { ub.remove(); turnUserBubble.delete(m.turnId); }
-              turnVoiceHtml.delete(m.turnId);
-            }
-            const ab = turnAgentBubble.get(m.turnId);
-            if (ab) { ab.remove(); turnAgentBubble.delete(m.turnId); }
+          addBubble('sys', t('voicelock.saved'));
+        } else if (m.error === 'too_short') {
+          updateVoiceLockUi();
+          addBubble('err', t('voicelock.too_short'));
+        } else if (m.error === 'unavailable') {
+          addBubble('err', t('voicelock.unavailable'));
+        } else {
+          updateVoiceLockUi();
+          addBubble('err', t('voicelock.error', { err: m.error || '?' }));
+        }
+      },
+      'speaker.status': (m) => {
+        serverSpeaker.available = !!m.available;
+        serverSpeaker.enrolled = !!m.enrolled;
+        serverSpeaker.count = m.count || 0;
+        updateVoiceLockUi();
+      },
+      'wake.detected': (_m) => {
+        // Wake word detected (possibly already in the partial) → chime + mic turns red/active.
+        // Ignore right after a manual close (race with trailing segments).
+        if (Date.now() < wakeCloseGuardUntil) return;
+        setWakeWindowActive(true);
+        playCue('on');
+      },
+      'wake.window': (m) => {
+        // Window open → mic red/active. Only start the idle-expiry timer when
+        // Antonia is waiting/done ('armed'/'done'); on an incoming command
+        // ('command') a reply follows → stop the timer so the window does
+        // not expire DURING the reply, only afterwards.
+        if (Date.now() < wakeCloseGuardUntil) return;
+        setWakeWindowActive(true);
+        if (m.reason === 'armed' || m.reason === 'done') armWakeWindowTimer(m.windowS);
+        else cancelWakeWindowTimer();
+      },
+      'wake.closed': (m) => {
+        // Window ended (stop command / manual / Alexa one-shot) → timer
+        // off + closing cue. In one-shot mode this happens after EVERY
+        // reply → no bubble (otherwise spam), just the subtle cue.
+        // Ein Stopp-Kommando muss auch die CLIENTSEITIG noch gepufferten
+        // Audio-Sekunden stoppen: der Server kann nach audio.end kein
+        // audio.stop mehr für diese Id senden (audio_ids bereits geräumt).
+        if (m.reason === 'stop_command') { stopCurrentAudio(); stopStreamPlayback(); }
+        cancelWakeWindowTimer();
+        setWakeWindowActive(false);
+        playCue('off');
+        if (m.reason !== 'oneshot') addBubble('sys', t('sys.wake_window_ended'));
+      },
+      'wake.armed': (_m) => {
+        // Only the wake word was said → the AI is now listening (conversation window).
+        addBubble('sys wake-armed', t('sys.agent_listening', { name: AGENT_NAME }));
+        if (micActive) setMicUi('listening');
+      },
+      'transcript': (m) => {
+        sttDone(m.segmentId);
+        // We write the text directly into the pending user bubble
+        // (overwritten by turn.pending below, but for edge cases)
+        lastLatency.textContent = `${m.sttMs}ms`;
+        if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: owner accepted
+        // Voice lock: inline coloring — vanished speech stays visible, struck
+        // red in place. Base for the diff: the server's pre-trim full text,
+        // or (when Whisper's final pass silently dropped speech a partial had
+        // shown) the last live partial. Server-confirmed trims strike from
+        // 1 word; partial-based diffs only strike runs ≥ 3 words so ordinary
+        // Whisper revisions don't masquerade as cuts.
+        if (m.text && typeof m.speakerScore === 'number') {
+          let html;
+          if (m.speakerTrimmed && m.speakerFullText) {
+            html = diffKeptHtml(m.speakerFullText, m.text, 1);
           } else {
-            discardTurn(m.turnId);
+            const partialBase = m.segmentId ? segPartialText.get(m.segmentId) : null;
+            html = partialBase ? diffKeptHtml(partialBase, m.text, 3) : escHtml(m.text);
           }
-          markTurnDiscarded(m.turnId);
-          turnPendingText.delete(m.turnId);
-          // Also stop the audio of the discarded turn if it is currently playing.
-          stopAudioForTurn(m.turnId);
-          setAgentBusy(false);
-          break;
-        case 'turn.commit':
-          if (m.source === 'text' || m.source === 'mixed') {
-            // Text or mixed turn: we already created the user bubble locally
-            // on send (pre-bubble → remapped on turn.commit,
-            // siehe wrapping handleMessage weiter unten).
-            const el = turnUserBubble.get(m.turnId);
-            if (el) {
-              el.classList.remove('pending','collecting');
-              // For mixed: the voice text was merged into m.text by the server.
-              // Re-set the bubble text so the voice part is visible.
-              if (m.source === 'mixed' && m.text) {
-                const commitText = m.text;
-                const vbox = el.querySelector(':scope > .vtext');
-                if (vbox) {
-                  // Bubble was rendered with colored voice HTML → replace it
-                  // with the server-merged plain text (typed part included).
-                  turnVoiceHtml.delete(m.turnId);
-                  vbox.textContent = commitText;
-                } else {
-                  // Find the text node (last text node) and replace it
-                  let txtNode = null;
-                  for (const n of el.childNodes) {
-                    if (n.nodeType === Node.TEXT_NODE) txtNode = n;
-                  }
-                  if (txtNode) txtNode.nodeValue = commitText;
-                  else el.appendChild(document.createTextNode(commitText));
+          pushVoiceHtml(m.turnId, html);
+          const kind = m.speakerTrimmed ? 'trim' : 'own';
+          const label = (m.speakerTrimmed ? '✂️ ' : '✓ ') + m.speakerScore.toFixed(2);
+          addSegChip(m.turnId, kind, label,
+                     m.speakerTrimmed ? t('seg.trimmed_title', { full: m.speakerFullText || '' })
+                                      : t('seg.own_title'));
+        }
+        if (m.segmentId) segPartialText.delete(m.segmentId);
+        if (!m.text) {
+          // Segment dropped (leer/ghost) — turn.pending kommt nicht; eine
+          // evtl. vom Partial erzeugte Bubble darf nicht hängen bleiben.
+          clearStalePartial(m.turnId);
+        }
+      },
+      'turn.pending': (m) => {
+        remapPreBubbles(m);   // text-send pre-bubble adopts the server turn id
+        turnPendingText.set(m.turnId, m.text);
+        updateUserBubble(m.turnId, m.text, m.debounceMs);
+        if (micActive) setMicUi('collecting');
+      },
+      'turn.discarded': (m) => {
+        if (m.coalesced) {
+          if (m.requeued === false) {
+            // The backend (Hermes) keeps the interrupted turn's user message
+            // as its OWN entry — mirror that: the committed bubble STAYS as
+            // its own message (incl. its speaker chips), exactly like a
+            // reload restores it. The follow-up speech gets a fresh bubble.
+            const ub = turnUserBubble.get(m.turnId);
+            if (ub) {
+              // Drop any partial suffix of the FOLLOW-UP speech that was
+              // rendered into this bubble while the old turn was in flight.
+              setBubbleText(ub, m.turnId, m.coalescedText || '');
+              ub.classList.remove('pending', 'collecting', 'partial');
+              setMeta(ub, t('turn.meta', { id: m.turnId.substr(0,4) }));
+              turnUserBubble.delete(m.turnId);   // freeze: next turn = new bubble
+            }
+            turnVoiceHtml.delete(m.turnId);
+          } else {
+            // Re-queued server-side: the text rides back inside the NEXT
+            // turn.pending → merge VISUALLY (carry the colored voice HTML
+            // over as its own paragraph) and drop the old bubble.
+            _coalesceCarry = (turnVoiceHtml.get(m.turnId) || []).slice();
+            const ub = turnUserBubble.get(m.turnId);
+            if (ub) { ub.remove(); turnUserBubble.delete(m.turnId); }
+            turnVoiceHtml.delete(m.turnId);
+          }
+          const ab = turnAgentBubble.get(m.turnId);
+          if (ab) { ab.remove(); turnAgentBubble.delete(m.turnId); }
+        } else {
+          discardTurn(m.turnId);
+        }
+        markTurnDiscarded(m.turnId);
+        turnPendingText.delete(m.turnId);
+        // Also stop the audio of the discarded turn if it is currently playing.
+        stopAudioForTurn(m.turnId);
+        setAgentBusy(false);
+      },
+      'turn.commit': (m) => {
+        remapPreBubbles(m);   // text-send pre-bubble adopts the server turn id
+        if (m.source === 'text' || m.source === 'mixed') {
+          // Text or mixed turn: we already created the user bubble locally
+          // on send (pre-bubble → remapped via remapPreBubbles above).
+          const el = turnUserBubble.get(m.turnId);
+          if (el) {
+            el.classList.remove('pending','collecting');
+            // For mixed: the voice text was merged into m.text by the server.
+            // Re-set the bubble text so the voice part is visible.
+            if (m.source === 'mixed' && m.text) {
+              const commitText = m.text;
+              const vbox = el.querySelector(':scope > .vtext');
+              if (vbox) {
+                // Bubble was rendered with colored voice HTML → replace it
+                // with the server-merged plain text (typed part included).
+                turnVoiceHtml.delete(m.turnId);
+                vbox.textContent = commitText;
+              } else {
+                // Find the text node (last text node) and replace it
+                let txtNode = null;
+                for (const n of el.childNodes) {
+                  if (n.nodeType === Node.TEXT_NODE) txtNode = n;
                 }
+                if (txtNode) txtNode.nodeValue = commitText;
+                else el.appendChild(document.createTextNode(commitText));
               }
-              const tag = m.source === 'mixed' ? t('source.voice_text') : t('source.text');
-              setMeta(el, t('turn.committed', { id: m.turnId.substr(0,4), tag }) + (m.imageCount ? t('turn.image_suffix', { n: m.imageCount }) : ''));
-            } else {
-              // No pre-mapping (e.g. mixed arrived without a send click — server
-              // merged voice + previously stacked text). Create a bubble.
-              commitUserBubble(m.turnId, m.text);
             }
-            if (micActive) setMicUi('thinking');
+            const tag = m.source === 'mixed' ? t('source.voice_text') : t('source.text');
+            setMeta(el, t('turn.committed', { id: m.turnId.substr(0,4), tag }) + (m.imageCount ? t('turn.image_suffix', { n: m.imageCount }) : ''));
           } else {
-            // Pur Voice
+            // No pre-mapping (e.g. mixed arrived without a send click — server
+            // merged voice + previously stacked text). Create a bubble.
             commitUserBubble(m.turnId, m.text);
-            if (micActive) setMicUi('thinking');
           }
-          turnPendingText.delete(m.turnId);
-          // Ein bis hierhin nicht konsumierter Coalesce-Carry gehört zu KEINEM
-          // späteren Turn mehr (z.B. wenn dieser Turn ein Text-Send war, der
-          // getOrCreateUserBubble nie durchlief) — sonst klebt er irgendwann
-          // an einer völlig fremden Voice-Bubble.
-          _coalesceCarry = null;
-          persistMsg('user', m.text);   // remember for reload restoration
-          break;
-        case 'reply.start':
-          addPendingAgentBubble(m.turnId);
-          turnReplyText.delete(m.turnId);
-          // Antonia is now working/answering → pause the window-expiry timer.
-          // It only restarts when she is done (playback.done, or on
-          // silence/error below). This way the channel does not close in the
-          // middle of a long reply.
-          cancelWakeWindowTimer();
-          setAgentBusy(true);   // mic becomes ⏹ (click = abort reply)
-          // New turn → reset the latency display; values follow per phase.
-          // (STT/lastLatency stays: it was already set on this turn's transcript.
-          // Reply/agent/TTS to '–' so silent/faulty turns do not keep
-          // showing the previous turn's numbers.)
-          statLlmFirst = statTtsFirst = statLlmTotal = statTtsTotal = null;
-          renderLlmStat();
-          renderTtsStat();
-          lastE2e.textContent = '–';
-          e2eBreakdown.textContent = t('stats.until_playback');
-          break;
-        case 'reply.delta':
-          // A1: reply text live as the tokens arrive.
-          appendAgentBubbleDelta(m.turnId, m.delta);
-          break;
-        case 'reply':
-          turnReplyText.delete(m.turnId);
-          finalizeAgentBubble(m.turnId, m.text, m.llmMs);
-          statLlmTotal = m.llmMs;
-          renderLlmStat();
-          persistMsg('agent', m.text);   // remember for reload restoration
-          break;
-        case 'reply.silent':
-          turnReplyText.delete(m.turnId);
-          finalizeSilentAgentBubble(m.turnId, m.reason || 'no_reply', m.llmMs || 0);
-          if (m.llmMs) { statLlmTotal = m.llmMs; renderLlmStat(); }
-          setAgentBusy(false);
-          // No speech output → no playback.done. One-shot: window closes immediately
-          // (wake word needed again); otherwise idle timer for the conversation window.
-          if (inputMode === 'wake') {
-            if (wakeOneshot()) closeWakeWindow();
-            else armWakeWindowTimer(serverWake.windowS);
+          if (micActive) setMicUi('thinking');
+        } else {
+          // Pur Voice
+          commitUserBubble(m.turnId, m.text);
+          if (micActive) setMicUi('thinking');
+        }
+        turnPendingText.delete(m.turnId);
+        // Ein bis hierhin nicht konsumierter Coalesce-Carry gehört zu KEINEM
+        // späteren Turn mehr (z.B. wenn dieser Turn ein Text-Send war, der
+        // getOrCreateUserBubble nie durchlief) — sonst klebt er irgendwann
+        // an einer völlig fremden Voice-Bubble.
+        _coalesceCarry = null;
+        persistMsg('user', m.text);   // remember for reload restoration
+      },
+      'reply.start': (m) => {
+        addPendingAgentBubble(m.turnId);
+        turnReplyText.delete(m.turnId);
+        // Antonia is now working/answering → pause the window-expiry timer.
+        // It only restarts when she is done (playback.done, or on
+        // silence/error below). This way the channel does not close in the
+        // middle of a long reply.
+        cancelWakeWindowTimer();
+        setAgentBusy(true);   // mic becomes ⏹ (click = abort reply)
+        // New turn → reset the latency display; values follow per phase.
+        // (STT/lastLatency stays: it was already set on this turn's transcript.
+        // Reply/agent/TTS to '–' so silent/faulty turns do not keep
+        // showing the previous turn's numbers.)
+        statLlmFirst = statTtsFirst = statLlmTotal = statTtsTotal = null;
+        renderLlmStat();
+        renderTtsStat();
+        lastE2e.textContent = '–';
+        e2eBreakdown.textContent = t('stats.until_playback');
+      },
+      'reply.delta': (m) => {
+        // A1: reply text live as the tokens arrive.
+        appendAgentBubbleDelta(m.turnId, m.delta);
+      },
+      'reply': (m) => {
+        turnReplyText.delete(m.turnId);
+        finalizeAgentBubble(m.turnId, m.text, m.llmMs);
+        statLlmTotal = m.llmMs;
+        renderLlmStat();
+        persistMsg('agent', m.text);   // remember for reload restoration
+      },
+      'reply.silent': (m) => {
+        turnReplyText.delete(m.turnId);
+        finalizeSilentAgentBubble(m.turnId, m.reason || 'no_reply', m.llmMs || 0);
+        if (m.llmMs) { statLlmTotal = m.llmMs; renderLlmStat(); }
+        setAgentBusy(false);
+        // No speech output → no playback.done. One-shot: window closes immediately
+        // (wake word needed again); otherwise idle timer for the conversation window.
+        if (inputMode === 'wake') {
+          if (wakeOneshot()) closeWakeWindow();
+          else armWakeWindowTimer(serverWake.windowS);
+        }
+      },
+      'reply.error': (m) => {
+        turnReplyText.delete(m.turnId);
+        finalizeAgentBubble(m.turnId, `⚠ ${m.error}`, 0);
+        setAgentBusy(false);
+        if (inputMode === 'wake') {
+          if (wakeOneshot()) closeWakeWindow();
+          else armWakeWindowTimer(serverWake.windowS);
+        }
+      },
+      'audio.start': (m) => {
+        // A2: progressive PCM-Wiedergabe starten (Chunks folgen als VCT2-Binary).
+        // Nur im Streaming-Pfad (sampleRate gesetzt): der klassische Pfad
+        // (STREAMING=0) liefert ein VCT1-WAV und sendet kein audio.end —
+        // ein hier gestarteter Stream-Player bliebe für immer "playing"
+        // (Stop-Button dauerhaft an, Wake-Timer blockiert, Phantom-Barge-ins).
+        if (Number.isFinite(m.sampleRate)) {
+          startStreamPlayback(m.turnId, m.audioId, m.sampleRate, m.codec);
+        }
+        // E2E latency to first playback + first-token values for agent/TTS.
+        if (Number.isFinite(m.e2eMs)) {
+          lastE2e.textContent = `${m.e2eMs}ms`;
+          // Breakdown: how much of that was the (intended) debounce pause?
+          if (Number.isFinite(m.debounceMs) && m.debounceMs > 0) {
+            const net = Math.max(0, m.e2eMs - m.debounceMs);
+            e2eBreakdown.textContent = t('stats.e2e_breakdown', { pause: m.debounceMs, net });
           }
-          break;
-        case 'reply.error':
-          turnReplyText.delete(m.turnId);
-          finalizeAgentBubble(m.turnId, `⚠ ${m.error}`, 0);
-          setAgentBusy(false);
-          if (inputMode === 'wake') {
-            if (wakeOneshot()) closeWakeWindow();
-            else armWakeWindowTimer(serverWake.windowS);
-          }
-          break;
-        case 'audio.start':
-          // A2: progressive PCM-Wiedergabe starten (Chunks folgen als VCT2-Binary).
-          // Nur im Streaming-Pfad (sampleRate gesetzt): der klassische Pfad
-          // (STREAMING=0) liefert ein VCT1-WAV und sendet kein audio.end —
-          // ein hier gestarteter Stream-Player bliebe für immer "playing"
-          // (Stop-Button dauerhaft an, Wake-Timer blockiert, Phantom-Barge-ins).
-          if (Number.isFinite(m.sampleRate)) {
-            startStreamPlayback(m.turnId, m.audioId, m.sampleRate, m.codec);
-          }
-          // E2E latency to first playback + first-token values for agent/TTS.
-          if (Number.isFinite(m.e2eMs)) {
-            lastE2e.textContent = `${m.e2eMs}ms`;
-            // Breakdown: how much of that was the (intended) debounce pause?
-            if (Number.isFinite(m.debounceMs) && m.debounceMs > 0) {
-              const net = Math.max(0, m.e2eMs - m.debounceMs);
-              e2eBreakdown.textContent = t('stats.e2e_breakdown', { pause: m.debounceMs, net });
+        }
+        if (Number.isFinite(m.llmFirstMs)) { statLlmFirst = m.llmFirstMs; renderLlmStat(); }
+        if (Number.isFinite(m.ttsFirstMs)) { statTtsFirst = m.ttsFirstMs; renderTtsStat(); }
+      },
+      'audio.end': (m) => {
+        // Alle Chunks gesendet → Player als "fertig" markieren; playback.done
+        // fires when the last buffer has finished playing.
+        // Opus: drain the decoder FIRST — in-flight decodes must land in the
+        // scheduler before the stream is finalized, or the tail is cut off.
+        if (streamPlayer && streamPlayer.turnId === m.turnId && streamPlayer.decoder) {
+          const dec = streamPlayer.decoder, tid = m.turnId;
+          dec.flush().catch(() => {}).finally(() => {
+            try { dec.close(); } catch (_) {}
+            if (streamPlayer && streamPlayer.turnId === tid && streamPlayer.decoder === dec) {
+              streamPlayer.decoder = null;
             }
-          }
-          if (Number.isFinite(m.llmFirstMs)) { statLlmFirst = m.llmFirstMs; renderLlmStat(); }
-          if (Number.isFinite(m.ttsFirstMs)) { statTtsFirst = m.ttsFirstMs; renderTtsStat(); }
-          break;
-        case 'audio.end':
-          // Alle Chunks gesendet → Player als "fertig" markieren; playback.done
-          // fires when the last buffer has finished playing.
-          // Opus: drain the decoder FIRST — in-flight decodes must land in the
-          // scheduler before the stream is finalized, or the tail is cut off.
-          if (streamPlayer && streamPlayer.turnId === m.turnId && streamPlayer.decoder) {
-            const dec = streamPlayer.decoder, tid = m.turnId;
-            dec.flush().catch(() => {}).finally(() => {
-              try { dec.close(); } catch (_) {}
-              if (streamPlayer && streamPlayer.turnId === tid && streamPlayer.decoder === dec) {
-                streamPlayer.decoder = null;
-              }
-              endStreamPlayback(tid);
-            });
-          } else {
-            endStreamPlayback(m.turnId);
-          }
-          if (Number.isFinite(m.ttsMs)) {
-            appendTtsToAgentBubble(m.turnId, m.ttsMs);
-            statTtsTotal = m.ttsMs;
-            renderTtsStat();
-          }
-          break;
-        case 'audio.meta':
-          // Klassischer Pfad (STREAMING=0): WAV folgt als VCT1-Binary.
+            endStreamPlayback(tid);
+          });
+        } else {
+          endStreamPlayback(m.turnId);
+        }
+        if (Number.isFinite(m.ttsMs)) {
           appendTtsToAgentBubble(m.turnId, m.ttsMs);
           statTtsTotal = m.ttsMs;
           renderTtsStat();
-          break;
-        case 'audio.stop':
-          // Stop can refer to a specific audioId, or — if
-          // without audioId — to everything active.
-          if (!m.audioId) { stopCurrentAudio(); stopStreamPlayback(); }
-          else {
-            if (currentAudioId === m.audioId) stopCurrentAudio();
-            if (streamPlayer && streamPlayer.audioId === m.audioId) stopStreamPlayback();
-          }
-          break;
-        case 'audio.error':
-          addBubble('err', t('err.tts', { error: m.error }));
-          break;
-        case 'transcript.error':
-          sttDone(m.segmentId);
-          addBubble('err', t('err.stt', { error: m.error }));
-          if (m.segmentId) segPartialText.delete(m.segmentId);
-          clearStalePartial(m.turnId);
-          break;
-        case 'ack':
-          break;
-        case 'external.message':
-          addExternalBubble(m.role, m.text);
-          break;
-        default:
-      }
+        }
+      },
+      'audio.meta': (m) => {
+        // Klassischer Pfad (STREAMING=0): WAV folgt als VCT1-Binary.
+        appendTtsToAgentBubble(m.turnId, m.ttsMs);
+        statTtsTotal = m.ttsMs;
+        renderTtsStat();
+      },
+      'audio.stop': (m) => {
+        // Stop can refer to a specific audioId, or — if
+        // without audioId — to everything active.
+        if (!m.audioId) { stopCurrentAudio(); stopStreamPlayback(); }
+        else {
+          if (currentAudioId === m.audioId) stopCurrentAudio();
+          if (streamPlayer && streamPlayer.audioId === m.audioId) stopStreamPlayback();
+        }
+      },
+      'audio.error': (m) => {
+        addBubble('err', t('err.tts', { error: m.error }));
+      },
+      'transcript.error': (m) => {
+        sttDone(m.segmentId);
+        addBubble('err', t('err.stt', { error: m.error }));
+        if (m.segmentId) segPartialText.delete(m.segmentId);
+        clearStalePartial(m.turnId);
+      },
+      'ack': (_m) => {},
+      'external.message': (m) => {
+        addExternalBubble(m.role, m.text);
+      },
+    };
+
+    function handleMessage(m) {
+      const h = Object.prototype.hasOwnProperty.call(MSG_HANDLERS, m.type)
+        ? MSG_HANDLERS[m.type] : null;   // guard: m.type could be any JSON value
+      if (h) h(m);
     }
 
     function addExternalBubble(role, text) {
@@ -4402,6 +4406,24 @@
       return new Uint8Array(float32.buffer, float32.byteOffset, float32.byteLength);
     }
 
+    /* Shared capture plumbing: a ScriptProcessor tap wired through a muted
+       gain node (audioprocess only fires when the chain reaches a
+       destination; gain 0 so you do not hear yourself). One implementation
+       for the VAD input tap, PTT and the enrollment/clone recorders. */
+    function connectMutedTap(ctx, src, frameSize, onFrame) {
+      const tap = ctx.createScriptProcessor(frameSize, 1, 1);
+      tap.onaudioprocess = onFrame;
+      src.connect(tap);
+      const sink = ctx.createGain(); sink.gain.value = 0;
+      tap.connect(sink).connect(ctx.destination);
+      return { tap, sink };
+    }
+    function disconnectMutedTap(chain) {
+      if (!chain) return;
+      try { chain.tap.disconnect(); } catch (_) {}
+      try { chain.sink.disconnect(); } catch (_) {}
+    }
+
     async function startMic(silent = false) {
       try {
         if (!silent) setMicUi('loading');
@@ -4423,8 +4445,7 @@
         inputStreaming = false;
         inputDs16k = makeDownsampler16k();
         try {
-          const tap = audioCtx.createScriptProcessor(2048, 1, 1);
-          tap.onaudioprocess = (ev) => {
+          const chain = connectMutedTap(audioCtx, src, 2048, (ev) => {
             if (enrolling) return;   // enrollment owns the binary channel
             const ch = ev.inputBuffer.getChannelData(0);
             const ds = inputDs16k(ch, audioCtx.sampleRate);
@@ -4443,12 +4464,9 @@
               if (uplinkCodec === 'opus') encodeUplinkFrame(ds);
               else try { ws.send(f32ToBytes(ds)); } catch (_) {}
             }
-          };
-          src.connect(tap);
-          const sink = audioCtx.createGain(); sink.gain.value = 0;
-          tap.connect(sink).connect(audioCtx.destination);
-          inputTapNode = tap;
-          inputTapSink = sink;
+          });
+          inputTapNode = chain.tap;
+          inputTapSink = chain.sink;
         } catch (_) { inputTapNode = null; }
 
         if (!window.vad) throw new Error(t('err.vad_not_loaded'));
@@ -4719,26 +4737,28 @@
       });
     }
 
-    async function enrollRecord() {
-      if (enrolling) return;
-      if (!serverSpeaker.available) { addBubble('err', t('voicelock.unavailable')); return; }
-      if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
+    /* Timed one-shot recording that OWNS the binary WS channel (enrollment
+       and voice-clone reference takes share this one code path). Pauses the
+       running VAD pipeline — its input tap would otherwise stream VAD-segment
+       frames in parallel with the recording frames and the server can't tell
+       them apart on the binary channel (garbled take) — opens its own capture
+       chain, streams `seconds` of 16 kHz f32 frames, then sends `commitMsg()`;
+       on failure `abortMsg` + an error bubble. Button/progress/label are the
+       caller's UI elements. */
+    async function recordTimedTake({ seconds, btn, progEl, labelEl, labelKey,
+                                     startMsg, commitMsg, abortMsg, errKey, onDone }) {
       enrolling = true;
-      enrollVoiceBtn.disabled = true;
-      enrollVoiceBtn.classList.add('recording');
-      // Pause the running VAD pipeline: its input tap would otherwise stream
-      // VAD-segment frames in parallel with the enrollment frames — the server
-      // can't tell them apart on the binary channel (garbled enrollment take).
+      btn.disabled = true;
+      btn.classList.add('recording');
       if (inputStreaming) abortInputStream();
       if (vad && micActive) { try { vad.pause(); } catch (_) {} }
-      let ctx = null, stream = null, tap = null, sink = null;
+      let ctx = null, stream = null, chain = null;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
         ctx = new (window.AudioContext || window.webkitAudioContext)();
         const src = ctx.createMediaStreamSource(stream);
-        tap = ctx.createScriptProcessor(2048, 1, 1);
-        ws.send(JSON.stringify({ type: 'speaker.enroll.start' }));
-        const target = 16000 * ENROLL_SECONDS;
+        ws.send(JSON.stringify(startMsg));
+        const target = 16000 * seconds;
         const ds16k = makeDownsampler16k();
         let sent = 0;
         await new Promise((resolve, reject) => {
@@ -4747,39 +4767,51 @@
           // und das finally liefe nie: enrolling bliebe true, der VAD-Tap
           // dauerhaft unterdrückt (Spracheingabe tot bis zum Reload).
           const deadline = setTimeout(
-            () => reject(new Error('enrollment timed out (no audio frames)')),
-            ENROLL_SECONDS * 1000 + 8000);
-          tap.onaudioprocess = (ev) => {
+            () => reject(new Error('recording timed out (no audio frames)')),
+            seconds * 1000 + 8000);
+          chain = connectMutedTap(ctx, src, 2048, (ev) => {
             if (sent >= target) return;
             const ds = ds16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
             try { ws.send(f32ToBytes(ds)); } catch (_) {}
             sent += ds.length;
             const pct = Math.min(100, Math.round((sent / target) * 100));
-            if (voiceLockProg) voiceLockProg.style.width = pct + '%';
-            enrollVoiceLabel.textContent = t('voicelock.recording', { pct });
+            if (progEl) progEl.style.width = pct + '%';
+            labelEl.textContent = t(labelKey, { pct });
             if (sent >= target) { clearTimeout(deadline); resolve(); }
-          };
-          src.connect(tap);
-          sink = ctx.createGain(); sink.gain.value = 0;
-          tap.connect(sink).connect(ctx.destination);
+          });
         });
-        ws.send(JSON.stringify({ type: 'speaker.enroll.commit' }));
-        // Result comes back as 'speaker.enroll.ack' → handled in the WS switch.
+        ws.send(JSON.stringify(commitMsg()));
+        // Result comes back as the matching *.ack → handled in MSG_HANDLERS.
       } catch (e) {
-        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'speaker.enroll.abort' })); } catch (_) {}
-        addBubble('err', t('voicelock.error', { err: (e && e.message) || e }));
+        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify(abortMsg)); } catch (_) {}
+        addBubble('err', t(errKey, { err: (e && e.message) || e }));
       } finally {
-        try { if (tap) tap.disconnect(); } catch (_) {}
-        try { if (sink) sink.disconnect(); } catch (_) {}
+        disconnectMutedTap(chain);
         try { if (stream) stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
         try { if (ctx) await ctx.close(); } catch (_) {}
         enrolling = false;
-        enrollVoiceBtn.disabled = false;
-        enrollVoiceBtn.classList.remove('recording');
-        if (voiceLockProg) voiceLockProg.style.width = '0%';
+        btn.disabled = false;
+        btn.classList.remove('recording');
+        if (progEl) progEl.style.width = '0%';
         if (vad && micActive) { try { vad.start(); } catch (_) {} }
-        updateVoiceLockUi();
+        if (onDone) onDone();
       }
+    }
+
+    async function enrollRecord() {
+      if (enrolling) return;
+      if (!serverSpeaker.available) { addBubble('err', t('voicelock.unavailable')); return; }
+      if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
+      await recordTimedTake({
+        seconds: ENROLL_SECONDS,
+        btn: enrollVoiceBtn, progEl: voiceLockProg,
+        labelEl: enrollVoiceLabel, labelKey: 'voicelock.recording',
+        startMsg: { type: 'speaker.enroll.start' },
+        commitMsg: () => ({ type: 'speaker.enroll.commit' }),
+        abortMsg: { type: 'speaker.enroll.abort' },
+        errKey: 'voicelock.error',
+        onDone: () => updateVoiceLockUi(),   // also resets the enroll label
+      });
     }
 
     if (enrollVoiceBtn) enrollVoiceBtn.addEventListener('click', enrollRecord);
@@ -4862,64 +4894,25 @@
     // Record a ~15s reference take and register it as a new cloned voice
     // (generous on purpose: the server trims edge fragments + dead air, so
     // extra room means cutting never starves the clone of material).
-    // Mirrors enrollRecord: it owns the binary channel (reuses the `enrolling`
-    // guard so the VAD/PTT senders stand down) and streams raw 16 kHz f32 PCM.
+    // Shares recordTimedTake with enrollRecord: it owns the binary channel
+    // (the `enrolling` guard makes the VAD/PTT senders stand down).
     async function cloneRecord() {
       if (enrolling) return;
       if (!serverVoiceClone.available) { addBubble('err', t('voices.unavailable')); return; }
       if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
       const name = prompt(t('voices.name_prompt'), '');
       if (name === null) return;                    // cancelled
-      enrolling = true;
-      recordVoiceBtn.disabled = true;
-      recordVoiceBtn.classList.add('recording');
-      if (inputStreaming) abortInputStream();
-      if (vad && micActive) { try { vad.pause(); } catch (_) {} }
-      let ctx = null, stream = null, tap = null, sink = null;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = ctx.createMediaStreamSource(stream);
-        tap = ctx.createScriptProcessor(2048, 1, 1);
-        ws.send(JSON.stringify({ type: 'voice.clone.start' }));
-        const target = 16000 * VOICE_CLONE_SECONDS;
-        const ds16k = makeDownsampler16k();
-        let sent = 0;
-        await new Promise((resolve, reject) => {
-          const deadline = setTimeout(
-            () => reject(new Error('recording timed out (no audio frames)')),
-            VOICE_CLONE_SECONDS * 1000 + 8000);
-          tap.onaudioprocess = (ev) => {
-            if (sent >= target) return;
-            const ds = ds16k(ev.inputBuffer.getChannelData(0), ctx.sampleRate);
-            try { ws.send(f32ToBytes(ds)); } catch (_) {}
-            sent += ds.length;
-            const pct = Math.min(100, Math.round((sent / target) * 100));
-            if (voiceRecProg) voiceRecProg.style.width = pct + '%';
-            recordVoiceLabel.textContent = t('voices.recording', { pct });
-            if (sent >= target) { clearTimeout(deadline); resolve(); }
-          };
-          src.connect(tap);
-          sink = ctx.createGain(); sink.gain.value = 0;
-          tap.connect(sink).connect(ctx.destination);
-        });
-        ws.send(JSON.stringify({ type: 'voice.clone.commit', name: (name || '').trim() }));
-        // Result comes back as 'voice.clone.ack' (+ a 'voice.state' broadcast).
-      } catch (e) {
-        try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'voice.clone.abort' })); } catch (_) {}
-        addBubble('err', t('voices.error', { err: (e && e.message) || e }));
-      } finally {
-        try { if (tap) tap.disconnect(); } catch (_) {}
-        try { if (sink) sink.disconnect(); } catch (_) {}
-        try { if (stream) stream.getTracks().forEach(tr => tr.stop()); } catch (_) {}
-        try { if (ctx) await ctx.close(); } catch (_) {}
-        enrolling = false;
-        recordVoiceBtn.disabled = false;
-        recordVoiceBtn.classList.remove('recording');
-        if (voiceRecProg) voiceRecProg.style.width = '0%';
-        recordVoiceLabel.textContent = t('voices.record');
-        if (vad && micActive) { try { vad.start(); } catch (_) {} }
-      }
+      await recordTimedTake({
+        seconds: VOICE_CLONE_SECONDS,
+        btn: recordVoiceBtn, progEl: voiceRecProg,
+        labelEl: recordVoiceLabel, labelKey: 'voices.recording',
+        startMsg: { type: 'voice.clone.start' },
+        commitMsg: () => ({ type: 'voice.clone.commit', name: (name || '').trim() }),
+        abortMsg: { type: 'voice.clone.abort' },
+        errKey: 'voices.error',
+        onDone: () => { recordVoiceLabel.textContent = t('voices.record'); },
+      });
+      // Result comes back as 'voice.clone.ack' (+ a 'voice.state' broadcast).
     }
 
     async function uploadVoiceFile(file, name, refText) {
@@ -5025,8 +5018,7 @@
 
       // Permanently running ScriptProcessor; collects into the ring buffer and
       // — when pttRecording — also into pttBuffers.
-      const node = pttCtx.createScriptProcessor(PTT_FRAME_SIZE, 1, 1);
-      node.onaudioprocess = (ev) => {
+      const chain = connectMutedTap(pttCtx, pttSource, PTT_FRAME_SIZE, (ev) => {
         const ch = ev.inputBuffer.getChannelData(0);
         const copy = new Float32Array(ch);
         // maintain the ring buffer (always)
@@ -5048,14 +5040,9 @@
             setTimeout(() => fin(), 0);
           }
         }
-      };
-      pttSource.connect(node);
-      // ScriptProcessor must connect to the destination, otherwise audioprocess does not fire.
-      // Gain 0 so you do not hear yourself.
-      const gain = pttCtx.createGain(); gain.gain.value = 0;
-      node.connect(gain).connect(pttCtx.destination);
-      pttGainSink = gain;
-      pttNode = node;
+      });
+      pttGainSink = chain.sink;
+      pttNode = chain.tap;
     }
 
     async function startPttRecording() {
@@ -5412,7 +5399,6 @@
     // For "mixed" we first check whether a voice bubble already exists
     // — if so, we discard the local pre-bubble instead of remapping.
     const pendingTextLocalTurnIds = [];
-    const _origHandle = handleMessage;
     // Migrates the pre-bubble's content (images!) into the target bubble if the
     // target bubble has no .images yet. Otherwise images are lost when
     // we simply discard the pre-bubble.
@@ -5454,25 +5440,24 @@
       }
     }
 
-    handleMessage = function(m) {
-      // Map pre-bubbles early — as soon as the server assigns a server turn id
-      // for the text send (arrives in turn.pending), we adopt the
-      // pre-bubble. Otherwise the turn.pending handler creates an EMPTY bubble
-      // under the server turn id, and turn.commit then wrongly thinks
-      // "voice bubble already there" → discards the pre-bubble with the image.
-      if (m && (m.type === 'turn.pending' || m.type === 'turn.commit')
-          && m.turnId && pendingTextLocalTurnIds.length) {
-        // turn.pending hat hasText/hasVoice; turn.commit hat source.
-        // We map for every case where the server turn CAN be driven by a text
-        // send — i.e. when turn.pending hasText=true OR
-        // turn.commit source in {text, mixed}.
-        const isTextDriven =
-          (m.type === 'turn.pending' && (m.hasText || (m.imageCount && m.imageCount > 0))) ||
-          (m.type === 'turn.commit' && (m.source === 'text' || m.source === 'mixed'));
-        if (isTextDriven) consumePreBubblesFor(m.turnId);
-      }
-      return _origHandle(m);
-    };
+    // Map pre-bubbles early — called at the TOP of the turn.pending /
+    // turn.commit handlers in MSG_HANDLERS (hoisted; the pre-bubble state
+    // lives here by the composer). As soon as the server assigns a server
+    // turn id for the text send (arrives in turn.pending), we adopt the
+    // pre-bubble. Otherwise the turn.pending handler creates an EMPTY bubble
+    // under the server turn id, and turn.commit then wrongly thinks
+    // "voice bubble already there" → discards the pre-bubble with the image.
+    function remapPreBubbles(m) {
+      if (!m || !m.turnId || !pendingTextLocalTurnIds.length) return;
+      // turn.pending hat hasText/hasVoice; turn.commit hat source.
+      // We map for every case where the server turn CAN be driven by a text
+      // send — i.e. when turn.pending hasText=true OR
+      // turn.commit source in {text, mixed}.
+      const isTextDriven =
+        (m.type === 'turn.pending' && (m.hasText || (m.imageCount && m.imageCount > 0))) ||
+        (m.type === 'turn.commit' && (m.source === 'text' || m.source === 'mixed'));
+      if (isTextDriven) consumePreBubblesFor(m.turnId);
+    }
 
     attachBtn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', () => {
@@ -5565,23 +5550,19 @@
       // Refresh the microphone dropdown so newly connected/disconnected devices appear.
       refreshMicList();
 
-      // --- 1) Switch playback output (AudioContext.setSinkId) ---
-      // setSinkId('') = system default output device.
-      if (playbackCtx && typeof playbackCtx.setSinkId === 'function') {
-        try { await playbackCtx.setSinkId(''); console.log('[device-switch] playbackCtx sink updated'); }
-        catch (e) { console.warn('[device-switch] playbackCtx.setSinkId failed:', e); }
-      }
-      if (cueCtx && typeof cueCtx.setSinkId === 'function') {
-        try { await cueCtx.setSinkId(''); } catch (_) {}
-      }
-
-      // --- 2) Switch <audio> elements (HTMLMediaElement.setSinkId) ---
-      if (currentAudioEl && typeof currentAudioEl.setSinkId === 'function') {
-        try { await currentAudioEl.setSinkId(''); } catch (_) {}
-      }
-      if (replayCtx && typeof replayCtx.setSinkId === 'function') {
-        try { await replayCtx.setSinkId(''); } catch (_) {}
-      }
+      // --- 1+2) Switch playback outputs: AudioContexts and <audio> elements.
+      // setSinkId('') = system default output device; silently skipped where
+      // unsupported (the AudioContext recreation below covers those).
+      const resetSink = async (target) => {
+        if (target && typeof target.setSinkId === 'function') {
+          try { await target.setSinkId(''); } catch (_) {}
+        }
+      };
+      await resetSink(playbackCtx);
+      await resetSink(cueCtx);
+      await resetSink(currentAudioEl);
+      await resetSink(replayCtx);
+      console.log('[device-switch] output sinks reset to default');
 
       // --- 3) Switch microphone input ---
       // For VAD mode: restart the pipeline (stopMic + startMic picks up new default mic).
