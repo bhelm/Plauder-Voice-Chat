@@ -74,6 +74,10 @@ auto-reload.
   out of `server.py` to separate process lifecycle from request handling.
 - **`images.py`** — self-contained `/upload` handler + `/uploads/...` → data-URL
   resolution for the multimodal LLM call (no runtime backend state).
+- **`voice_clone.py`** — voice library / cloning handlers: `/voice-upload`,
+  recorded-sample commit, hello capability block, active-voice lookup. Reads
+  `server.*` at call time (same pattern as `app.py`); the wrapper CRUD client
+  is `voices.py` (`VoiceLibrary`).
 - **`backends/{stt,tts,llm}/`** — each has a `base.py` abstract class with a
   `from_config()` factory dispatching on `STT_BACKEND`/`TTS_BACKEND`/`LLM_BACKEND`.
   **Heavy GPU deps (`faster_whisper`, `torch`, `omnivoice`) are imported only inside

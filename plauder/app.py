@@ -16,7 +16,7 @@ import time
 
 from aiohttp import web
 
-from . import server
+from . import server, voice_clone
 from .backends import LLMBackend, STTBackend, TTSBackend
 from .config import SAMPLE_RATE, Config, load_config
 from .images import UPLOAD_DIR, upload_image
@@ -48,7 +48,7 @@ def build_app() -> web.Application:
     app.router.add_get(p("/healthz"), server.healthz)
     app.router.add_get(p("/ws"), server.ws_handler)
     app.router.add_post(p("/upload"), upload_image)
-    app.router.add_post(p("/voice-upload"), server.upload_voice_sample)
+    app.router.add_post(p("/voice-upload"), voice_clone.upload_voice_sample)
     if server.STATIC_DIR.exists():
         app.router.add_static(p("/static/"), server.STATIC_DIR, show_index=False)
     app.router.add_static(p("/uploads/"), UPLOAD_DIR, show_index=False)

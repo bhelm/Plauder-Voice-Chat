@@ -1,5 +1,5 @@
 """Voice library: per-call TTS voice override, active-voice persistence, and the
-server-side clone helpers. All network-free (fake OpenAI client / fake library)."""
+server-side clone helpers (plauder.voice_clone). All network-free (fake OpenAI client / fake library)."""
 import asyncio
 import types
 from unittest.mock import MagicMock
@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from plauder import server as srv
+from plauder import voice_clone as vc
 from plauder.backends.tts.openai_api import OpenAITTSBackend
 from plauder.voices import DEFAULT_VOICE_ID, VoiceLibrary
 
@@ -87,28 +88,28 @@ class _FakeVoices:
 def test_clone_active_and_active_voice_id(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
-    assert srv._clone_active() is True
-    assert srv._active_voice_id() == "clone-1"
+    assert vc.clone_active() is True
+    assert vc.active_voice_id() == "clone-1"
 
 
 def test_clone_inactive_when_disabled(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices())
-    assert srv._clone_active() is False
-    assert srv._active_voice_id() is None
+    assert vc.clone_active() is False
+    assert vc.active_voice_id() is None
 
 
 def test_clone_inactive_when_no_library(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", None)
-    assert srv._clone_active() is False
-    assert srv._active_voice_id() is None
+    assert vc.clone_active() is False
+    assert vc.active_voice_id() is None
 
 
 def test_voice_clone_hello_available(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
-    hello = asyncio.run(srv._voice_clone_hello())
+    hello = asyncio.run(vc.voice_clone_hello())
     assert hello["available"] is True
     assert hello["active"] == "clone-1"
     assert {v["id"] for v in hello["voices"]} == {DEFAULT_VOICE_ID, "clone-1"}
@@ -117,7 +118,7 @@ def test_voice_clone_hello_available(monkeypatch):
 def test_voice_clone_hello_unavailable(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", None)
-    assert asyncio.run(srv._voice_clone_hello()) == {"available": False}
+    assert asyncio.run(vc.voice_clone_hello()) == {"available": False}
 
 
 # --- clone commit (recording → cleanup → STT → register) ----------------------
@@ -164,7 +165,7 @@ def test_clone_commit_trims_edge_fragment_before_stt(monkeypatch):
     stt, voices = _FakeSTT(), _FakeRegVoices()
     _wire(monkeypatch, stt=stt, voices=voices)
     buf = _f32([_tone(0.4), _sil(0.6), _tone(3.0), _sil(0.5)])  # half word at start
-    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    ack = asyncio.run(vc.clone_commit(buf, "Me"))
     assert ack["ok"] is True and ack["refText"] == "hallo welt"
     # STT saw the CLEANED buffer (fragment + gap removed), not the raw recording
     assert len(stt.buffers[0]) < len(buf)
@@ -176,7 +177,7 @@ def test_clone_commit_rejects_edge_only_speech(monkeypatch):
     voices = _FakeRegVoices()
     _wire(monkeypatch, voices=voices)
     buf = _f32([_tone(1.0), _sil(0.5), _tone(1.0)])  # speech touches both edges
-    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    ack = asyncio.run(vc.clone_commit(buf, "Me"))
     assert ack == {"ok": False, "error": "edge_speech"}
     assert voices.calls == []
 
@@ -185,12 +186,12 @@ def test_clone_commit_trim_disabled_passes_raw_buffer(monkeypatch):
     stt = _FakeSTT()
     _wire(monkeypatch, trim=False, stt=stt)
     buf = _f32([_tone(0.4), _sil(0.6), _tone(3.0), _sil(0.5)])
-    ack = asyncio.run(srv._clone_commit(buf, "Me"))
+    ack = asyncio.run(vc.clone_commit(buf, "Me"))
     assert ack["ok"] is True
     assert len(stt.buffers[0]) == len(buf)
 
 
 def test_clone_commit_too_short_raw(monkeypatch):
     _wire(monkeypatch)
-    ack = asyncio.run(srv._clone_commit(_f32([_sil(0.5)]), "Me"))
+    ack = asyncio.run(vc.clone_commit(_f32([_sil(0.5)]), "Me"))
     assert ack == {"ok": False, "error": "too_short"}
