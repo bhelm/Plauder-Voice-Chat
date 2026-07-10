@@ -286,7 +286,8 @@ def test_trim_overrun_cuts_at_breath_pause_inside_region():
     out, info = _trim([_sil(1.0), _tone(3.0), _sil(0.08), _tone(0.4)])
     assert out is not None
     assert info["dropped_tail"] and not info["dropped_head"]
-    assert abs(len(out) / 4 / _SR - 3.4) < 0.15   # 3 s speech + 2×200 ms pad
+    # head pad 200 ms + 3 s speech + tail pad clamped to ~60% of the 80 ms gap
+    assert abs(len(out) / 4 / _SR - 3.25) < 0.15
     assert abs(info["kept_s"] - 3.0) < 0.15
 
 
@@ -295,3 +296,21 @@ def test_trim_overrun_at_start_cuts_at_breath_pause():
     assert out is not None
     assert info["dropped_head"] and not info["dropped_tail"]
     assert abs(info["kept_s"] - 3.0) < 0.15
+
+
+def test_trim_pad_never_reaches_into_dropped_material():
+    # Loud fragment only 80 ms behind the kept speech: the tail pad must stop
+    # inside the gap, not pull the fragment's onset back into the reference.
+    out, info = _trim([_sil(1.0), _tone(3.0), _sil(0.08), _tone(0.4, amp=0.9)])
+    assert out is not None and info["dropped_tail"]
+    arr = np.frombuffer(out, dtype=np.float32)
+    # guard = 40% of the 80 ms gap (~32 ms) + 20 ms fade → the very end is calm
+    assert np.abs(arr[-int(_SR * 0.03):]).max() < 0.05, "no silence guard at the cut"
+    # and the loud fragment (amp 0.9) itself must be gone entirely
+    assert np.abs(arr[-int(_SR * 0.25):]).max() < 0.5, "cut-off fragment leaked into the tail pad"
+
+
+def test_trim_output_has_edge_fades():
+    out, _ = _trim([_sil(0.5), _tone(3.0), _sil(0.5)])
+    arr = np.frombuffer(out, dtype=np.float32)
+    assert abs(arr[0]) < 1e-4 and abs(arr[-1]) < 1e-4

@@ -339,10 +339,7 @@ function disconnectMutedTap(chain) {
 async function startMic(silent = false) {
   try {
     if (!silent) setMicUi('loading');
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: micConstraints(),
-      video: false,
-    });
+    micStream = await getMicStream();
     // Re-enumerate so device labels become visible after permission grant.
     refreshMicList();
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -586,7 +583,7 @@ async function recordTimedTake({ seconds, btn, progEl, labelEl, labelKey,
   if (vad && micActive) { try { vad.pause(); } catch (_) {} }
   let ctx = null, stream = null, chain = null;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
+    stream = await getMicStream();
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     const src = ctx.createMediaStreamSource(stream);
     ws.send(JSON.stringify(startMsg));
@@ -671,10 +668,7 @@ async function ensurePttCtx() {
   // so the ring buffer is pre-filled when the user presses the
   // key. Stream + context stay open during PTT mode.
   if (pttCtx && pttStream && pttSource && pttNode) return;
-  pttStream = await navigator.mediaDevices.getUserMedia({
-    audio: micConstraints(),
-    video: false,
-  });
+  pttStream = await getMicStream();
   // Re-enumerate so device labels become visible after permission grant.
   refreshMicList();
   pttCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });

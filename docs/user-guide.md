@@ -62,7 +62,8 @@ so there's visible feedback instead of a silent gap before the reply.
 
 | Control | Range / default | What it does |
 |---|---|---|
-| **Microphone** | System default | Pick the input device; the choice is remembered. |
+| **Microphone** | System default | Pick the input device; the choice is remembered. If a remembered device disappears (or Firefox rotates its device ids — grant the mic permission *permanently* to avoid that), capture falls back to the system default instead of failing. |
+| **🛡️ Echo guard** | on in Firefox, off elsewhere | Routes TTS playback through a local WebRTC loopback so the browser's echo cancellation removes the assistant's voice from the mic. Needed on Firefox with speakers — its echo canceller ignores raw Web-Audio output, so without this the assistant hears (and interrupts) itself. Chrome usually doesn't need it. |
 | **Speaking speed** | 0.7–3.0× (0.95×) | TTS playback rate. Sent to the server as `speed`, or applied locally if `TTS_OPENAI_LOCAL_SPEED=1`. |
 | **Volume** | 0–100 % (80 %) | TTS playback volume. |
 | **Cue volume** | 0–100 % (70 %, 0 = off) | Volume of the wake-word tones (rising "pling" on open, falling "plong" on close). Only sound in wake mode; releasing the slider previews the tone. |

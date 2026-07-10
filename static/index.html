@@ -250,6 +250,23 @@
               <option value="" data-i18n="settings.microphone_default">System default</option>
             </select>
           </div>
+
+          <!-- Echo guard: route TTS playback through a local WebRTC loopback so
+               the browser's echo cancellation subtracts it from the mic. Needed
+               on Firefox with speakers (its AEC ignores raw Web-Audio output);
+               default ON there, OFF elsewhere. -->
+          <div class="card">
+            <div class="vlock-toggle" data-i18n-title="settings.echo_guard_title">
+              <span data-i18n="settings.echo_guard">🛡️ Echo guard</span>
+              <label class="switch">
+                <input type="checkbox" id="echoGuard" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+            <div data-i18n="settings.echo_guard_help" style="font-size: 11px; color: var(--muted); margin-top: 8px;">
+              Keeps the mic from hearing the assistant (speakers, Firefox).
+            </div>
+          </div>
         </div>
       </details>
 
@@ -498,6 +515,25 @@
       return c;
     }
 
+    /* All mic capture goes through here. A persisted deviceId can go stale —
+       device unplugged, or Firefox, which rotates deviceIds every session
+       unless the mic permission is granted permanently — and `exact` then
+       fails with OverconstrainedError. Retry once on the system default
+       instead of killing the whole capture pipeline. (NotAllowedError is the
+       user saying no — retrying would just prompt again.) */
+    async function getMicStream() {
+      try {
+        return await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
+      } catch (e) {
+        if (!selectedMicId || (e && e.name === 'NotAllowedError')) throw e;
+        console.warn('[mic-select] saved mic unavailable (' + ((e && e.name) || e) + '), using default');
+        selectedMicId = '';
+        saveSetting('micDeviceId', '');
+        if (micSelect) micSelect.value = '';
+        return await navigator.mediaDevices.getUserMedia({ audio: micConstraints(), video: false });
+      }
+    }
+
     async function refreshMicList() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
       try {
@@ -517,10 +553,18 @@
           micSelect.value = prev;
         } else if (selectedMicId && Array.from(micSelect.options).some(o => o.value === selectedMicId)) {
           micSelect.value = selectedMicId;
-        } else {
+        } else if (mics.some(d => d.deviceId)) {
+          // Authoritative list (permission granted, real ids): the saved
+          // device is genuinely gone — reset to default.
           micSelect.value = '';
           selectedMicId = '';
           saveSetting('micDeviceId', '');
+        } else {
+          // Pre-permission enumeration: Firefox (and Chrome in some states)
+          // hides deviceIds until the mic permission is granted. Do NOT wipe
+          // the saved choice here — the list re-populates via refreshMicList()
+          // right after the first getUserMedia succeeds.
+          micSelect.value = '';
         }
       } catch (e) { console.warn('[mic-select] enumerateDevices failed:', e); }
     }
@@ -541,6 +585,13 @@
 
     // Initial enumeration (labels may be empty before permission grant).
     refreshMicList();
+
+    /* ===== Echo guard toggle (playback.js owns the routing) ===== */
+    const echoGuard = document.getElementById('echoGuard');
+    if (echoGuard) {
+      echoGuard.checked = echoLoopbackEnabled();
+      echoGuard.addEventListener('change', () => setEchoLoopback(echoGuard.checked));
+    }
 
     const vadThreshold      = document.getElementById('vadThreshold');
     const vadThresholdLabel = document.getElementById('vadThresholdLabel');
@@ -2733,6 +2784,9 @@
       await resetSink(cueCtx);
       await resetSink(currentAudioEl);
       await resetSink(replayCtx);
+      // Echo-guard loopback: the actual output is the loopback <audio>
+      // element, not the AudioContext — reset those sinks too.
+      for (const el of loopbackAudioEls()) await resetSink(el);
       console.log('[device-switch] output sinks reset to default');
 
       // --- 3) Switch microphone input ---
@@ -2764,6 +2818,10 @@
     speedLabel.textContent = parseFloat(speed.value).toFixed(2) + 'x';
     debounceLabel.textContent = (parseInt(debounce.value, 10) / 1000).toFixed(1) + 's';
     restoreTranscript();   // vorherige Sitzung anzeigen (Kontext lebt serverseitig weiter)
+    // Pre-warm the playback context: with the echo guard on, the WebRTC
+    // loopback negotiates now instead of eating the first ~200 ms of the
+    // very first reply. Suspended until real playback resumes it.
+    try { ensurePlaybackCtx(); } catch (_) {}
     connect();
     startReconnectWatchdog();   // safety net; backoff + visibility handle the rest
   </script>

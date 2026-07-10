@@ -175,35 +175,63 @@ def trim_clone_reference(raw_f32: bytes, sample_rate: int, *,
         return [r for r in runs if r[0] >= a and r[1] <= b]
 
     def _cut_head(a: int, b: int):
-        """Region touches the START: keep from the first internal pause on."""
+        """Region touches the START: keep from the first internal pause on.
+        Returns ``(kept_region, bound)`` — ``bound`` is where the dropped
+        material ends (in frames), so the pad can be clamped against it."""
         sub = _sub_runs(a, b)
         for i in range(1, len(sub)):
             if sub[i][0] - sub[i - 1][1] >= fine_fr:
-                return (sub[i][0], b)
+                return (sub[i][0], b), sub[i - 1][1]
         return None
 
     def _cut_tail(a: int, b: int):
-        """Region touches the END: keep up to the last internal pause."""
+        """Region touches the END: keep up to the last internal pause.
+        Returns ``(kept_region, bound)`` — ``bound`` is where the dropped
+        material starts (in frames)."""
         sub = _sub_runs(a, b)
         for i in range(len(sub) - 1, 0, -1):
             if sub[i][0] - sub[i - 1][1] >= fine_fr:
-                return (a, sub[i - 1][1])
+                return (a, sub[i - 1][1]), sub[i][0]
         return None
 
     def _speech_s(regs) -> float:
         return sum(b - a for a, b in regs) * frame / sample_rate
+
+    # Sample positions of removed material: the pad must NEVER reach back into
+    # it. A dropped fragment often sits only 60-120 ms from the kept speech —
+    # a naive 200 ms pad would pull the fragment's onset phoneme back into the
+    # reference as an unsubtitled "tzz" (the exact artifact this cleanup
+    # exists to remove).
+    lo_bound = 0                     # dropped-head material ends here
+    hi_bound = samples.shape[0]      # dropped-tail material starts here
 
     dur_s = samples.shape[0] / sample_rate
     edge_s = edge_ms / 1000.0
     if regions and regions[0][0] * frame / sample_rate <= edge_s:
         info["dropped_head"] = True
         # Whole-region drop unless that would gut the take (then cut inside).
-        kept = _cut_head(*regions[0]) if _speech_s(regions[1:]) < min_keep_s else None
-        regions = ([kept] if kept else []) + regions[1:]
+        if _speech_s(regions[1:]) >= min_keep_s:
+            lo_bound = regions[0][1] * frame
+            regions = regions[1:]
+        else:
+            cut = _cut_head(*regions[0])
+            if cut:
+                lo_bound = cut[1] * frame
+                regions = [cut[0]] + regions[1:]
+            else:
+                regions = regions[1:]
     if regions and regions[-1][1] * frame / sample_rate >= dur_s - edge_s:
         info["dropped_tail"] = True
-        kept = _cut_tail(*regions[-1]) if _speech_s(regions[:-1]) < min_keep_s else None
-        regions = regions[:-1] + ([kept] if kept else [])
+        if _speech_s(regions[:-1]) >= min_keep_s:
+            hi_bound = regions[-1][0] * frame
+            regions = regions[:-1]
+        else:
+            cut = _cut_tail(*regions[-1])
+            if cut:
+                hi_bound = cut[1] * frame
+                regions = regions[:-1] + [cut[0]]
+            else:
+                regions = regions[:-1]
     if not regions:
         info["reason"] = "edge_speech"
         return None, info
@@ -216,9 +244,24 @@ def trim_clone_reference(raw_f32: bytes, sample_rate: int, *,
     pad = int(sample_rate * pad_ms / 1000.0)
     a = max(0, regions[0][0] * frame - pad)
     b = min(samples.shape[0], regions[-1][1] * frame + pad)
+    # Clamp the pads at a cut: keep >=40% of the gap to the removed material
+    # as a silence guard.
+    if lo_bound > 0:
+        a = max(a, lo_bound + (regions[0][0] * frame - lo_bound) * 2 // 5)
+    if hi_bound < samples.shape[0]:
+        b = min(b, hi_bound - (hi_bound - regions[-1][1] * frame) * 2 // 5)
     info["head_cut_s"] = a / sample_rate
     info["tail_cut_s"] = (samples.shape[0] - b) / sample_rate
-    return samples[a:b].tobytes(), info
+    # 20 ms raised-cosine fades: cuts land in pauses, but a hard edge on
+    # residual low-level audio is still an audible click the model would
+    # faithfully clone.
+    out = samples[a:b].copy()
+    fade = max(1, int(sample_rate * 0.02))
+    if out.shape[0] >= 2 * fade:
+        ramp = ((1 - np.cos(np.linspace(0, np.pi, fade))) / 2).astype(np.float32)
+        out[:fade] *= ramp
+        out[-fade:] *= ramp[::-1]
+    return out.tobytes(), info
 
 
 def time_stretch(samples_f32, rate: float, sample_rate: int) -> np.ndarray:

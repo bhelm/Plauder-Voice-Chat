@@ -9,6 +9,128 @@ let currentAudioEl = null;
 let currentAudioId = null;
 let currentTurnId = null;
 
+/* ===== Echo guard: echo-cancellable output via WebRTC loopback =====
+   Browser AEC only subtracts audio it knows as "far end": <audio> elements
+   and WebRTC tracks. Our TTS is raw Web-Audio scheduling (BufferSources into
+   ctx.destination) — Firefox's AEC never sees it, so on speakers the mic
+   hears the assistant and the VAD barge-ins on its own reply. (Chrome mostly
+   gets away with it because its AEC references the whole tab output —
+   platform-dependent.) Fix: route the master gain through a local
+   RTCPeerConnection pair into an <audio> element; the reply then counts as
+   "call audio", which every browser's AEC cancels. Volume/duck/suspend logic
+   is untouched — it all acts on the gain node BEFORE this sink.
+   Preference: settings → "Echo guard"; default ON in Firefox, OFF elsewhere
+   (persisted as 'echoLoopback'). Resolved lazily — the settings helpers live
+   in index.html and don't exist yet when this file loads. */
+let _echoLoopbackPref = null;
+const _loopbackSinks = [];   // live sinks: { ctx, gain, label, sink }
+
+function echoLoopbackEnabled() {
+  if (_echoLoopbackPref === null) {
+    let saved = null;
+    try { saved = loadSavedSetting('echoLoopback'); } catch (_) {}
+    _echoLoopbackPref = saved === '1' ? true
+      : saved === '0' ? false
+      : /firefox/i.test(navigator.userAgent || '');
+  }
+  return _echoLoopbackPref;
+}
+
+function _closeLoopbackSink(sink) {
+  if (!sink) return;
+  sink.dead = true;
+  try { sink.audioEl.pause(); sink.audioEl.srcObject = null; } catch (_) {}
+  try { if (sink.pc1) sink.pc1.close(); } catch (_) {}
+  try { if (sink.pc2) sink.pc2.close(); } catch (_) {}
+}
+
+function _createLoopbackSink(ctx, gain, label) {
+  const sink = {
+    input: ctx.createMediaStreamDestination(),
+    audioEl: new Audio(),
+    pc1: null, pc2: null, ready: false, dead: false,
+    // On any failure: fall back to direct output so audio is never lost.
+    // (After fallback the dead sink may still be connected — harmless, its
+    // peer connection is closed and ontrack is gated on `dead`.)
+    fallback(reason) {
+      if (this.dead) return;
+      console.warn('[echo-guard] loopback unavailable (' + label + '): ' + reason
+                   + ' — direct output');
+      _closeLoopbackSink(this);
+      try { gain.connect(ctx.destination); } catch (_) {}
+    },
+  };
+  sink.audioEl.autoplay = true;
+  (async () => {
+    try {
+      const pc1 = sink.pc1 = new RTCPeerConnection();
+      const pc2 = sink.pc2 = new RTCPeerConnection();
+      pc1.onicecandidate = (e) => { if (e.candidate) pc2.addIceCandidate(e.candidate).catch(() => {}); };
+      pc2.onicecandidate = (e) => { if (e.candidate) pc1.addIceCandidate(e.candidate).catch(() => {}); };
+      pc2.ontrack = (ev) => {
+        if (sink.dead) return;
+        sink.audioEl.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+        // Autoplay may be blocked before the first user gesture; retried in
+        // _ensureLoopbackAlive() on every playback start.
+        sink.audioEl.play().catch(() => {});
+        sink.ready = true;
+        console.log('[echo-guard] loopback active (' + label + ')');
+      };
+      for (const tr of sink.input.stream.getAudioTracks()) pc1.addTrack(tr, sink.input.stream);
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      await pc1.setRemoteDescription(answer);
+    } catch (e) {
+      sink.fallback((e && e.message) || e);
+    }
+  })();
+  // Local negotiation normally completes in well under a second.
+  setTimeout(() => { if (!sink.ready) sink.fallback('negotiation timeout'); }, 3000);
+  return sink;
+}
+
+/* Wire `gain` to the context's real output — direct, or through the loopback
+   when the echo guard is on. Idempotent per (ctx, gain): re-routes live when
+   the setting changes. */
+function routeMasterOut(ctx, gain, label) {
+  let entry = _loopbackSinks.find((s) => s.ctx === ctx && s.gain === gain);
+  if (!entry) { entry = { ctx, gain, label, sink: null }; _loopbackSinks.push(entry); }
+  try { gain.disconnect(); } catch (_) {}
+  _closeLoopbackSink(entry.sink);
+  entry.sink = null;
+  const supported = typeof RTCPeerConnection === 'function'
+    && typeof ctx.createMediaStreamDestination === 'function';
+  if (echoLoopbackEnabled() && supported) {
+    entry.sink = _createLoopbackSink(ctx, gain, label);
+    gain.connect(entry.sink.input);
+  } else {
+    gain.connect(ctx.destination);
+  }
+}
+
+function _ensureLoopbackAlive() {
+  // Autoplay-blocked elements start once the user has interacted; playback
+  // starts are always user-adjacent, so retry here.
+  for (const e of _loopbackSinks) {
+    if (e.sink && !e.sink.dead && e.sink.audioEl.paused && e.sink.audioEl.srcObject) {
+      e.sink.audioEl.play().catch(() => {});
+    }
+  }
+}
+
+function setEchoLoopback(on) {
+  _echoLoopbackPref = !!on;
+  try { saveSetting('echoLoopback', on ? '1' : '0'); } catch (_) {}
+  for (const e of _loopbackSinks) routeMasterOut(e.ctx, e.gain, e.label);
+}
+
+function loopbackAudioEls() {
+  return _loopbackSinks.filter((e) => e.sink && !e.sink.dead).map((e) => e.sink.audioEl);
+}
+
 /* ===== Progressive PCM playback (A2, VCT2 chunks via Web Audio) =====
    Instead of a finished WAV file, raw PCM chunks arrive as soon as the
    server has them. We chain them gaplessly through a dedicated AudioContext
@@ -23,8 +145,9 @@ function ensurePlaybackCtx() {
   if (!playbackCtx) {
     playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
     playbackGain = playbackCtx.createGain();
-    playbackGain.connect(playbackCtx.destination);
+    routeMasterOut(playbackCtx, playbackGain, 'playback');
   }
+  _ensureLoopbackAlive();
   // Do NOT auto-resume if the user paused live playback via the
   // speaker button (otherwise incoming chunks would unintentionally
   // restart it).
@@ -355,8 +478,9 @@ function ensureReplayCtx() {
   if (!replayCtx) {
     replayCtx = new (window.AudioContext || window.webkitAudioContext)();
     replayGain = replayCtx.createGain();
-    replayGain.connect(replayCtx.destination);
+    routeMasterOut(replayCtx, replayGain, 'replay');
   }
+  _ensureLoopbackAlive();
   return replayCtx;
 }
 
