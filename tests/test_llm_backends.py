@@ -252,3 +252,66 @@ def test_openclaw_chat_stream_yields_deltas():
     assert "".join(deltas) == "Hallo Welt"
     assert b._session.calls[0]["json"]["stream"] is True
     assert b._session.calls[0]["json"]["user"] == "agent:antonia:openai-user:voice-user"
+
+
+# --------------------------------------------------------------------------- #
+# Per-turn hint injection (gateway drops client system messages)
+# --------------------------------------------------------------------------- #
+def _hint_backend(hint="[Hinweis]"):
+    b = OpenAICompatLLMBackend(api_key="k", base_url="http://x/v1", model="m")
+    b.turn_hint = hint
+    return b
+
+
+def test_turn_hint_appended_to_last_user_message():
+    b = _hint_backend()
+    history = [
+        {"role": "user", "content": "erste Frage"},
+        {"role": "assistant", "content": "Antwort"},
+        {"role": "user", "content": "zweite Frage"},
+    ]
+    out = b._inject_turn_hint(history)
+    assert out[-1]["content"] == "zweite Frage\n\n[Hinweis]"
+    assert out[0]["content"] == "erste Frage"  # only the LAST user turn
+    # caller's history must stay untouched (no accumulation across turns)
+    assert history[-1]["content"] == "zweite Frage"
+
+
+def test_turn_hint_multimodal_content_gets_text_part():
+    b = _hint_backend()
+    history = [{"role": "user", "content": [
+        {"type": "text", "text": "schau mal"},
+        {"type": "image_url", "image_url": {"url": "data:..."}},
+    ]}]
+    out = b._inject_turn_hint(history)
+    assert out[0]["content"][-1] == {"type": "text", "text": "[Hinweis]"}
+    assert len(history[0]["content"]) == 2  # original unchanged
+
+
+def test_turn_hint_empty_or_no_user_message_is_noop():
+    b = _hint_backend(hint="")
+    history = [{"role": "user", "content": "hi"}]
+    assert b._inject_turn_hint(history) is history
+    b2 = _hint_backend()
+    only_assistant = [{"role": "assistant", "content": "hi"}]
+    assert b2._inject_turn_hint(only_assistant) == only_assistant
+
+
+def test_turn_hint_lands_in_request_body():
+    b = _hint_backend()
+    _url, _headers, body = b._build_request(
+        [{"role": "user", "content": "hi"}], None, stream=False)
+    assert body["messages"][-1]["content"].endswith("[Hinweis]")
+
+
+def test_config_resolved_voice_turn_hint(monkeypatch):
+    from plauder.config import Config
+    cfg = Config.from_env()
+    # language default is non-empty and bracketed
+    assert cfg.resolved_voice_turn_hint().startswith("[")
+    # explicit override wins
+    object.__setattr__(cfg, "voice_turn_hint", "custom")
+    assert cfg.resolved_voice_turn_hint() == "custom"
+    # "-" disables
+    object.__setattr__(cfg, "voice_turn_hint", "-")
+    assert cfg.resolved_voice_turn_hint() == ""

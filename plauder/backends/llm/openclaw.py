@@ -50,7 +50,7 @@ class OpenClawLLMBackend(OpenAICompatLLMBackend):
 
     @classmethod
     def from_config(cls, cfg) -> "OpenClawLLMBackend":
-        return cls(
+        backend = cls(
             gateway_url=cfg.openclaw_gateway_url,
             token=cfg.openclaw_gateway_token,
             agent_id=cfg.openclaw_agent_id,
@@ -59,6 +59,10 @@ class OpenClawLLMBackend(OpenAICompatLLMBackend):
             timeout=cfg.llm_timeout,
             model=cfg.llm_model,
         )
+        # getattr: test doubles are duck-typed and may omit the method.
+        _hint = getattr(cfg, "resolved_voice_turn_hint", None)
+        backend.turn_hint = _hint() if callable(_hint) else ""
+        return backend
 
     async def load(self) -> None:
         if not self.token:

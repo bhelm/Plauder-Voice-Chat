@@ -31,18 +31,24 @@ class OpenAICompatLLMBackend(LLMBackend):
         self.timeout = timeout
         self.session_key = session_key
         self.session_id = session_id
+        # Per-turn voice rule line (set via from_config; see config.py).
+        self.turn_hint = ""
         self._session: ClientSession | None = None
         self.last_meta: dict = {}
 
     @classmethod
     def from_config(cls, cfg) -> "OpenAICompatLLMBackend":
-        return cls(
+        backend = cls(
             api_key=cfg.llm_api_key,
             base_url=cfg.llm_base_url,
             model=cfg.llm_model,
             max_tokens=cfg.llm_max_tokens,
             timeout=cfg.llm_timeout,
         )
+        # getattr: test doubles are duck-typed and may omit the method.
+        _hint = getattr(cfg, "resolved_voice_turn_hint", None)
+        backend.turn_hint = _hint() if callable(_hint) else ""
+        return backend
 
     async def load(self) -> None:
         if not self.api_key:
@@ -86,12 +92,38 @@ class OpenAICompatLLMBackend(LLMBackend):
         usage in the stream; subclasses (OpenClaw) inject a ``user`` instead."""
         return {"stream_options": {"include_usage": True}} if stream else {}
 
+    def _inject_turn_hint(self, messages: list[dict]) -> list[dict]:
+        """Append ``self.turn_hint`` to the LAST user message.
+
+        The Hermes gateway rebuilds its own system prompt and drops client
+        system messages, so voice-mode rules only reach the model inside a
+        user turn (which also gives them recency). Copies the affected
+        message — the caller's history is never mutated, so hints cannot
+        accumulate across turns.
+        """
+        hint = getattr(self, "turn_hint", "") or ""
+        if not hint:
+            return messages
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") != "user":
+                continue
+            msg = dict(messages[i])
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = f"{content}\n\n{hint}"
+            elif isinstance(content, list):
+                msg["content"] = list(content) + [{"type": "text", "text": hint}]
+            else:
+                return messages
+            return messages[:i] + [msg] + messages[i + 1:]
+        return messages
+
     def _build_request(self, messages: list[dict], system_hint: str | None,
                        *, stream: bool) -> tuple[str, dict, dict]:
         full_messages: list[dict] = []
         if system_hint:
             full_messages.append({"role": "system", "content": system_hint})
-        full_messages.extend(messages)
+        full_messages.extend(self._inject_turn_hint(messages))
         headers = {
             "Authorization": f"Bearer {self._auth_token}",
             "Content-Type": "application/json",

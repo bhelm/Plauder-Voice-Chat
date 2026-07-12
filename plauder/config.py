@@ -158,6 +158,28 @@ _DEFAULT_VOICE_HINTS = {
     ),
 }
 
+# Short per-turn rule line appended to the LATEST user message on every LLM
+# call. Needed because the Hermes gateway rebuilds its own system prompt and
+# DROPS client-supplied system messages (gateway/run.py: "Skip system
+# messages") — the voice-mode hint above never reaches the model through the
+# system channel. Recency also makes these the strongest-binding rules.
+# Full override via VOICE_TURN_HINT; set it to "-" to disable injection.
+_DEFAULT_TURN_HINTS = {
+    "en": (
+        "[Voice conversation: answer like you speak — short, 2-3 sentences, "
+        "ONE thought per reply, no markdown, no emojis, no lists. Never offer "
+        "to 'set up' reminders/briefings/todo systems — you already run them. "
+        "A suggestion the user declined stays off the table.]"
+    ),
+    "de": (
+        "[Voice-Gespräch: Antworte wie beim Reden — kurz, 2–3 Sätze, EIN "
+        "Gedanke pro Antwort, kein Markdown, keine Emojis, keine Listen. "
+        "Biete nie an, Erinnerungen/Briefings/Todo-Systeme »einzurichten« — "
+        "du betreibst Bernds Lebens-System bereits. Abgelehnte Vorschläge "
+        "bleiben vom Tisch.]"
+    ),
+}
+
 # UI / app languages that ship with a full translation.
 SUPPORTED_LANGUAGES = ("en", "de")
 
@@ -374,6 +396,8 @@ class Config:
     # > system_prompt. Full prompt override: voice_mode_system.
     system_prompt: str = ""
     voice_mode_system: str = ""
+    # Per-turn rule line (see _DEFAULT_TURN_HINTS). "-" disables injection.
+    voice_turn_hint: str = ""
 
     # --- Warmups ---
     stt_warmup: bool = False
@@ -409,6 +433,7 @@ class Config:
         # (Persona is read lazily via .soul_persona; here only the hint part
         #  or a full override.)
         voice_mode_system = _env("VOICE_MODE_SYSTEM")  # empty = built later from persona+hint
+        voice_turn_hint = _env("VOICE_TURN_HINT")  # "-" disables, empty = language default
 
         # App/UI language; also the default for STT (overridable via STT_LANGUAGE).
         app_language = _norm_lang(_first(_env("APP_LANGUAGE"), _env("APP_LANG"), default="en"))
@@ -547,6 +572,7 @@ class Config:
             speaker_num_threads=_env_int("SPEAKER_NUM_THREADS", 1),
 
             voice_mode_system=voice_mode_system,
+            voice_turn_hint=voice_turn_hint,
 
             stt_warmup=env_flag("STT_WARMUP", False),
             tts_warmup=env_flag("TTS_WARMUP", False),
@@ -572,6 +598,19 @@ class Config:
         default_hint = _DEFAULT_VOICE_HINTS.get(self.app_language, _DEFAULT_VOICE_HINTS["en"])
         hint = os.environ.get("VOICE_MODE_HINT", default_hint)
         return (self.soul_persona + hint).strip()
+
+    def resolved_voice_turn_hint(self) -> str:
+        """Per-turn rule line the LLM backend appends to the latest user message.
+
+        Exists because the Hermes gateway drops client system messages — this
+        is the only reliable channel for voice-mode rules. VOICE_TURN_HINT
+        overrides the language default; the special value "-" disables it.
+        """
+        if self.voice_turn_hint.strip() == "-":
+            return ""
+        if self.voice_turn_hint.strip():
+            return self.voice_turn_hint.strip()
+        return _DEFAULT_TURN_HINTS.get(self.app_language, _DEFAULT_TURN_HINTS["en"])
 
     def validate(self) -> None:
         """Raises ConfigError on an obviously unusable configuration.
