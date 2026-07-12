@@ -102,6 +102,16 @@ auto-reload.
   **Heavy GPU deps (`faster_whisper`, `torch`, `omnivoice`) are imported only inside
   `load()` of their backend** — never at module level. The cloud default never
   loads GPU code. Keep this invariant when touching backends.
+  The `hermes_gateway` LLM backend is special: a **persistent WebSocket** to the
+  Hermes gateway's `voice_chat` platform adapter (plugin source lives in
+  `hermes_plugin/` in this repo, symlink-installed into
+  `~/.hermes/plugins/platforms/`). It sends only the LAST user message (the
+  gateway keeps the history) and receives **unsolicited pushes** (background
+  task results, cron) which `server.handle_gateway_push` speaks through the
+  streaming machinery in push mode (`_StreamingReply(push=True)` — like echo,
+  but the bubble is a regular reply marked `push`). Wire protocol + setup:
+  `hermes_plugin/README.md`; cross-side protocol tests:
+  `tests/test_hermes_bridge.py`, push tests: `tests/test_server_push.py`.
 - **`session.py`** (`ConversationManager`) holds conversation history per
   `user_key`; LLM backends are stateless (receive the full message list).
 - **`turn_state.py`** (`TurnState`) — per-connection debounce/coalescing state.

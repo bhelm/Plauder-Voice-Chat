@@ -201,7 +201,7 @@ def _norm_base_path(value: str) -> str:
 
 VALID_STT_BACKENDS = ("openai", "whisper_local")
 VALID_TTS_BACKENDS = ("openai", "omnivoice_local")
-VALID_LLM_BACKENDS = ("openai_compat", "openclaw")
+VALID_LLM_BACKENDS = ("openai_compat", "openclaw", "hermes_gateway")
 
 
 class ConfigError(RuntimeError):
@@ -301,6 +301,13 @@ class Config:
     # Stable session key for the voice chat's own Hermes session (server-side
     # memory/history via X-Hermes-Session-Id). Empty = no Hermes binding.
     hermes_session_key_separate: str = ""
+
+    # --- LLM: hermes_gateway (persistent WS to the voice_chat platform
+    # adapter — see hermes_plugin/). Token must equal the gateway's
+    # VOICE_CHAT_BRIDGE_TOKEN. ---
+    hermes_gateway_ws_url: str = "ws://127.0.0.1:8321/ws"
+    hermes_gateway_token: str = ""
+    hermes_gateway_chat_id: str = "default"
 
     # --- LLM: OpenClaw (legacy) ---
     openclaw_gateway_url: str = "http://localhost:8080"
@@ -521,6 +528,14 @@ class Config:
             # Hermes memory binding
             hermes_session_key_separate=_env("HERMES_SESSION_KEY_SEPARATE"),
 
+            # LLM hermes_gateway (persistent WS to the gateway's voice_chat
+            # platform adapter)
+            hermes_gateway_ws_url=_first(_env("HERMES_GATEWAY_WS_URL"),
+                                         default="ws://127.0.0.1:8321/ws"),
+            hermes_gateway_token=_env("HERMES_GATEWAY_TOKEN"),
+            hermes_gateway_chat_id=_first(_env("HERMES_GATEWAY_CHAT_ID"),
+                                          default="default"),
+
             # LLM openclaw (legacy)
             openclaw_gateway_url=_first(_env("OPENCLAW_GATEWAY_URL"),
                                         default="http://localhost:8080").rstrip("/"),
@@ -644,6 +659,10 @@ class Config:
         if self.llm_backend == "openclaw" and not self.openclaw_gateway_token:
             raise ConfigError(
                 "LLM_BACKEND=openclaw, but no OPENCLAW_GATEWAY_TOKEN set.")
+        if self.llm_backend == "hermes_gateway" and not self.hermes_gateway_token:
+            raise ConfigError(
+                "LLM_BACKEND=hermes_gateway, but no HERMES_GATEWAY_TOKEN set "
+                "(shared bridge secret = the gateway's VOICE_CHAT_BRIDGE_TOKEN).")
         if self.tts_backend == "omnivoice_local" and self.omnivoice_mode == "clone" \
                 and not self.omnivoice_ref_audio:
             raise ConfigError(

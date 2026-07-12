@@ -50,5 +50,8 @@ class LLMBackend(abc.ABC):
         if name == "openclaw":
             from .openclaw import OpenClawLLMBackend
             return OpenClawLLMBackend.from_config(cfg)
+        if name == "hermes_gateway":
+            from .hermes_gateway import HermesGatewayLLMBackend
+            return HermesGatewayLLMBackend.from_config(cfg)
         from ..base import BackendError
         raise BackendError(f"Unknown LLM_BACKEND: {name!r}")

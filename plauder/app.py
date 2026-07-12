@@ -138,6 +138,12 @@ async def main():
 
     server.configure(cfg, stt=stt, tts=tts, conv=conv, bridge=bridge, speaker=speaker,
                      voices=voices)
+    # hermes_gateway backend: route unsolicited gateway pushes (background
+    # task results, cron deliveries) into the speak-a-push machinery.
+    push_hook = getattr(conv.llm, "set_push_handler", None)
+    if callable(push_hook):
+        push_hook(server.handle_gateway_push)
+        LOG.info("🔗 Gateway push delivery wired (%s)", cfg.llm_backend)
     if voices is not None:
         LOG.info("🗣️  Voice library active (active voice=%s)", voices.get_active())
     if speaker is not None:

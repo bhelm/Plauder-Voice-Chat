@@ -167,8 +167,9 @@ Full nginx example in [INSTALL §7](INSTALL.md#7-reverse-proxy--sub-path).
       ├──────────────┤     ├──────────────┤     ├──────────────┤
       │ openai       │     │ openai_compat│     │ openai       │   ← cloud
       │ whisper_local│     │ openclaw     │     │ omnivoice_   │   ← local/GPU
-      │ (faster-     │     │ (gateway)    │     │  local       │     (lazy)
-      │  whisper)    │     │              │     │ (omnivoice)  │
+      │ (faster-     │     │ (legacy gw)  │     │  local       │     (lazy)
+      │  whisper)    │     │ hermes_gate- │     │ (omnivoice)  │
+      │              │     │  way (WS)    │     │              │
       └──────────────┘     └──────────────┘     └──────────────┘
         STT_BACKEND          LLM_BACKEND          TTS_BACKEND
 ```
@@ -344,7 +345,14 @@ local dependency yields a clear message from `load()` instead of an import error
 |---|---|---|
 | `STT_BACKEND` | `openai` · `whisper_local` | `openai` |
 | `TTS_BACKEND` | `openai` · `omnivoice_local` | `openai` |
-| `LLM_BACKEND` | `openai_compat` · `openclaw` | `openai_compat` |
+| `LLM_BACKEND` | `openai_compat` · `openclaw` · `hermes_gateway` | `openai_compat` |
+
+`hermes_gateway` replaces the stateless HTTP call with a persistent WebSocket
+to the Hermes gateway's `voice_chat` platform adapter (`hermes_plugin/` in this
+repo): the gateway keeps the session history, sets the voice-mode prompt per
+turn, and can **push** messages into the voice chat at any time (background
+task results, cron deliveries) — plauder speaks them via the normal TTS path.
+Setup: `hermes_plugin/README.md`.
 
 ### Local / GPU
 
@@ -403,7 +411,7 @@ plauder/
 └── backends/
     ├── stt/{base,openai_api,whisper_local}.py
     ├── tts/{base,openai_api,omnivoice_local}.py
-    └── llm/{base,openai_compat,openclaw}.py
+    └── llm/{base,openai_compat,openclaw,hermes_gateway}.py
 server.py                  # entrypoint shim → plauder.server.run()
 static/index.html          # complete browser client (audio, WS, UI)
 ```

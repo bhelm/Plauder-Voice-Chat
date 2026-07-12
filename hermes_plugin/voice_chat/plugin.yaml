@@ -1,0 +1,29 @@
+name: voice_chat
+version: "0.1.0"
+kind: platform
+description: >
+  Browser voice chat (plauder) as a native gateway platform. Runs a
+  localhost WebSocket bridge the voice-chat server connects to; inbound
+  transcripts become full agent turns, and the persistent link enables
+  asynchronous push delivery (delegate_task background results, cron,
+  terminal notify_on_complete) into the voice chat. Text only — STT/TTS
+  stay in plauder.
+requires_env:
+  - name: VOICE_CHAT_BRIDGE_TOKEN
+    description: Shared secret the plauder client must present on the bridge WebSocket
+    password: true
+optional_env:
+  - name: VOICE_CHAT_WS_HOST
+    description: Bridge bind host (default 127.0.0.1)
+  - name: VOICE_CHAT_WS_PORT
+    description: Bridge bind port (default 8321)
+  - name: VOICE_CHAT_USER_ID
+    description: User id for the voice session (default "bernd")
+  - name: VOICE_CHAT_HOME_CHANNEL
+    description: chat_id for bare deliver=voice_chat cron targets (default "default")
+  - name: VOICE_CHAT_CHANNEL_PROMPT
+    description: Override the per-turn voice-mode prompt ("-" disables)
+  - name: VOICE_CHAT_ALLOWED_USERS
+    description: Comma-separated allowlist of user ids
+  - name: VOICE_CHAT_ALLOW_ALL_USERS
+    description: true to skip the user allowlist

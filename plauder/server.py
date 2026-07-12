@@ -610,7 +610,7 @@ class _StreamingReply:
     """
 
     def __init__(self, ws, state: TurnState, turn_id, reply_id, *,
-                 combined, resolved_imgs, echo=False):
+                 combined, resolved_imgs, echo=False, push=False):
         self.ws = ws
         self.state = state
         self.turn_id = turn_id
@@ -620,6 +620,10 @@ class _StreamingReply:
         # Echo mode: the "LLM stream" is the user's own text (no CONV involved),
         # and the finished reply is not mirrored to peers/Telegram.
         self.echo = echo
+        # Push mode (hermes_gateway backend): like echo the "stream" is fixed
+        # text with no CONV call, but the bubble is a regular agent reply
+        # (marked push, not 🔁). Delivered per connection → no peer mirror.
+        self.push = push
 
         self.pron = CFG.pronunciations_file if CFG else None
         # Cloned voice for this whole reply, resolved once (None = backend default).
@@ -834,7 +838,7 @@ class _StreamingReply:
         yield self.combined
 
     async def _consume_stream(self):
-        if self.echo:
+        if self.echo or self.push:
             agen = self._echo_stream()
         else:
             # Re-apply THIS connection's Hermes session id right before the call:
@@ -918,8 +922,8 @@ class _StreamingReply:
                 self.held.append(self.pending.strip())
             full_reply = "".join(self.parts).strip()
             llm_ms = int((time.time() - self.t_llm) * 1000)
-            # Echo turns never touched CONV — its meta is stale (previous turn).
-            meta = ({} if self.echo
+            # Echo/push turns never touched CONV — its meta is stale (previous turn).
+            meta = ({} if (self.echo or self.push)
                     else dict(getattr(CONV, "last_stream_meta", {}) or {}))
 
             if sanitizer.is_no_reply(full_reply):
@@ -946,12 +950,14 @@ class _StreamingReply:
                 "streamed": True, "ts": time.time()}
             if self.echo:
                 reply_evt["echo"] = True
+            if self.push:
+                reply_evt["push"] = True
             await ws.send_json(reply_evt)
-            if not self.echo:
+            if not (self.echo or self.push):
                 _broadcast_peers_bg(ws, {"type": "chat.remote", "role": "assistant",
                                          "text": full_reply, "ts": time.time()})
 
-            if BRIDGE and BRIDGE.enabled and cleaned_full and not self.echo:
+            if BRIDGE and BRIDGE.enabled and cleaned_full and not (self.echo or self.push):
                 BRIDGE.remember_self_sent(full_reply)
                 asyncio.create_task(BRIDGE.send(f"❤️ {CFG.agent_name}: {cleaned_full}", echo_text=full_reply))
 
@@ -973,10 +979,79 @@ class _StreamingReply:
 
 
 async def _stream_reply_and_tts(ws, state: TurnState, turn_id, reply_id, *,
-                                combined, resolved_imgs, echo=False):
+                                combined, resolved_imgs, echo=False, push=False):
     """Streaming turn (A1+A2) — see _StreamingReply."""
     await _StreamingReply(ws, state, turn_id, reply_id, combined=combined,
-                          resolved_imgs=resolved_imgs, echo=echo).run()
+                          resolved_imgs=resolved_imgs, echo=echo, push=push).run()
+
+
+# ============================================================================ #
+# Gateway pushes (hermes_gateway backend): unsolicited agent messages —
+# background task results, cron deliveries — arriving OUTSIDE a voice turn.
+# They are spoken like a normal reply (streaming TTS machinery in push mode).
+# ============================================================================ #
+# Pushes that arrived while no browser was connected; spoken on next connect.
+_PENDING_PUSHES: deque = deque(maxlen=20)
+# A push never talks over a running reply: wait this long for the in-flight
+# turn to finish, then speak anyway.
+PUSH_WAIT_TURN_S = 180.0
+
+
+async def handle_gateway_push(text: str) -> None:
+    """Entry point wired to the hermes_gateway backend's push handler
+    (see app.init_backends). Must never raise."""
+    text = (text or "").strip()
+    if not text:
+        return
+    if not WS_CLIENTS:
+        _PENDING_PUSHES.append(text)
+        LOG.info("gateway push queued (no client connected): %r", text[:80])
+        return
+    for ws, state in list(WS_CLIENTS.items()):
+        _spawn_tracked(state, _push_to_client(ws, state, text))
+
+
+def _flush_pending_pushes(ws, state: TurnState) -> None:
+    """Speak pushes that queued up while no browser was connected. Only the
+    first connection drains the queue (peers mirror nothing here — each push
+    is a one-off delivery, not shared session state)."""
+    while _PENDING_PUSHES:
+        _spawn_tracked(state, _push_to_client(ws, state, _PENDING_PUSHES.popleft()))
+
+
+async def _push_to_client(ws, state: TurnState, text: str) -> None:
+    # Let a running turn finish first (bounded — a wedged turn must not
+    # silence pushes forever).
+    deadline = time.time() + PUSH_WAIT_TURN_S
+    while time.time() < deadline:
+        task = state.agent_task
+        if task is None or task.done():
+            break
+        await asyncio.sleep(0.25)
+
+    turn_id = f"push-{_short_id()}"
+    reply_id = f"reply-{turn_id}"
+    # Claim the agent_task slot while idle so an owner barge-in
+    # (_cancel_in_flight) stops push playback like any reply.
+    me = asyncio.current_task()
+    claimed = False
+    if state.agent_task is None or state.agent_task.done():
+        state.agent_task = me
+        claimed = True
+    try:
+        LOG.info("turn=%s gateway push: %r", turn_id, text[:120])
+        await ws.send_json({"type": "reply.start", "turnId": turn_id,
+                            "replyId": reply_id, "push": True, "ts": time.time()})
+        await _stream_reply_and_tts(ws, state, turn_id, reply_id,
+                                    combined=text, resolved_imgs=[], push=True)
+    except asyncio.CancelledError:
+        LOG.info("turn=%s gateway push cancelled (barge-in/close)", turn_id)
+        raise
+    except Exception:
+        LOG.exception("turn=%s gateway push failed", turn_id)
+    finally:
+        if claimed and state.agent_task is me:
+            state.agent_task = None
 
 
 def _resume_debounce(ws, state: TurnState) -> None:
@@ -2262,6 +2337,11 @@ async def _load_history(ws, state: TurnState, peer) -> None:
     — a real, authenticated HTTP call per connect for nothing."""
     if not (CFG and CONV is not None and CFG.hermes_session_key_separate):
         return
+    if CFG.llm_backend == "hermes_gateway":
+        # The gateway keeps the session history itself (SessionDB); the
+        # /api/sessions fetch targets the legacy API-server session and
+        # would seed stale, unrelated context.
+        return
     try:
         history = await fetch_history(
             base_url=CFG.llm_base_url,
@@ -2305,6 +2385,8 @@ async def ws_handler(request):
 
     await _send_hello(ws, state)
     await _load_history(ws, state, peer)
+    # Speak gateway pushes that queued up while no browser was connected.
+    _flush_pending_pushes(ws, state)
 
     try:
         async for msg in ws:
