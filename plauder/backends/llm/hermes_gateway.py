@@ -145,7 +145,9 @@ class HermesGatewayLLMBackend(LLMBackend):
         while not self._closed:
             ws = None
             try:
-                ws = await self._session.ws_connect(self.url, heartbeat=20)
+                ws = await self._session.ws_connect(
+                    self.url, heartbeat=20,
+                    max_msg_size=32 * 1024 * 1024)
                 await ws.send_json({
                     "type": "hello", "token": self.token,
                     "chat_id": self.chat_id, "client": "plauder",
@@ -193,26 +195,30 @@ class HermesGatewayLLMBackend(LLMBackend):
 
     def _handle_frame(self, frame: dict) -> None:
         ftype = frame.get("type")
-        if ftype == "agent.message":
+        if ftype in ("agent.message", "agent.partial"):
             turn_id = frame.get("turn_id")
             text = str(frame.get("text") or "")
             queue = self._turns.get(turn_id) if turn_id else None
             if queue is not None:
-                queue.put_nowait(("text", text))
-            elif text.strip():
+                kind = "msg" if ftype == "agent.message" else "partial"
+                queue.put_nowait((kind, frame.get("message_id"), text))
+            elif text.strip() and (ftype == "agent.message"
+                                   or frame.get("finalize")):
                 # No (live) turn for it -> asynchronous push. Also catches
                 # replies to turns the client gave up on (timeout/restart):
-                # better spoken late than silently dropped.
+                # better spoken late than silently dropped. Mid-stream
+                # partials without a turn are worthless and skipped.
                 self._dispatch_push(text)
         elif ftype == "turn.done":
             queue = self._turns.get(frame.get("turn_id"))
             if queue is not None:
-                queue.put_nowait(("done", str(frame.get("status") or "ok")))
+                queue.put_nowait(("done", None,
+                                  str(frame.get("status") or "ok")))
         # Unknown frame types: ignored (forward compatibility).
 
     def _fail_pending(self, reason: str) -> None:
         for queue in self._turns.values():
-            queue.put_nowait(("error", reason))
+            queue.put_nowait(("error", None, reason))
 
     # ------------------------------------------------------------------ #
     # Chat interface
@@ -278,25 +284,50 @@ class HermesGatewayLLMBackend(LLMBackend):
                 raise RuntimeError("hermes_gateway: bridge not connected")
             await ws.send_json(frame)
 
-            first = True
+            # Per-message accumulation: agent.message opens a message,
+            # agent.partial replaces its content (grow-only while streaming).
+            # Only the SUFFIX beyond what was already yielded is emitted, so
+            # progressive edits stream into the TTS without double-speaking.
+            seen: dict[str, str] = {}   # message_id -> text accounted for
+            yielded_any = False
+            anon = 0
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise UpstreamTimeoutError(
                         f"hermes_gateway: no reply within {self.timeout}s")
                 try:
-                    kind, payload = await asyncio.wait_for(queue.get(),
-                                                           timeout=remaining)
+                    kind, mid, payload = await asyncio.wait_for(
+                        queue.get(), timeout=remaining)
                 except asyncio.TimeoutError:
                     raise UpstreamTimeoutError(
                         f"hermes_gateway: no reply within {self.timeout}s"
                     ) from None
-                if kind == "text":
-                    if payload:
-                        # Multiple messages in one turn (split delivery) are
-                        # read as separate paragraphs.
-                        yield payload if first else "\n\n" + payload
-                        first = False
+                if kind in ("msg", "partial"):
+                    if mid is None:
+                        anon += 1
+                        mid = f"anon-{anon}"
+                    prev = seen.get(mid)
+                    if prev is None:                      # new message
+                        seen[mid] = payload
+                        if payload:
+                            # Later messages of the same turn (split
+                            # delivery, segment breaks) are read as
+                            # separate paragraphs.
+                            yield ("\n\n" + payload) if yielded_any else payload
+                            yielded_any = True
+                    elif payload == prev:
+                        continue
+                    elif payload.startswith(prev):        # grew — yield suffix
+                        seen[mid] = payload
+                        delta = payload[len(prev):]
+                        if delta:
+                            yield delta
+                            yielded_any = True
+                    else:
+                        # Reformatted finalize (e.g. markdown cleanup): the
+                        # content was already spoken — record, don't repeat.
+                        seen[mid] = payload
                 elif kind == "done":
                     break
                 else:

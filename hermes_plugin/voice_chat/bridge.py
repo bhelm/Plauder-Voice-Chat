@@ -13,14 +13,19 @@ Wire protocol (JSON text frames, both sides ignore unknown types):
     {"type": "hello", "token": "...", "chat_id": "default",
      "client": "plauder", "proto": 1}
     {"type": "user.message", "turn_id": "ab12cd", "text": "...",
-     "modality": "voice"|"text", "image_urls": ["..."]}
+     "modality": "voice"|"text", "image_urls": ["data:image/...;base64,…"]}
 
   gateway -> plauder:
     {"type": "hello.ok", "proto": 1, "platform": "voice_chat"}
     {"type": "agent.message", "text": "...", "turn_id": "ab12cd"|null,
      "push": bool, "message_id": "..."}
-        turn_id set   -> reply belonging to that user.message turn
+        turn_id set   -> a NEW message belonging to that turn (initial
+                         streaming chunk or a complete reply)
         turn_id null  -> unsolicited push (speak it)
+    {"type": "agent.partial", "turn_id": "ab12cd", "message_id": "...",
+     "text": "<full accumulated text>", "finalize": bool}
+        progressive token streaming: text REPLACES the message's content
+        (grow-only while streaming; a finalize may reformat)
     {"type": "turn.done", "turn_id": "ab12cd", "status": "ok"|...}
 
 This module is deliberately free of ``gateway.*`` imports so the voice-chat
@@ -35,6 +40,7 @@ import collections
 import hmac
 import json
 import logging
+import uuid
 from typing import Awaitable, Callable, Deque, Dict, Optional
 
 from aiohttp import WSMsgType, web
@@ -47,6 +53,8 @@ HELLO_TIMEOUT_S = 10.0
 CLOSE_UNAUTHORIZED = 4401
 #: Per-chat cap of frames queued while the voice client is disconnected.
 QUEUE_MAX = 50
+#: Frame size cap — user.message frames may carry base64 data-URL images.
+MAX_MSG_BYTES = 32 * 1024 * 1024
 
 
 class VoiceBridgeServer:
@@ -76,9 +84,10 @@ class VoiceBridgeServer:
         async def _health(_request):
             return web.Response(text="ok")
 
-        app = web.Application()
+        app = web.Application(client_max_size=1024 * 1024)
         app.router.add_get("/ws", self._ws_handler)
         app.router.add_get("/health", _health)
+        app.router.add_post("/push", self._push_handler)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port,
@@ -140,11 +149,34 @@ class VoiceBridgeServer:
                 q.appendleft(frame)   # connection died again — keep it
                 return
 
+    async def _push_handler(self, request: web.Request) -> web.Response:
+        """Out-of-process push entry (``hermes send``, standalone cron):
+        token-authenticated HTTP POST -> agent.message push frame to the
+        voice client (queued when it is offline)."""
+        token = request.headers.get("X-Bridge-Token", "")
+        if not self.token or not hmac.compare_digest(token, self.token):
+            return web.json_response({"error": "bad token"}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON"}, status=400)
+        text = str((body or {}).get("text") or "").strip()
+        if not text:
+            return web.json_response({"error": "text required"}, status=400)
+        chat_id = str((body or {}).get("chat_id") or "default")
+        frame = {"type": "agent.message", "text": text, "turn_id": None,
+                 "push": True, "message_id": uuid.uuid4().hex[:12]}
+        delivered = await self.send_frame(chat_id, frame)
+        if not delivered:
+            self.queue_frame(chat_id, frame)
+        return web.json_response({"success": True, "queued": not delivered,
+                                  "message_id": frame["message_id"]})
+
     # ------------------------------------------------------------------ #
     # Inbound
     # ------------------------------------------------------------------ #
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=20)
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MSG_BYTES)
         await ws.prepare(request)
 
         chat_id = await self._handshake(ws)

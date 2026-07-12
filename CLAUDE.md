@@ -105,11 +105,16 @@ auto-reload.
   The `hermes_gateway` LLM backend is special: a **persistent WebSocket** to the
   Hermes gateway's `voice_chat` platform adapter (plugin source lives in
   `hermes_plugin/` in this repo, symlink-installed into
-  `~/.hermes/plugins/platforms/`). It sends only the LAST user message (the
-  gateway keeps the history) and receives **unsolicited pushes** (background
-  task results, cron) which `server.handle_gateway_push` speaks through the
-  streaming machinery in push mode (`_StreamingReply(push=True)` — like echo,
-  but the bubble is a regular reply marked `push`). Wire protocol + setup:
+  `~/.hermes/plugins/platforms/` — after changing `hermes_plugin/` code, run
+  `hermes gateway restart`, not just the voice-chat service). It sends only
+  the LAST user message incl. image data URLs (the gateway keeps the history
+  and caches images as vision attachments) and receives **unsolicited pushes**
+  (background task results, cron) which `server.handle_gateway_push` speaks
+  through the streaming machinery in push mode (`_StreamingReply(push=True)` —
+  like echo, but the bubble is a regular reply marked `push`). Gateway token
+  streaming arrives as `agent.partial` frames carrying the full accumulated
+  text; the backend yields suffix deltas per message and ignores reformatted
+  finalize rewrites (no double-speak). Wire protocol + setup:
   `hermes_plugin/README.md`; cross-side protocol tests:
   `tests/test_hermes_bridge.py`, push tests: `tests/test_server_push.py`.
 - **`session.py`** (`ConversationManager`) holds conversation history per

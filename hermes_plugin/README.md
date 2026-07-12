@@ -16,13 +16,25 @@ Browser ⇄ plauder (STT/TTS, port 8319)
 
 - Inbound: transcripts become `MessageEvent`s with a per-turn voice-mode
   `channel_prompt` (terse, no markdown — override via
-  `VOICE_CHAT_CHANNEL_PROMPT`, `-` disables).
+  `VOICE_CHAT_CHANNEL_PROMPT`, `-` disables). Image uploads travel as data
+  URLs and are cached into real vision attachments (`media_urls`).
 - Outbound: turn replies are tagged with the originating `turn_id`;
   everything else is a push and gets spoken. Frames sent while plauder is
   down are queued (bounded) and flushed on reconnect.
+- Token streaming: with `display.platforms.voice_chat.streaming: true` in
+  config.yaml the gateway's stream consumer drives `edit_message` →
+  `agent.partial` frames; plauder yields suffix deltas so TTS starts on
+  the first complete sentence (streaming cursor is stripped server-side).
+- Out-of-process senders (`hermes send -t voice_chat`, cron running
+  outside the gateway) use the bridge's token-authenticated
+  `POST /push` (`standalone_sender_fn`). The home channel for bare
+  targets comes from `VOICE_CHAT_HOME_CHANNEL` (default `default`).
 - The adapter is text-only. STT, TTS, VAD, barge-in all stay in plauder.
 - Wire protocol: header comment in `voice_chat/bridge.py`. Protocol tests:
   `tests/test_hermes_bridge.py` (runs in the plauder venv, no gateway needed).
+- Known gap: plauder's "New Session" button rotates the legacy
+  `.hermes_session_id` only — it does not reset the gateway session yet
+  (send `/new` in the chat as a workaround).
 
 ## Install (once)
 

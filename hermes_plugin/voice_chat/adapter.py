@@ -31,6 +31,7 @@ restarts.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import uuid
@@ -42,9 +43,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
+    cache_image_from_url,
     resolve_channel_prompt,
 )
-from gateway.platforms.helpers import strip_markdown
 
 from .bridge import VoiceBridgeServer
 
@@ -62,6 +64,17 @@ DEFAULT_CHANNEL_PROMPT = (
     "Keine Emojis, kein Markdown, keine Code-Blöcke, keine Tabellen. Keine "
     "URLs vorlesen — beschreibe stattdessen in Worten, worum es geht."
 )
+
+
+def _strip_cursor(text: str) -> str:
+    """Drop a trailing streaming cursor. The GatewayStreamConsumer appends it
+    to mid-stream content — and the FIRST chunk of a stream arrives via
+    send(), not edit_message(), so both outbound paths must strip it."""
+    text = text.rstrip()
+    for cursor in ("▉", "▌", "█"):
+        if text.endswith(cursor):
+            return text[: -len(cursor)].rstrip()
+    return text
 
 
 def _env(name: str, default: str = "") -> str:
@@ -96,6 +109,10 @@ class VoiceChatAdapter(BasePlatformAdapter):
 
     #: Voice replies are spoken — fenced code renders as gibberish.
     supports_code_blocks = False
+    #: Enables the GatewayStreamConsumer edit path (progressive
+    #: agent.partial frames) when display.platforms.voice_chat.streaming
+    #: is on — plauder starts TTS on the first complete sentence.
+    SUPPORTS_MESSAGE_EDITING = True
     # supports_async_delivery stays True (base default): the persistent
     # bridge WS is exactly the outbound channel background tasks need.
 
@@ -155,9 +172,11 @@ class VoiceChatAdapter(BasePlatformAdapter):
                               retryable=True, error_kind="transient")
         message_id = uuid.uuid4().hex[:12]
         turn_id = self._active_turns.get(chat_id)
+        # No markdown stripping: plauder renders markdown in the bubble and
+        # its TTS sanitizer strips it per sentence anyway.
         frame = {
             "type": "agent.message",
-            "text": self.format_message(content),
+            "text": _strip_cursor(content),
             "turn_id": turn_id,
             "push": turn_id is None,
             "message_id": message_id,
@@ -175,12 +194,37 @@ class VoiceChatAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": "Voice-Chat", "type": "dm", "chat_id": chat_id}
 
+    async def edit_message(self, chat_id: str, message_id: str, content: str,
+                           *, finalize: bool = False) -> SendResult:
+        """Progressive streaming edit from the GatewayStreamConsumer: the
+        accumulated text so far, addressed to the message send() created.
+        Plauder computes the suffix delta and feeds its sentence-wise TTS."""
+        if self._bridge is None:
+            return SendResult(success=False, error="voice_chat bridge not running",
+                              retryable=True, error_kind="transient")
+        # Mid-stream edits carry the streaming cursor — never speak/render it.
+        text = _strip_cursor(content)
+        frame = {
+            "type": "agent.partial",
+            "turn_id": self._active_turns.get(chat_id),
+            "message_id": message_id,
+            "text": text,
+            "finalize": finalize,
+        }
+        if not await self._bridge.send_frame(chat_id, frame):
+            if finalize:
+                # Client died mid-stream: preserve the final content — it is
+                # flushed on reconnect and spoken as a push.
+                self._bridge.queue_frame(chat_id, {
+                    "type": "agent.message", "text": text,
+                    "turn_id": None, "push": True, "message_id": message_id,
+                })
+            # Non-final partials are worthless after a disconnect: drop.
+        return SendResult(success=True, message_id=message_id)
+
     # ------------------------------------------------------------------ #
-    # Formatting / lifecycle hooks
+    # Lifecycle hooks
     # ------------------------------------------------------------------ #
-    def format_message(self, content: str) -> str:
-        """Markdown renders as literal characters in a spoken/plain channel."""
-        return strip_markdown(content)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         turn_id = (event.metadata or {}).get("vc_turn_id")
@@ -229,18 +273,24 @@ class VoiceChatAdapter(BasePlatformAdapter):
             user_id=self._user_id,
             user_name=self._user_name,
         )
-        # Image uploads arrive as URLs served by plauder; the agent can fetch
-        # them with its tools. (media_urls expects local file paths, so URLs
-        # travel inside the text instead.)
-        image_urls = [u for u in (frame.get("image_urls") or [])
-                      if isinstance(u, str)]
-        if image_urls:
-            text += "\n\n[Bilder aus dem Voice-Chat: " + " ".join(image_urls) + "]"
+        # Image uploads arrive as data URLs (plauder resolves /uploads/…
+        # before the LLM call); cache them as local files so the agent gets
+        # real vision attachments (media_urls = paths, media_types = MIMEs).
+        media_urls, media_types = [], []
+        for url in (frame.get("image_urls") or []):
+            if not isinstance(url, str):
+                continue
+            cached, mime = await self._cache_image(url)
+            if cached:
+                media_urls.append(cached)
+                media_types.append(mime)
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
             source=source,
             message_id=turn_id,
+            media_urls=media_urls,
+            media_types=media_types,
             metadata={"vc_turn_id": turn_id, "modality": modality},
         )
         event.channel_prompt = self._channel_prompt_for(chat_id)
@@ -248,9 +298,71 @@ class VoiceChatAdapter(BasePlatformAdapter):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png",
+                 "image/webp": ".webp", "image/gif": ".gif"}
+
+    async def _cache_image(self, url: str) -> tuple[Optional[str], str]:
+        """data:/http(s) image URL -> (local cached path, mime). (None, "")
+        when undecodable — the turn proceeds without that attachment."""
+        try:
+            if url.startswith("data:"):
+                header, _, b64 = url.partition(",")
+                if not b64:
+                    return None, ""
+                mime = header[5:].split(";", 1)[0].strip().lower() or "image/jpeg"
+                data = base64.b64decode(b64, validate=False)
+                path = cache_image_from_bytes(
+                    data, ext=self._MIME_EXT.get(mime, ".jpg"))
+                return path, mime
+            if url.startswith(("http://", "https://")):
+                path = await cache_image_from_url(url)
+                return path, "image/jpeg"
+        except Exception as exc:
+            logger.warning("[voice_chat] image attachment dropped: %s", exc)
+        return None, ""
+
 
 def _build_adapter(config: PlatformConfig) -> VoiceChatAdapter:
     return VoiceChatAdapter(config)
+
+
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None,
+                           media_files=None, force_document=False):
+    """Out-of-process delivery (``hermes send``, cron without a live
+    gateway... in THIS process): POST to the bridge's /push endpoint —
+    the bridge lives in the gateway process and holds the WS to plauder."""
+    import aiohttp
+
+    token = _env("VOICE_CHAT_BRIDGE_TOKEN").strip()
+    if not token:
+        return {"error": "voice_chat not configured (VOICE_CHAT_BRIDGE_TOKEN)"}
+    host = _env("VOICE_CHAT_WS_HOST", DEFAULT_WS_HOST)
+    port = _env("VOICE_CHAT_WS_PORT", str(DEFAULT_WS_PORT))
+    url = f"http://{host}:{port}/push"
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(
+                    url, json={"chat_id": chat_id or "default",
+                               "text": message},
+                    headers={"X-Bridge-Token": token}) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    return {"error": f"bridge /push {resp.status}: {body}"}
+                return {"success": True, "platform": "voice_chat",
+                        "chat_id": chat_id or "default",
+                        "message_id": body.get("message_id", ""),
+                        "queued": body.get("queued", False)}
+    except Exception as exc:
+        return {"error": f"voice_chat bridge unreachable ({url}): {exc} — "
+                         "is the gateway running?"}
+
+
+def _env_enablement() -> dict:
+    """Seed the platform's home channel so bare targets (``hermes send -t
+    voice_chat``, ``deliver=voice_chat``) resolve without an explicit chat."""
+    home = _env("VOICE_CHAT_HOME_CHANNEL", "default").strip() or "default"
+    return {"home_channel": {"chat_id": home, "name": "Voice-Chat"}}
 
 
 def register(ctx) -> None:
@@ -265,5 +377,7 @@ def register(ctx) -> None:
         allowed_users_env="VOICE_CHAT_ALLOWED_USERS",
         allow_all_env="VOICE_CHAT_ALLOW_ALL_USERS",
         cron_deliver_env_var="VOICE_CHAT_HOME_CHANNEL",
+        env_enablement_fn=_env_enablement,
+        standalone_sender_fn=_standalone_send,
         emoji="🎙️",
     )

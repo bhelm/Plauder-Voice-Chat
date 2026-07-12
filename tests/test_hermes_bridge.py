@@ -216,6 +216,145 @@ def test_chat_fails_fast_when_no_bridge_running():
 
 
 # --------------------------------------------------------------------------- #
+# Streaming (agent.partial) path
+# --------------------------------------------------------------------------- #
+def test_streaming_partials_yield_suffix_deltas():
+    async def run():
+        server_box = {}
+
+        async def on_user_message(chat_id, frame):
+            srv = server_box["server"]
+            tid = frame["turn_id"]
+            # Gateway stream consumer: initial send(), then growing edits,
+            # then a finalize edit, then turn.done.
+            await srv.send_frame(chat_id, {
+                "type": "agent.message", "text": "Hallo",
+                "turn_id": tid, "message_id": "m1", "push": False})
+            await srv.send_frame(chat_id, {
+                "type": "agent.partial", "turn_id": tid, "message_id": "m1",
+                "text": "Hallo Bernd.", "finalize": False})
+            await srv.send_frame(chat_id, {
+                "type": "agent.partial", "turn_id": tid, "message_id": "m1",
+                "text": "Hallo Bernd. Wie geht's?", "finalize": True})
+            await srv.send_frame(chat_id, {
+                "type": "turn.done", "turn_id": tid, "status": "ok"})
+
+        server = _mk_server(on_user_message)
+        server_box["server"] = server
+        await server.start()
+        backend = _mk_backend(server.port)
+        try:
+            await backend.load()
+            deltas = [d async for d in backend.chat_stream(
+                [{"role": "user", "content": "hi"}])]
+            assert deltas == ["Hallo", " Bernd.", " Wie geht's?"]
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_streaming_reformatted_finalize_is_not_respoken():
+    async def run():
+        server_box = {}
+
+        async def on_user_message(chat_id, frame):
+            srv = server_box["server"]
+            tid = frame["turn_id"]
+            await srv.send_frame(chat_id, {
+                "type": "agent.partial", "turn_id": tid, "message_id": "m1",
+                "text": "Der **Plan** steht.", "finalize": False})
+            # finalize reformats (markdown cleanup) -> prefix mismatch
+            await srv.send_frame(chat_id, {
+                "type": "agent.partial", "turn_id": tid, "message_id": "m1",
+                "text": "Der Plan steht.", "finalize": True})
+            await srv.send_frame(chat_id, {
+                "type": "turn.done", "turn_id": tid, "status": "ok"})
+
+        server = _mk_server(on_user_message)
+        server_box["server"] = server
+        await server.start()
+        backend = _mk_backend(server.port)
+        try:
+            await backend.load()
+            deltas = [d async for d in backend.chat_stream(
+                [{"role": "user", "content": "hi"}])]
+            assert deltas == ["Der **Plan** steht."]
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_streaming_segment_break_second_message_is_new_paragraph():
+    async def run():
+        server_box = {}
+
+        async def on_user_message(chat_id, frame):
+            srv = server_box["server"]
+            tid = frame["turn_id"]
+            await srv.send_frame(chat_id, {
+                "type": "agent.message", "text": "Ich schaue nach.",
+                "turn_id": tid, "message_id": "m1", "push": False})
+            await srv.send_frame(chat_id, {
+                "type": "agent.message", "text": "Fertig: alles gut.",
+                "turn_id": tid, "message_id": "m2", "push": False})
+            await srv.send_frame(chat_id, {
+                "type": "turn.done", "turn_id": tid, "status": "ok"})
+
+        server = _mk_server(on_user_message)
+        server_box["server"] = server
+        await server.start()
+        backend = _mk_backend(server.port)
+        try:
+            await backend.load()
+            reply = await backend.chat([{"role": "user", "content": "hi"}])
+            assert reply == "Ich schaue nach.\n\nFertig: alles gut."
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_orphan_finalize_partial_becomes_push():
+    async def run():
+        server = _mk_server()
+        await server.start()
+        backend = _mk_backend(server.port)
+        got = asyncio.Queue()
+
+        async def on_push(text):
+            await got.put(text)
+
+        backend.set_push_handler(on_push)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            # finalize partial for a turn the client never had -> spoken late
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": "gone", "message_id": "m9",
+                "text": "Späte Antwort.", "finalize": True})
+            # mid-stream orphan partial -> silently dropped
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": "gone", "message_id": "m9",
+                "text": "Späte Antwort. Mehr.", "finalize": False})
+            text = await asyncio.wait_for(got.get(), timeout=3)
+            assert text == "Späte Antwort."
+            assert got.empty()
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
 # Push path
 # --------------------------------------------------------------------------- #
 def test_push_frame_reaches_handler():
@@ -299,6 +438,54 @@ def test_queued_frames_flush_on_connect():
             await backend.load()
             text = await asyncio.wait_for(got.get(), timeout=5)
             assert text == "verspätete Lieferung"
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# HTTP /push endpoint (out-of-process senders: hermes send, standalone cron)
+# --------------------------------------------------------------------------- #
+def test_http_push_delivers_or_queues():
+    async def run():
+        server = _mk_server()
+        await server.start()
+        base = f"http://127.0.0.1:{server.port}"
+        backend = _mk_backend(server.port)
+        got = asyncio.Queue()
+
+        async def on_push(text):
+            await got.put(text)
+
+        backend.set_push_handler(on_push)
+        try:
+            async with ClientSession() as http:
+                # Bad token -> 401
+                async with http.post(f"{base}/push",
+                                     json={"text": "x"},
+                                     headers={"X-Bridge-Token": "WRONG"}) as r:
+                    assert r.status == 401
+                # No client yet -> queued
+                async with http.post(f"{base}/push",
+                                     json={"text": "aus der Ferne"},
+                                     headers={"X-Bridge-Token": TOKEN}) as r:
+                    assert r.status == 200
+                    body = await r.json()
+                    assert body["success"] and body["queued"]
+                # Client connects -> queued push is flushed and spoken
+                await backend.load()
+                text = await asyncio.wait_for(got.get(), timeout=5)
+                assert text == "aus der Ferne"
+                # Live client -> delivered directly (queued: false)
+                async with http.post(f"{base}/push",
+                                     json={"text": "direkt"},
+                                     headers={"X-Bridge-Token": TOKEN}) as r:
+                    body = await r.json()
+                    assert body["success"] and not body["queued"]
+                text = await asyncio.wait_for(got.get(), timeout=5)
+                assert text == "direkt"
         finally:
             await backend.close()
             await server.stop()
