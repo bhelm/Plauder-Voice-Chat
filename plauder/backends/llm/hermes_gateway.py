@@ -137,6 +137,21 @@ class HermesGatewayLLMBackend(LLMBackend):
         self._push_tasks.add(task)
         task.add_done_callback(self._push_tasks.discard)
 
+    async def reset_session(self) -> None:
+        """Ask the gateway for a fresh session ("New Session" button).
+        The adapter turns the frame into an internal /new command that
+        rotates the gateway's SessionDB session. Best-effort: with the
+        bridge down, only the local reset happens (logged)."""
+        ws = self._ws
+        if ws is None:
+            LOG.warning("reset_session: bridge not connected — "
+                        "gateway session unchanged")
+            return
+        try:
+            await ws.send_json({"type": "session.reset"})
+        except Exception as exc:
+            LOG.warning("reset_session send failed: %s", exc)
+
     # ------------------------------------------------------------------ #
     # Connection manager
     # ------------------------------------------------------------------ #

@@ -67,6 +67,36 @@ def test_push_without_client_is_queued_and_spoken_on_connect():
     asyncio.run(run())
 
 
+def test_session_reset_calls_gateway_reset_hook():
+    cfg = _configure()
+
+    class ResettableFakeLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.resets = 0
+
+        async def reset_session(self):
+            self.resets += 1
+
+    llm = ResettableFakeLLM()
+    srv.configure(cfg, stt=FakeSTT(), tts=FakeTTS(),
+                  conv=ConversationManager(llm, system_prompt="sys"),
+                  bridge=None,
+                  ghost=srv.sanitizer.HallucinationFilter(enabled=False))
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "session.reset"})
+            ack, seen, _ = await _drain_until(ws, "session.reset.ack")
+            assert ack is not None, f"kein ack; gesehen: {seen}"
+            assert llm.resets == 1
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_empty_push_is_ignored():
     _configure()
 

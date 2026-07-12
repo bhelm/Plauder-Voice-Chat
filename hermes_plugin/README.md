@@ -32,9 +32,10 @@ Browser ⇄ plauder (STT/TTS, port 8319)
 - The adapter is text-only. STT, TTS, VAD, barge-in all stay in plauder.
 - Wire protocol: header comment in `voice_chat/bridge.py`. Protocol tests:
   `tests/test_hermes_bridge.py` (runs in the plauder venv, no gateway needed).
-- Known gap: plauder's "New Session" button rotates the legacy
-  `.hermes_session_id` only — it does not reset the gateway session yet
-  (send `/new` in the chat as a workaround).
+- "New Session" in the voice UI resets the gateway session too: plauder's
+  backend sends a `session.reset` frame, the adapter runs an internal
+  `/new` (the noisy "Session reset!" confirmation is muted — time window
+  + content match, so real pushes still get through).
 
 ## Install (once)
 

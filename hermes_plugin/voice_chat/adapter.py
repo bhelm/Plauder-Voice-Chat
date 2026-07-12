@@ -34,6 +34,7 @@ import asyncio
 import base64
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -127,6 +128,9 @@ class VoiceChatAdapter(BasePlatformAdapter):
         self._bridge: Optional[VoiceBridgeServer] = None
         #: chat_id -> turn_id of the message currently being processed.
         self._active_turns: Dict[str, str] = {}
+        #: chat_id -> deadline for muting the /new confirmation push
+        #: ("✨ Session reset …" would be read aloud otherwise).
+        self._reset_mute: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Required abstract methods
@@ -141,7 +145,8 @@ class VoiceChatAdapter(BasePlatformAdapter):
             return False
         self._bridge = VoiceBridgeServer(
             self._host, self._port, self._token,
-            on_user_message=self._on_user_message)
+            on_user_message=self._on_user_message,
+            on_session_reset=self._on_session_reset)
         try:
             await self._bridge.start()
         except OSError as exc:
@@ -172,6 +177,18 @@ class VoiceChatAdapter(BasePlatformAdapter):
                               retryable=True, error_kind="transient")
         message_id = uuid.uuid4().hex[:12]
         turn_id = self._active_turns.get(chat_id)
+        # Swallow the /new confirmation after a voice-UI session reset: the
+        # UI acks the reset itself, and speaking "Session reset! Model: …"
+        # is pure noise. Time window + content match, so a real background
+        # result arriving in the window still gets through.
+        mute_until = self._reset_mute.get(chat_id, 0.0)
+        if mute_until:
+            if time.time() >= mute_until:
+                self._reset_mute.pop(chat_id, None)
+            elif turn_id is None and "session reset" in content.lower():
+                self._reset_mute.pop(chat_id, None)
+                logger.debug("[voice_chat] muted /new confirmation")
+                return SendResult(success=True, message_id=message_id)
         # No markdown stripping: plauder renders markdown in the bubble and
         # its TTS sanitizer strips it per sentence anyway.
         frame = {
@@ -294,6 +311,32 @@ class VoiceChatAdapter(BasePlatformAdapter):
             metadata={"vc_turn_id": turn_id, "modality": modality},
         )
         event.channel_prompt = self._channel_prompt_for(chat_id)
+        task = asyncio.create_task(self.handle_message(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _on_session_reset(self, chat_id: str) -> None:
+        """"New Session" in the voice UI: run an internal /new command so
+        the gateway rotates its SessionDB session for this chat. The
+        confirmation reply arrives without a live turn -> spoken as push."""
+        logger.info("[voice_chat] session reset requested (chat_id=%r)",
+                    chat_id)
+        self._active_turns.pop(chat_id, None)
+        self._reset_mute[chat_id] = time.time() + 10.0
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name="Voice-Chat",
+            chat_type="dm",
+            user_id=self._user_id,
+            user_name=self._user_name,
+        )
+        event = MessageEvent(
+            text="/new",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            metadata={"vc_control": "session.reset"},
+        )
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

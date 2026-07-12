@@ -446,6 +446,49 @@ def test_queued_frames_flush_on_connect():
 
 
 # --------------------------------------------------------------------------- #
+# Session reset ("New Session" button -> gateway /new)
+# --------------------------------------------------------------------------- #
+def test_reset_session_frame_reaches_server_callback():
+    async def run():
+        resets = asyncio.Queue()
+
+        async def on_session_reset(chat_id):
+            await resets.put(chat_id)
+
+        async def on_user_message(chat_id, frame):
+            return None
+
+        server = VoiceBridgeServer("127.0.0.1", 0, TOKEN,
+                                   on_user_message=on_user_message,
+                                   on_session_reset=on_session_reset)
+        await server.start()
+        backend = _mk_backend(server.port)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            await backend.reset_session()
+            chat_id = await asyncio.wait_for(resets.get(), timeout=3)
+            assert chat_id == "default"
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_reset_session_without_connection_is_noop():
+    async def run():
+        backend = HermesGatewayLLMBackend(url="ws://127.0.0.1:1/ws",
+                                          token=TOKEN)
+        await backend.reset_session()   # must not raise
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
 # HTTP /push endpoint (out-of-process senders: hermes send, standalone cron)
 # --------------------------------------------------------------------------- #
 def test_http_push_delivers_or_queues():

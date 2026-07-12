@@ -14,6 +14,8 @@ Wire protocol (JSON text frames, both sides ignore unknown types):
      "client": "plauder", "proto": 1}
     {"type": "user.message", "turn_id": "ab12cd", "text": "...",
      "modality": "voice"|"text", "image_urls": ["data:image/...;base64,…"]}
+    {"type": "session.reset"}
+        "New Session" in the voice UI -> gateway rotates its session (/new)
 
   gateway -> plauder:
     {"type": "hello.ok", "proto": 1, "platform": "voice_chat"}
@@ -66,11 +68,14 @@ class VoiceBridgeServer:
     """
 
     def __init__(self, host: str, port: int, token: str, *,
-                 on_user_message: Callable[[str, dict], Awaitable[None]]):
+                 on_user_message: Callable[[str, dict], Awaitable[None]],
+                 on_session_reset: Optional[
+                     Callable[[str], Awaitable[None]]] = None):
         self.host = host
         self.port = port
         self.token = token
         self._on_user_message = on_user_message
+        self._on_session_reset = on_session_reset
         self._runner: Optional[web.AppRunner] = None
         #: chat_id -> live WebSocket (latest hello wins).
         self._conns: Dict[str, web.WebSocketResponse] = {}
@@ -211,11 +216,17 @@ class VoiceBridgeServer:
                     continue
                 if not isinstance(frame, dict):
                     continue
-                if frame.get("type") == "user.message":
+                ftype = frame.get("type")
+                if ftype == "user.message":
                     try:
                         await self._on_user_message(chat_id, frame)
                     except Exception:
                         LOG.exception("bridge: user.message handler failed")
+                elif ftype == "session.reset" and self._on_session_reset:
+                    try:
+                        await self._on_session_reset(chat_id)
+                    except Exception:
+                        LOG.exception("bridge: session.reset handler failed")
                 # Unknown frame types: ignored (forward compatibility).
         finally:
             if self._conns.get(chat_id) is ws:

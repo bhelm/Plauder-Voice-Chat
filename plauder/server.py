@@ -2099,6 +2099,16 @@ async def _ws_session_reset(conn: WsConn, data):
     # page reload would re-derive the stable pre-reset ID and
     # silently continue the OLD Hermes session.
     state.hermes_session_id_separate = rotate_hermes_session_id()
+    # Gateway mode (hermes_gateway backend): the rotation above only affects
+    # the legacy API-server binding — ALSO reset the gateway-side session
+    # (the backend sends a session.reset frame, the adapter turns it into an
+    # internal /new). Best-effort: a dead bridge must not break the local reset.
+    _gw_reset = getattr(CONV.llm, "reset_session", None) if CONV else None
+    if callable(_gw_reset):
+        try:
+            await _gw_reset()
+        except Exception:
+            LOG.exception("gateway session reset failed (ignored)")
     LOG.info("session reset for %s: user=%s", conn.peer, new_user)
     await ws.send_json({
         "type": "session.reset.ack", "sessionUser": new_user,
