@@ -34,7 +34,6 @@ import asyncio
 import base64
 import logging
 import os
-import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -49,7 +48,7 @@ from gateway.platforms.base import (
     resolve_channel_prompt,
 )
 
-from .bridge import VoiceBridgeServer
+from .bridge import VoiceBridgeServer, is_system_text
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +64,17 @@ DEFAULT_CHANNEL_PROMPT = (
     "Keine Emojis, kein Markdown, keine Code-Blöcke, keine Tabellen. Keine "
     "URLs vorlesen — beschreibe stattdessen in Worten, worum es geht."
 )
+
+
+def _is_system_message(content: str,
+                       metadata: Optional[Dict[str, Any]]) -> bool:
+    """Gateway system notice? Clean metadata flag first (the local core
+    patch marks lifecycle sends for voice_chat with non_conversational),
+    emoji-prefix heuristic (bridge.is_system_text) as fallback for paths
+    the core never marks — and after a hermes update reverts the patch."""
+    if metadata and metadata.get("non_conversational"):
+        return True
+    return is_system_text(content)
 
 
 def _strip_cursor(text: str) -> str:
@@ -128,9 +138,6 @@ class VoiceChatAdapter(BasePlatformAdapter):
         self._bridge: Optional[VoiceBridgeServer] = None
         #: chat_id -> turn_id of the message currently being processed.
         self._active_turns: Dict[str, str] = {}
-        #: chat_id -> deadline for muting the /new confirmation push
-        #: ("✨ Session reset …" would be read aloud otherwise).
-        self._reset_mute: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Required abstract methods
@@ -177,18 +184,12 @@ class VoiceChatAdapter(BasePlatformAdapter):
                               retryable=True, error_kind="transient")
         message_id = uuid.uuid4().hex[:12]
         turn_id = self._active_turns.get(chat_id)
-        # Swallow the /new confirmation after a voice-UI session reset: the
-        # UI acks the reset itself, and speaking "Session reset! Model: …"
-        # is pure noise. Time window + content match, so a real background
-        # result arriving in the window still gets through.
-        mute_until = self._reset_mute.get(chat_id, 0.0)
-        if mute_until:
-            if time.time() >= mute_until:
-                self._reset_mute.pop(chat_id, None)
-            elif turn_id is None and "session reset" in content.lower():
-                self._reset_mute.pop(chat_id, None)
-                logger.debug("[voice_chat] muted /new confirmation")
-                return SendResult(success=True, message_id=message_id)
+        # System notices (restart/online, busy acks, /new confirmation) are
+        # shown in the chat but NOT spoken — and never routed into a turn
+        # stream, even if one happens to be active.
+        system = _is_system_message(content, metadata)
+        if system:
+            turn_id = None
         # No markdown stripping: plauder renders markdown in the bubble and
         # its TTS sanitizer strips it per sentence anyway.
         frame = {
@@ -198,6 +199,9 @@ class VoiceChatAdapter(BasePlatformAdapter):
             "push": turn_id is None,
             "message_id": message_id,
         }
+        if system:
+            frame["speak"] = False
+            frame["system"] = True
         if not await self._bridge.send_frame(chat_id, frame):
             # Voice client currently down (restart, deploy): queue — the
             # frame is flushed on the next reconnect and, lacking a live
@@ -221,6 +225,16 @@ class VoiceChatAdapter(BasePlatformAdapter):
                               retryable=True, error_kind="transient")
         # Mid-stream edits carry the streaming cursor — never speak/render it.
         text = _strip_cursor(content)
+        if is_system_text(text):
+            # Streamed system notice: only the final state is worth showing,
+            # silently. Mid-stream growth is dropped.
+            if finalize and text:
+                await self._bridge.send_frame(chat_id, {
+                    "type": "agent.message", "text": text, "turn_id": None,
+                    "push": True, "speak": False, "system": True,
+                    "message_id": message_id,
+                })
+            return SendResult(success=True, message_id=message_id)
         frame = {
             "type": "agent.partial",
             "turn_id": self._active_turns.get(chat_id),
@@ -322,7 +336,6 @@ class VoiceChatAdapter(BasePlatformAdapter):
         logger.info("[voice_chat] session reset requested (chat_id=%r)",
                     chat_id)
         self._active_turns.pop(chat_id, None)
-        self._reset_mute[chat_id] = time.time() + 10.0
         source = self.build_source(
             chat_id=chat_id,
             chat_name="Voice-Chat",

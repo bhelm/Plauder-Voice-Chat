@@ -997,18 +997,19 @@ _PENDING_PUSHES: deque = deque(maxlen=20)
 PUSH_WAIT_TURN_S = 180.0
 
 
-async def handle_gateway_push(text: str) -> None:
+async def handle_gateway_push(text: str, speak: bool = True) -> None:
     """Entry point wired to the hermes_gateway backend's push handler
-    (see app.init_backends). Must never raise."""
+    (see app.init_backends). ``speak=False`` = gateway system notice:
+    shown as a chat bubble, never synthesized. Must never raise."""
     text = (text or "").strip()
     if not text:
         return
     if not WS_CLIENTS:
-        _PENDING_PUSHES.append(text)
+        _PENDING_PUSHES.append((text, speak))
         LOG.info("gateway push queued (no client connected): %r", text[:80])
         return
     for ws, state in list(WS_CLIENTS.items()):
-        _spawn_tracked(state, _push_to_client(ws, state, text))
+        _spawn_tracked(state, _push_to_client(ws, state, text, speak))
 
 
 def _flush_pending_pushes(ws, state: TurnState) -> None:
@@ -1016,10 +1017,23 @@ def _flush_pending_pushes(ws, state: TurnState) -> None:
     first connection drains the queue (peers mirror nothing here — each push
     is a one-off delivery, not shared session state)."""
     while _PENDING_PUSHES:
-        _spawn_tracked(state, _push_to_client(ws, state, _PENDING_PUSHES.popleft()))
+        queued_text, queued_speak = _PENDING_PUSHES.popleft()
+        _spawn_tracked(state, _push_to_client(ws, state, queued_text,
+                                              queued_speak))
 
 
-async def _push_to_client(ws, state: TurnState, text: str) -> None:
+async def _push_to_client(ws, state: TurnState, text: str,
+                          speak: bool = True) -> None:
+    if not speak:
+        # System notice: silent bubble via the existing external.message
+        # client path (renders text, no audio) — no turn machinery needed.
+        try:
+            await ws.send_json({"type": "external.message",
+                                "role": "assistant", "text": text,
+                                "source": "system", "ts": time.time()})
+        except Exception:
+            LOG.exception("silent push send failed")
+        return
     # Let a running turn finish first (bounded — a wedged turn must not
     # silence pushes forever).
     deadline = time.time() + PUSH_WAIT_TURN_S

@@ -29,6 +29,17 @@ Browser ⇄ plauder (STT/TTS, port 8319)
   outside the gateway) use the bridge's token-authenticated
   `POST /push` (`standalone_sender_fn`). The home channel for bare
   targets comes from `VOICE_CHAT_HOME_CHANNEL` (default `default`).
+- Gateway system notices (restart/online, busy acks, /new confirmation)
+  are delivered with `speak: false`: plauder shows a silent chat bubble
+  (`external.message`) instead of speaking them. Classification: the
+  `non_conversational` metadata flag (requires the local core patch in
+  `/usr/local/lib/hermes-agent/gateway/run.py` `_non_conversational_metadata`
+  — voice_chat added next to discord; backup + re-apply notes in
+  `/root/server-config/patches/`) with an emoji-prefix fallback
+  (`bridge.is_system_text`) that also covers unpatched cores.
+- Orphaned streamed replies (turn died, e.g. after a gateway crash) are
+  coalesced per message_id (`PUSH_DEBOUNCE_S`) and spoken ONCE with the
+  final text — regression guard for the 12.07. OOM incident.
 - The adapter is text-only. STT, TTS, VAD, barge-in all stay in plauder.
 - Wire protocol: header comment in `voice_chat/bridge.py`. Protocol tests:
   `tests/test_hermes_bridge.py` (runs in the plauder venv, no gateway needed).

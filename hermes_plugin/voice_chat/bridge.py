@@ -20,10 +20,12 @@ Wire protocol (JSON text frames, both sides ignore unknown types):
   gateway -> plauder:
     {"type": "hello.ok", "proto": 1, "platform": "voice_chat"}
     {"type": "agent.message", "text": "...", "turn_id": "ab12cd"|null,
-     "push": bool, "message_id": "..."}
+     "push": bool, "message_id": "...",
+     "speak": bool (optional, default true), "system": bool (optional)}
         turn_id set   -> a NEW message belonging to that turn (initial
                          streaming chunk or a complete reply)
         turn_id null  -> unsolicited push (speak it)
+        speak=false   -> gateway system notice: show a bubble, no TTS
     {"type": "agent.partial", "turn_id": "ab12cd", "message_id": "...",
      "text": "<full accumulated text>", "finalize": bool}
         progressive token streaming: text REPLACES the message's content
@@ -57,6 +59,17 @@ CLOSE_UNAUTHORIZED = 4401
 QUEUE_MAX = 50
 #: Frame size cap — user.message frames may carry base64 data-URL images.
 MAX_MSG_BYTES = 32 * 1024 * 1024
+#: Leading emoji of the gateway's hardcoded system texts ("♻️ Gateway
+#: online…", "⚠️ Gateway restarting…", "⚡ Interrupting current task…",
+#: "✨ Session reset!…"). Texts starting with one are shown as silent
+#: bubbles instead of being spoken — safe because the voice channel prompt
+#: forbids Antonia emojis, so real replies never start with one.
+SYSTEM_EMOJI_PREFIXES = ("♻️", "⚠️", "⚡", "✨", "⏳", "🆕")
+
+
+def is_system_text(text: str) -> bool:
+    """Heuristic system-notice classifier (see SYSTEM_EMOJI_PREFIXES)."""
+    return text.lstrip().startswith(SYSTEM_EMOJI_PREFIXES)
 
 
 class VoiceBridgeServer:
@@ -171,6 +184,9 @@ class VoiceBridgeServer:
         chat_id = str((body or {}).get("chat_id") or "default")
         frame = {"type": "agent.message", "text": text, "turn_id": None,
                  "push": True, "message_id": uuid.uuid4().hex[:12]}
+        if is_system_text(text):
+            frame["speak"] = False
+            frame["system"] = True
         delivered = await self.send_frame(chat_id, frame)
         if not delivered:
             self.queue_frame(chat_id, frame)

@@ -97,6 +97,26 @@ def test_session_reset_calls_gateway_reset_hook():
     asyncio.run(run())
 
 
+def test_system_push_is_shown_but_not_spoken():
+    _configure()
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await srv.handle_gateway_push("♻️ Gateway online", speak=False)
+            evt, seen, binary = await _drain_until(ws, "external.message")
+            assert evt is not None, f"kein external.message; gesehen: {seen}"
+            assert evt["text"] == "♻️ Gateway online"
+            assert evt["source"] == "system"
+            assert "reply.start" not in seen
+            assert "audio.start" not in seen
+            assert binary is None
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_empty_push_is_ignored():
     _configure()
 

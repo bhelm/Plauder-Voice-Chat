@@ -37,6 +37,11 @@ CONNECT_WAIT_S = 10.0      # how long a turn waits for the link before failing
 HANDSHAKE_TIMEOUT_S = 10.0
 BACKOFF_MAX_S = 15.0
 PENDING_PUSH_MAX = 20      # pushes buffered before the handler is wired
+# Debounce window per pushed message_id: a streamed orphan reply arrives as
+# an initial agent.message chunk plus growing agent.partial frames — without
+# coalescing, the chunk AND the final text would both be spoken ("Session"
+# … "Session wiederhergestellt …", the 12.07. double-speak bug).
+PUSH_DEBOUNCE_S = 1.2
 
 
 class HermesGatewayLLMBackend(LLMBackend):
@@ -60,8 +65,11 @@ class HermesGatewayLLMBackend(LLMBackend):
         #: turn_id -> queue of ("text"|"done"|"error", payload)
         self._turns: dict[str, asyncio.Queue] = {}
         self._push_handler = None
-        self._pending_pushes: list[str] = []
+        self._pending_pushes: list[tuple[str, bool]] = []
         self._push_tasks: set = set()
+        #: message_id -> {"text", "speak", "task"} — debounce buffer that
+        #: coalesces streamed push updates into ONE dispatched message.
+        self._push_buf: dict[str, dict] = {}
 
     @classmethod
     def from_config(cls, cfg) -> "HermesGatewayLLMBackend":
@@ -114,28 +122,67 @@ class HermesGatewayLLMBackend(LLMBackend):
     # Push plumbing (server wires its speak function here)
     # ------------------------------------------------------------------ #
     def set_push_handler(self, handler) -> None:
-        """``handler(text)`` is awaited for every unsolicited agent message.
-        Pushes that arrived earlier are flushed immediately."""
+        """``handler(text, speak)`` is awaited for every unsolicited agent
+        message (speak=False -> display only, no TTS — gateway system
+        notices). Pushes that arrived earlier are flushed immediately."""
         self._push_handler = handler
         pending, self._pending_pushes = self._pending_pushes, []
-        for text in pending:
-            self._dispatch_push(text)
+        for text, speak in pending:
+            self._dispatch_push(text, speak)
 
-    def _dispatch_push(self, text: str) -> None:
+    def _dispatch_push(self, text: str, speak: bool = True) -> None:
         if self._push_handler is None:
-            self._pending_pushes.append(text)
+            self._pending_pushes.append((text, speak))
             del self._pending_pushes[:-PENDING_PUSH_MAX]
             return
 
         async def _run():
             try:
-                await self._push_handler(text)
+                await self._push_handler(text, speak)
             except Exception:
                 LOG.exception("push handler failed")
 
         task = asyncio.create_task(_run())
         self._push_tasks.add(task)
         task.add_done_callback(self._push_tasks.discard)
+
+    # --- push coalescing (see PUSH_DEBOUNCE_S) ------------------------- #
+    def _buffer_push(self, mid: str, text: str, speak: bool,
+                     *, flush: bool = False) -> None:
+        entry = self._push_buf.get(mid)
+        if entry is None:
+            entry = self._push_buf[mid] = {"text": text, "speak": speak,
+                                           "task": None}
+        else:
+            entry["text"] = text
+            entry["speak"] = entry["speak"] and speak
+        if entry["task"] is not None:
+            entry["task"].cancel()
+            entry["task"] = None
+        if flush:
+            self._flush_push(mid)
+            return
+
+        async def _timer():
+            try:
+                await asyncio.sleep(PUSH_DEBOUNCE_S)
+            except asyncio.CancelledError:
+                return
+            self._flush_push(mid)
+
+        entry["task"] = asyncio.create_task(_timer())
+        self._push_tasks.add(entry["task"])
+        entry["task"].add_done_callback(self._push_tasks.discard)
+
+    def _flush_push(self, mid: str) -> None:
+        entry = self._push_buf.pop(mid, None)
+        if entry is None:
+            return
+        if entry["task"] is not None:
+            entry["task"].cancel()
+        text = entry["text"].strip()
+        if text:
+            self._dispatch_push(text, entry["speak"])
 
     async def reset_session(self) -> None:
         """Ask the gateway for a fresh session ("New Session" button).
@@ -217,13 +264,23 @@ class HermesGatewayLLMBackend(LLMBackend):
             if queue is not None:
                 kind = "msg" if ftype == "agent.message" else "partial"
                 queue.put_nowait((kind, frame.get("message_id"), text))
-            elif text.strip() and (ftype == "agent.message"
-                                   or frame.get("finalize")):
-                # No (live) turn for it -> asynchronous push. Also catches
-                # replies to turns the client gave up on (timeout/restart):
-                # better spoken late than silently dropped. Mid-stream
-                # partials without a turn are worthless and skipped.
-                self._dispatch_push(text)
+            elif text.strip():
+                # No (live) turn -> asynchronous push. Coalesced per
+                # message_id (see PUSH_DEBOUNCE_S): a streamed orphan reply
+                # (initial chunk + partial growth + finalize) is dispatched
+                # ONCE with its final text instead of chunk-by-chunk.
+                mid = str(frame.get("message_id") or uuid.uuid4().hex[:12])
+                speak = frame.get("speak") is not False
+                if ftype == "agent.message":
+                    # System notices (speak=False) are single-shot: no
+                    # stream will follow, skip the debounce delay.
+                    self._buffer_push(mid, text, speak, flush=not speak)
+                elif frame.get("finalize"):
+                    self._buffer_push(mid, text, speak, flush=True)
+                elif mid in self._push_buf:
+                    self._buffer_push(mid, text, speak)
+                # Mid-stream orphan partial with no buffered start: skip —
+                # the finalize will carry the full text anyway.
         elif ftype == "turn.done":
             queue = self._turns.get(frame.get("turn_id"))
             if queue is not None:

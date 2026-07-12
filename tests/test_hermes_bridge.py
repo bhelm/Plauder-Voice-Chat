@@ -326,7 +326,7 @@ def test_orphan_finalize_partial_becomes_push():
         backend = _mk_backend(server.port)
         got = asyncio.Queue()
 
-        async def on_push(text):
+        async def on_push(text, speak=True):
             await got.put(text)
 
         backend.set_push_handler(on_push)
@@ -364,7 +364,7 @@ def test_push_frame_reaches_handler():
         backend = _mk_backend(server.port)
         got = asyncio.Queue()
 
-        async def on_push(text):
+        async def on_push(text, speak=True):
             await got.put(text)
 
         backend.set_push_handler(on_push)
@@ -406,7 +406,7 @@ def test_push_buffered_until_handler_registered():
             await asyncio.sleep(0.2)       # frame lands in _pending_pushes
             got = asyncio.Queue()
 
-            async def on_push(text):
+            async def on_push(text, speak=True):
                 await got.put(text)
 
             backend.set_push_handler(on_push)      # flushes the buffer
@@ -430,7 +430,7 @@ def test_queued_frames_flush_on_connect():
         backend = _mk_backend(server.port)
         got = asyncio.Queue()
 
-        async def on_push(text):
+        async def on_push(text, speak=True):
             await got.put(text)
 
         backend.set_push_handler(on_push)
@@ -438,6 +438,81 @@ def test_queued_frames_flush_on_connect():
             await backend.load()
             text = await asyncio.wait_for(got.get(), timeout=5)
             assert text == "verspätete Lieferung"
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_streamed_orphan_push_spoken_once():
+    """Regression (12.07. OOM incident): a streamed reply whose turn died
+    arrives as initial chunk + partial growth + finalize — it must be
+    dispatched ONCE with the final text, not chunk-by-chunk ("Session" …
+    then the full sentence again)."""
+    async def run():
+        server = _mk_server()
+        await server.start()
+        backend = _mk_backend(server.port)
+        got = asyncio.Queue()
+
+        async def on_push(text, speak=True):
+            await got.put((text, speak))
+
+        backend.set_push_handler(on_push)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            await server.send_frame("default", {
+                "type": "agent.message", "text": "Session",
+                "turn_id": None, "push": True, "message_id": "m1"})
+            await asyncio.sleep(0.3)   # inside the debounce window
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": None, "message_id": "m1",
+                "text": "Session wiederhergestellt.", "finalize": False})
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": None, "message_id": "m1",
+                "text": "Session wiederhergestellt, alles online.",
+                "finalize": True})
+            text, speak = await asyncio.wait_for(got.get(), timeout=3)
+            assert text == "Session wiederhergestellt, alles online."
+            assert speak is True
+            await asyncio.sleep(1.5)   # a full debounce window later …
+            assert got.empty()         # … still exactly ONE dispatch
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_speak_false_push_flag_reaches_handler():
+    async def run():
+        server = _mk_server()
+        await server.start()
+        backend = _mk_backend(server.port)
+        got = asyncio.Queue()
+
+        async def on_push(text, speak=True):
+            await got.put((text, speak))
+
+        backend.set_push_handler(on_push)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            await server.send_frame("default", {
+                "type": "agent.message", "text": "♻️ Gateway online",
+                "turn_id": None, "push": True, "speak": False,
+                "system": True, "message_id": "sys1"})
+            text, speak = await asyncio.wait_for(got.get(), timeout=3)
+            assert text == "♻️ Gateway online"
+            assert speak is False
         finally:
             await backend.close()
             await server.stop()
@@ -499,7 +574,7 @@ def test_http_push_delivers_or_queues():
         backend = _mk_backend(server.port)
         got = asyncio.Queue()
 
-        async def on_push(text):
+        async def on_push(text, speak=True):
             await got.put(text)
 
         backend.set_push_handler(on_push)
