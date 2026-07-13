@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -45,6 +46,36 @@ from .speaker_verify import foreign_regions, keep_regions
 from .turn_state import TurnState
 
 LOG = logging.getLogger("voice-chat")
+
+# Laughter / nonverbal vocalizations are acoustically NOT the owner's normal
+# speech, so the speaker embedding scores them like a foreign voice and the
+# block-trim would cut them out (struck through in the UI). But laughter is
+# genuine owner input the LLM needs as conversational context — it must never
+# be trimmed. This matches the whole utterance OR the bit the trim removed:
+# Whisper renders laughter as repeated ha/he/hi/ho syllables ("Hahaha", "Ha
+# ha ha", "Hehehe") or as a bracketed/asterisked tag ("*Gelächter*",
+# "[laughter]", "*Lachen*"). Punctuation/whitespace is ignored.
+_LAUGH_RE = re.compile(
+    r"^[\s\.\,\!\?…\-—–\"'»«„“”]*"
+    r"(?:"
+    r"(?:ha|he|hi|ho|hah|heh|hih|haha|hehe|haw|mhm|hm+)"
+    r"(?:[\s\-\.\,]*(?:ha|he|hi|ho|hah|heh|hih|haha|hehe|haw|hm+))*"
+    r"|[\*\[\(]\s*(?:gelächter|gelaechter|lachen|lacht|laughter|laughs|laughing|chuckle|giggl\w*)\s*[\*\]\)]"
+    r")"
+    r"[\s\.\,\!\?…\-—–\"'»«„“”]*$",
+    re.IGNORECASE,
+)
+
+
+def is_laughter_only(text: str) -> bool:
+    """True when ``text`` is purely laughter / a nonverbal-laughter tag (no
+    real words). Used to protect laughter from the speaker block-trim: the
+    embedding scores laughter like a foreign voice, but it is genuine owner
+    input the LLM needs.
+    """
+    if not text or not text.strip():
+        return False
+    return bool(_LAUGH_RE.match(text.strip()))
 
 SPEAKER_BARGE_MIN_S = 1.5      # audio needed before the first early check —
                                # short prefixes overscore (field: a video prefix
@@ -208,6 +239,18 @@ async def apply_commit_gate(ws, state: TurnState, *, segment_id, pcm_bytes,
         matched = True
         LOG.info("speaker: short segment passes while composing seg=%s "
                  "dur=%.1fs score=%.3f", segment_id, duration_s, res.score)
+    # Owner-laughter pass: a segment that is PURELY laughter scores like a
+    # foreign voice (laughter embeds unlike normal speech), so it would be
+    # rejected outright. But laughter right after the owner was heard is the
+    # owner laughing — genuine input the LLM needs. Accept it when the text is
+    # laughter-only AND the owner was recently confirmed (continuity window),
+    # so a stranger laughing out of the blue still doesn't pass.
+    if (not matched and is_laughter_only(text)
+            and state.speaker_last_own > 0
+            and time.time() - state.speaker_last_own_ts <= SPEAKER_CONT_WINDOW_S):
+        matched = True
+        LOG.info("speaker: owner-laughter passes seg=%s dur=%.1fs score=%.3f "
+                 "text=%r", segment_id, duration_s, res.score, text[:40])
     if res.matched and res.reason == "match":
         # Only STRICT matches refresh the continuity anchor (a chain of
         # continuity accepts must not drift the reference downwards; a
@@ -286,6 +329,20 @@ async def apply_commit_gate(ws, state: TurnState, *, segment_id, pcm_bytes,
             return False
         text2 = await _crop_and_restt(keep, keep_total)
         if not text2 or text2 == text:
+            return False
+        # Laughter guard: if the trim removed laughter that was in the original
+        # transcript, the "foreign" block was almost certainly the owner
+        # laughing (laughter embeds unlike normal speech and looks foreign to
+        # the gate). Laughter is genuine owner input the LLM needs — keep the
+        # full transcript, don't cut. Detect via the laughter tokens present
+        # in the original but gone after the trim.
+        removed_laughter = [
+            tok for tok in re.findall(r"[^\s.,!?…]+|[\*\[\(][^\*\]\)]+[\*\]\)]", text)
+            if is_laughter_only(tok) and tok not in text2
+        ]
+        if removed_laughter:
+            LOG.info("speaker: trim SKIPPED seg=%s — would cut laughter %r "
+                     "(kept full transcript)", segment_id, removed_laughter)
             return False
         LOG.info("speaker: block trim seg=%s foreign=%s %r → %r",
                  segment_id,

@@ -206,6 +206,13 @@ class Config:
     whisper_compute_type: str = "int8"
     whisper_beam_size: int = 5
     whisper_local_files_only: bool = True
+    # Whisper's default (condition_on_previous_text=True) feeds the previous
+    # segment's text back into the decoder. On nonverbal / repetitive audio
+    # (laughter "hahaha", coughs) this biases the decoder toward "cleaning up"
+    # or dropping the repetition, so genuine laughter can vanish from the
+    # transcript. False decodes each window independently → laughter and other
+    # nonverbal vocalizations survive. (Matches the pre-fork behavior.)
+    whisper_condition_on_previous_text: bool = False
 
     # --- STT Partial / Streaming (B2) ---
     # While a segment is still being streamed in (B1), periodically transcribe
@@ -435,6 +442,8 @@ class Config:
             whisper_compute_type=_first(_env("WHISPER_COMPUTE_TYPE"), default="int8"),
             whisper_beam_size=_env_int("WHISPER_BEAM_SIZE", 5),
             whisper_local_files_only=env_flag("WHISPER_LOCAL_FILES_ONLY", True),
+            whisper_condition_on_previous_text=env_flag(
+                "WHISPER_CONDITION_ON_PREVIOUS_TEXT", False),
 
             # Partials by default only with local Whisper (the API backend would
             # otherwise be called multiple times per second at a cost).

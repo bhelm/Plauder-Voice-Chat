@@ -97,6 +97,12 @@ VOICES = None
 # this repo; stays disabled when it is missing).
 _SPEAKER_IDENTIFIER = None
 _SPEAKER_INIT_FAILED = False
+# Runtime on/off of the identification (settings.houseSpeakerEnabled). Process-
+# wide like the voice-lock toggle; the loaded identifier/store is kept.
+HOUSE_SPEAKER_ENABLED = True
+# Shortest usable house-speaker sample (seconds) — below this the embedding is
+# too unstable to serve as a register.
+MIN_HOUSE_SAMPLE_S = 2.0
 
 
 def configure(cfg: Config, *, stt=None, tts=None, conv=None, bridge=None, ghost=None,
@@ -131,6 +137,45 @@ def get_speaker_identifier():
             LOG.warning("Speaker-ID init failed, disabled: %s", exc)
             return None
     return _SPEAKER_IDENTIFIER
+
+
+def _house_speakers_payload(ident):
+    """Detailed speaker list for the management UI (hello + house.speakers).
+    ``samples`` carries one label per register (may be empty strings)."""
+    out = []
+    for sp in ident.store.all():
+        regs = list(getattr(sp, "registers", []) or [])
+        n = int(getattr(sp, "n_samples", 0) or 0)
+        out.append({
+            "name": sp.name,
+            "role": getattr(sp, "role", "guest"),
+            "relation": getattr(sp, "relation", ""),
+            "samples": [(regs[i] if i < len(regs) else "") for i in range(n)],
+        })
+    return out
+
+
+def _house_speaker_hello():
+    """House-Mode speaker-ID capability block for the hello frame. Failsafe
+    like the rest of the house path: any surprise → advertised as unavailable."""
+    ident = get_speaker_identifier()
+    if ident is None:
+        return {"available": False}
+    try:
+        speakers = ident.store.all()
+        return {
+            "available": True,
+            "enabled": HOUSE_SPEAKER_ENABLED,
+            "count": len(speakers),
+            "names": [sp.name for sp in speakers],
+            "speakers": _house_speakers_payload(ident),
+            "simThreshold": float(getattr(ident, "sim_threshold", 0.5)),
+            "switchThreshold": float(getattr(ident, "switch_threshold", 0.6)),
+            "minDurS": float(getattr(ident, "min_dur_s", 5.0)),
+        }
+    except Exception:
+        LOG.exception("houseSpeaker hello block failed (advertised unavailable)")
+        return {"available": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -1376,6 +1421,8 @@ async def _identify_house_speaker(pcm_bytes, segment_id, speech_start_ts,
                                   force_hold):
     """Speaker-ID (House-Mode, optional, failsafe). Returns the speaker info
     dict for the transcript event, or None (disabled / failed)."""
+    if not HOUSE_SPEAKER_ENABLED:
+        return None
     identifier = get_speaker_identifier()
     if identifier is None:
         return None
@@ -1608,7 +1655,8 @@ class WsConn:
     clone recording / streamed segment / full segment)."""
 
     __slots__ = ("ws", "state", "peer", "pending_segment_meta",
-                 "active_stream", "enroll_stream", "clone_stream")
+                 "active_stream", "enroll_stream", "clone_stream",
+                 "house_stream")
 
     def __init__(self, ws, state: TurnState, peer):
         self.ws = ws
@@ -1627,6 +1675,9 @@ class WsConn:
         # Voice-clone recording: same idea as enroll_stream — while set, binary
         # frames are the reference sample for a new cloned voice.
         self.clone_stream: bytearray | None = None
+        # House-Mode speaker sample recording: {"name": str, "buf": bytearray}
+        # while a take for that (new or existing) speaker is streaming in.
+        self.house_stream: dict | None = None
 
 
 def _client_speech_start_ts(data) -> float | None:
@@ -1753,10 +1804,11 @@ async def _ws_segment_start(conn: WsConn, data):
 
 async def _ws_segment_stream_start(conn: WsConn, data):
     ws = conn.ws
-    # While the owner is recording an enrollment or voice-clone
+    # While the owner is recording an enrollment, voice-clone or house-speaker
     # take, VAD segments are ignored entirely — their frames
     # would race with the recording frames for the binary channel.
-    if conn.enroll_stream is not None or conn.clone_stream is not None:
+    if (conn.enroll_stream is not None or conn.clone_stream is not None
+            or conn.house_stream is not None):
         return
     # B1: start of a streamed segment. Following binary frames
     # (raw f32le) are appended until segment.stream.commit arrives.
@@ -1879,6 +1931,163 @@ async def _ws_speaker_enroll_clear(conn: WsConn, data):
         "enrolled": bool(SPEAKER is not None and SPEAKER.has_profile()),
         "count": (SPEAKER._count if SPEAKER is not None else 0),
         "ts": time.time()})
+
+
+# --------------------------------------------------------------------------- #
+# House-Mode speaker management (list / enroll a sample / rename / delete).
+# Store mutations broadcast the fresh list to EVERY browser (management UIs on
+# other devices stay in sync); errors go only to the requester (house.error).
+# All ops are duck-typed against the external speaker_id store and failsafe.
+# --------------------------------------------------------------------------- #
+async def _house_broadcast_speakers(ws) -> None:
+    ident = get_speaker_identifier()
+    if ident is None:
+        return
+    payload = {"type": "house.speakers",
+               "speakers": _house_speakers_payload(ident), "ts": time.time()}
+    try:
+        await ws.send_json(payload)
+    except Exception:
+        pass
+    await _broadcast_peers(ws, payload)
+
+
+async def _ws_house_list(conn: WsConn, data):
+    ident = get_speaker_identifier()
+    if ident is None:
+        await conn.ws.send_json({"type": "house.error", "op": "list",
+                                 "error": "unavailable", "ts": time.time()})
+        return
+    await conn.ws.send_json({"type": "house.speakers",
+                             "speakers": _house_speakers_payload(ident),
+                             "ts": time.time()})
+
+
+async def _ws_house_enroll_start(conn: WsConn, data):
+    # Begin buffering a sample take for a (new or existing) house speaker.
+    name = str(data.get("name") or "").strip()[:60]
+    ident = get_speaker_identifier()
+    if ident is None or not name:
+        conn.house_stream = None
+        await conn.ws.send_json({
+            "type": "house.enroll.ack", "ok": False,
+            "error": ("unavailable" if ident is None else "bad_name"),
+            "ts": time.time()})
+        return
+    # Same binary-channel hygiene as the voice-lock enrollment: drop a
+    # half-streamed segment and queued segment.start metas (FIFO desync).
+    if conn.active_stream is not None:
+        conn.active_stream["done"] = True
+        conn.active_stream = None
+    conn.pending_segment_meta.clear()
+    conn.house_stream = {"name": name, "buf": bytearray()}
+
+
+async def _ws_house_enroll_commit(conn: WsConn, data):
+    ws = conn.ws
+    rec, conn.house_stream = conn.house_stream, None
+    ident = get_speaker_identifier()
+    if rec is None or ident is None:
+        await ws.send_json({"type": "house.enroll.ack", "ok": False,
+                            "error": "unavailable", "ts": time.time()})
+        return
+    name, buf = rec["name"], bytes(rec["buf"])
+    if len(buf) < int(SAMPLE_RATE * 4 * MIN_HOUSE_SAMPLE_S):
+        await ws.send_json({"type": "house.enroll.ack", "ok": False,
+                            "error": "too_short", "ts": time.time()})
+        return
+    try:
+        audio = audio_utils.pcm_bytes_to_float32_array(buf)
+        emb = await asyncio.to_thread(ident.embedder.embed, audio, SAMPLE_RATE)
+        if emb is None:
+            await ws.send_json({"type": "house.enroll.ack", "ok": False,
+                                "error": "too_short", "ts": time.time()})
+            return
+        ident.store.add_register(name, emb, label=time.strftime("%Y-%m-%d %H:%M"))
+        ident.reset()   # sticky current speaker may be stale after store changes
+        sp = ident.store.get(name)
+        count = int(getattr(sp, "n_samples", 0) or 0) if sp is not None else 0
+        LOG.info("house: sample enrolled for %r (samples=%d)", name, count)
+        await ws.send_json({"type": "house.enroll.ack", "ok": True,
+                            "name": name, "count": count, "ts": time.time()})
+        await _house_broadcast_speakers(ws)
+    except Exception as exc:
+        LOG.exception("house enroll failed")
+        await ws.send_json({"type": "house.enroll.ack", "ok": False,
+                            "error": str(exc), "ts": time.time()})
+
+
+async def _ws_house_enroll_abort(conn: WsConn, data):
+    conn.house_stream = None
+
+
+async def _house_mutate(conn: WsConn, op: str, fn) -> None:
+    """Shared guard/error/broadcast wrapper for the management mutations.
+    ``fn(ident) -> (ok, error)`` performs the store change synchronously."""
+    ws = conn.ws
+    ident = get_speaker_identifier()
+    if ident is None:
+        await ws.send_json({"type": "house.error", "op": op,
+                            "error": "unavailable", "ts": time.time()})
+        return
+    try:
+        ok, err = fn(ident)
+    except Exception as exc:
+        LOG.exception("house %s failed", op)
+        ok, err = False, str(exc)
+    if not ok:
+        await ws.send_json({"type": "house.error", "op": op,
+                            "error": err or "failed", "ts": time.time()})
+        return
+    ident.reset()
+    await _house_broadcast_speakers(ws)
+
+
+async def _ws_house_rename(conn: WsConn, data):
+    old = str(data.get("name") or "").strip()
+    new = str(data.get("newName") or "").strip()[:60]
+
+    def _do(ident):
+        if not old or not new:
+            return False, "bad_name"
+        rename = getattr(ident.store, "rename", None)
+        if rename is None:
+            return False, "unsupported"
+        return (True, None) if rename(old, new) else (False, "rejected")
+
+    await _house_mutate(conn, "rename", _do)
+
+
+async def _ws_house_delete(conn: WsConn, data):
+    name = str(data.get("name") or "").strip()
+
+    def _do(ident):
+        if not name:
+            return False, "bad_name"
+        remove = getattr(ident.store, "remove", None)
+        if remove is None:
+            return False, "unsupported"
+        return (True, None) if remove(name) else (False, "not_found")
+
+    await _house_mutate(conn, "delete", _do)
+
+
+async def _ws_house_sample_delete(conn: WsConn, data):
+    name = str(data.get("name") or "").strip()
+    try:
+        idx = int(data.get("index"))
+    except (TypeError, ValueError):
+        idx = -1
+
+    def _do(ident):
+        if not name or idx < 0:
+            return False, "bad_request"
+        rm = getattr(ident.store, "remove_register", None)
+        if rm is None:
+            return False, "unsupported"
+        return (True, None) if rm(name, idx) else (False, "not_found")
+
+    await _house_mutate(conn, "sample.delete", _do)
 
 
 async def _ws_voice_clone_start(conn: WsConn, data):
@@ -2080,6 +2289,23 @@ async def _ws_settings(conn: WsConn, data):
     if "speakerLockEnabled" in data and SPEAKER is not None:
         # Temporary on/off of the whole voice-lock gate (profile kept).
         SPEAKER.enabled = bool(data["speakerLockEnabled"])
+    # House-Mode speaker-ID live tuning (same process-wide semantics as the
+    # voice-lock knobs above; ignored when the identifier is not loaded).
+    house_ident = get_speaker_identifier()
+    if "houseSpeakerEnabled" in data and house_ident is not None:
+        global HOUSE_SPEAKER_ENABLED
+        HOUSE_SPEAKER_ENABLED = bool(data["houseSpeakerEnabled"])
+    if house_ident is not None:
+        if "houseSimThreshold" in data:
+            try:
+                house_ident.sim_threshold = max(0.1, min(0.95, float(data["houseSimThreshold"])))
+            except (TypeError, ValueError):
+                pass
+        if "houseSwitchThreshold" in data:
+            try:
+                house_ident.switch_threshold = max(0.1, min(0.95, float(data["houseSwitchThreshold"])))
+            except (TypeError, ValueError):
+                pass
     if "audioCodec" in data:
         # Downlink codec request. Only honor "opus" when the
         # codec is actually usable — otherwise fall back to raw
@@ -2101,6 +2327,11 @@ async def _ws_settings(conn: WsConn, data):
         "hermesMode": "separate",
         "speakerThreshold": (SPEAKER.threshold if SPEAKER is not None else None),
         "speakerLockEnabled": (SPEAKER.enabled if SPEAKER is not None else None),
+        "houseSpeakerEnabled": (HOUSE_SPEAKER_ENABLED if house_ident is not None else None),
+        "houseSimThreshold": (getattr(house_ident, "sim_threshold", None)
+                              if house_ident is not None else None),
+        "houseSwitchThreshold": (getattr(house_ident, "switch_threshold", None)
+                                 if house_ident is not None else None),
         "vad": vad_params, "ts": time.time(),
     })
 
@@ -2121,6 +2352,13 @@ _WS_TEXT_HANDLERS = {
     "speaker.enroll.commit": _ws_speaker_enroll_commit,
     "speaker.enroll.abort": _ws_speaker_enroll_abort,
     "speaker.enroll.clear": _ws_speaker_enroll_clear,
+    "house.list": _ws_house_list,
+    "house.enroll.start": _ws_house_enroll_start,
+    "house.enroll.commit": _ws_house_enroll_commit,
+    "house.enroll.abort": _ws_house_enroll_abort,
+    "house.rename": _ws_house_rename,
+    "house.delete": _ws_house_delete,
+    "house.sample.delete": _ws_house_sample_delete,
     "voice.clone.start": _ws_voice_clone_start,
     "voice.clone.commit": _ws_voice_clone_commit,
     "voice.clone.abort": _ws_voice_clone_abort,
@@ -2147,6 +2385,10 @@ async def _ws_binary(conn: WsConn, raw: bytes):
     if conn.clone_stream is not None:
         # Voice-clone reference recording — buffer until commit.
         conn.clone_stream.extend(raw)
+        return
+    if conn.house_stream is not None:
+        # House-Mode speaker sample recording — buffer until commit.
+        conn.house_stream["buf"].extend(raw)
         return
     if conn.active_stream is not None:
         # B1: frame of a streamed segment — append. The final
@@ -2241,6 +2483,10 @@ async def _send_hello(ws, state: TurnState) -> None:
             # Runtime toggle state (the client re-asserts its own on connect).
             "enabled": bool(SPEAKER is not None and getattr(SPEAKER, "enabled", True)),
         },
+        # House-Mode speaker-ID (multi-speaker identification): drives the
+        # client's speaker-recognition settings card, same pattern as
+        # speakerLock above. {"available": False} when the feature is off.
+        "houseSpeaker": _house_speaker_hello(),
         # Voice library: available = cloning wired (wrapper behind TTS). Carries
         # the current voice list + active id so the client renders immediately.
         "voiceClone": clone_caps,

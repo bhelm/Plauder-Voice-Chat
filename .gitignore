@@ -1,5 +1,8 @@
 # Secrets — niemals committen
 .env
+# Weitere .env-Varianten (enthalten API-Keys, z.B. .env.joy)
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -23,6 +26,10 @@ house_data/
 models/
 *.onnx
 speaker_profile.json
+# Single-Mode-Profile pro Agent (biometrische Stimm-Embeddings)
+speaker_profile_*.json
+# Enroll-Rohdaten (private Sprachaufnahmen)
+enroll_samples/
 
 # Backups / Editor / OS
 *_orig.py
