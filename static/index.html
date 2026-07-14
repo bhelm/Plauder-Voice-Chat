@@ -172,6 +172,15 @@
               <button id="houseSpkDeleteBtn" class="danger" data-i18n-title="houseid.delete">🗑</button>
             </div>
           </div>
+          <!-- Free-text role of the selected speaker (e.g. admin/dad/friend);
+               sent to the LLM as part of the speaker tag on every utterance. -->
+          <div class="houseid-role" data-i18n-title="houseid.role_title"
+               title="Sent to the assistant as a tag with everything this person says.">
+            <span data-i18n="houseid.role_label">Role</span>
+            <input id="houseSpkRole" type="text" maxlength="60"
+                   data-i18n-placeholder="houseid.role_placeholder"
+                   placeholder="e.g. admin, dad, friend …" />
+          </div>
           <div class="vlock-metric">
             <span data-i18n="houseid.samples">Samples</span>
             <b id="houseSpkSampleCount">–</b>
@@ -583,6 +592,7 @@
     const houseSpkAddBtn      = document.getElementById('houseSpkAddBtn');
     const houseSpkRenameBtn   = document.getElementById('houseSpkRenameBtn');
     const houseSpkDeleteBtn   = document.getElementById('houseSpkDeleteBtn');
+    const houseSpkRole        = document.getElementById('houseSpkRole');
     const houseSpkSampleCount = document.getElementById('houseSpkSampleCount');
     const houseSpkSamples     = document.getElementById('houseSpkSamples');
     const houseSpkRecordBtn   = document.getElementById('houseSpkRecordBtn');
@@ -2495,6 +2505,15 @@
 
     function houseSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
+    // Effective free-text role of a speaker: the editable `role` field, with
+    // the legacy enum defaults ("guest"/"unknown") treated as empty and the
+    // legacy `relation` field as fallback — mirrors the server's LLM tag.
+    function houseRoleText(s) {
+      const r = (s.role || '').trim();
+      if (r && r.toLowerCase() !== 'guest' && r.toLowerCase() !== 'unknown') return r;
+      return (s.relation || '').trim();
+    }
+
     function renderHouseSpeakers() {
       if (!houseSpkSelect) return;
       const list = serverHouse.speakers || [];
@@ -2510,7 +2529,8 @@
         for (const s of list) {
           const o = document.createElement('option');
           o.value = s.name;
-          o.textContent = s.name + (s.relation ? ` (${s.relation})` : '');
+          const role = houseRoleText(s);
+          o.textContent = s.name + (role ? ` (${role})` : '');
           if (s.name === houseSelSpeaker) o.selected = true;
           houseSpkSelect.appendChild(o);
         }
@@ -2521,6 +2541,14 @@
       if (houseSpkRecordBtn) houseSpkRecordBtn.disabled = !houseSelSpeaker || enrolling;
       // Sample chips of the selected speaker (✖ removes one register).
       const sel = list.find(s => s.name === houseSelSpeaker);
+      if (houseSpkRole) {
+        houseSpkRole.disabled = !sel;
+        // Don't clobber the field while the user is typing in it — the
+        // broadcast after a save re-renders this card.
+        if (document.activeElement !== houseSpkRole) {
+          houseSpkRole.value = sel ? houseRoleText(sel) : '';
+        }
+      }
       const samples = (sel && sel.samples) || [];
       if (houseSpkSampleCount) {
         houseSpkSampleCount.textContent = houseSelSpeaker ? String(samples.length) : '–';
@@ -2601,6 +2629,13 @@
     });
     if (houseSpkRecordBtn) houseSpkRecordBtn.addEventListener('click', () => {
       houseRecordSample(houseSelSpeaker);
+    });
+    if (houseSpkRole) houseSpkRole.addEventListener('change', () => {
+      if (!houseSelSpeaker) return;
+      // Empty value clears the role; the confirming house.speakers broadcast
+      // refreshes the picker labels on every device.
+      houseSend({ type: 'house.role', name: houseSelSpeaker,
+                  role: houseSpkRole.value.trim() });
     });
 
     /* ===== Voice library (cloned voices) ===== */

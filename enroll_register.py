@@ -85,9 +85,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Multi-Register-Enrollment für den SpeakerStore.")
     ap.add_argument("clips", nargs="+", help="WAV-Clips (verschiedene Register).")
     ap.add_argument("--name", required=True, help="Sprecher-Name (z.B. Alice).")
-    ap.add_argument("--role", default=None, help="Rolle: admin | guest.")
+    ap.add_argument("--role", default=None,
+                    help="Freitext-Rolle, z.B. 'Admin', 'Vater', 'Freund' "
+                         "(erscheint im Sprecher-Tag; auch in der Web-UI editierbar).")
     ap.add_argument("--relation", default=None,
-                    help="Beziehung/Tag, z.B. 'Vater' oder 'Mutter' (erscheint im Sprecher-Tag).")
+                    help="Legacy-Feld Beziehung, z.B. 'Vater' — neu besser --role verwenden.")
     here = Path(__file__).resolve().parent
     ap.add_argument("--store", default=str(here / "house_data" / "speakers.json"),
                     help="Pfad zum Fingerprint-Store (JSON).")

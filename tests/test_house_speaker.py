@@ -50,6 +50,14 @@ class FakeStore:
     def remove(self, name):
         return self._speakers.pop(name, None) is not None
 
+    def set_role(self, name, role):
+        sp = self._speakers.get(name)
+        if sp is None:
+            return False
+        sp.role = role.strip()
+        sp.relation = ""
+        return True
+
     def rename(self, old, new):
         sp = self._speakers.get(old)
         if sp is None or new in self._speakers:
@@ -290,6 +298,57 @@ def test_house_rename_delete_and_sample_delete():
             await ws.close()
 
     asyncio.run(run())
+
+
+def test_house_role_set_clear_and_errors():
+    _cfg, ident = _configure_house(stt_texts=[], deltas=["x"])
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+
+            # Free-text role is stored and broadcast with the speaker list.
+            await ws.send_json({"type": "house.role",
+                                "name": "robert", "role": "Vater"})
+            spk, _ = await _drain_until(ws, "house.speakers")
+            by_name = {s["name"]: s for s in spk["speakers"]}
+            assert by_name["robert"]["role"] == "Vater"
+
+            # Empty role clears it again.
+            await ws.send_json({"type": "house.role",
+                                "name": "robert", "role": ""})
+            spk, _ = await _drain_until(ws, "house.speakers")
+            by_name = {s["name"]: s for s in spk["speakers"]}
+            assert by_name["robert"]["role"] == ""
+
+            # Unknown speaker → error to the requester only.
+            await ws.send_json({"type": "house.role",
+                                "name": "nope", "role": "Freund"})
+            err, _ = await _drain_until(ws, "house.error")
+            assert err["op"] == "role" and err["error"] == "not_found"
+            assert ident.resets >= 2
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_speaker_tag_uses_free_text_role():
+    tag = srv._speaker_tag
+    assert tag("hi", None) == "hi"
+    # Free-text role (the new editable field).
+    assert tag("hi", {"name": "anna", "role": "Mutter", "relation": "",
+                      "known": True}) == "[Speaker: anna (Mutter)] hi"
+    # Legacy enum stores: guest carries no info, relation is the qualifier;
+    # admin + relation keeps producing the combined tag.
+    assert tag("hi", {"name": "bob", "role": "guest", "relation": "Vater",
+                      "known": True}) == "[Speaker: bob (Vater)] hi"
+    assert tag("hi", {"name": "bob", "role": "admin", "relation": "Vater",
+                      "known": True}) == "[Speaker: bob (admin, Vater)] hi"
+    assert tag("hi", {"name": "bob", "role": "guest", "relation": "",
+                      "known": True}) == "[Speaker: bob] hi"
+    assert tag("hi", {"name": "unbekannt", "role": "unknown", "relation": "",
+                      "known": False}) == "[Speaker: unbekannt, unknown] hi"
 
 
 def test_house_mgmt_unavailable_without_feature():

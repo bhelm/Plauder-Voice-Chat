@@ -296,6 +296,16 @@
   .vlock.paused .vlock-chip { color: var(--warn); border-color: rgba(251,191,36,.5); }
   /* House-Mode speaker management: sample chips of the selected speaker */
   .houseid-samples { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 8px; }
+  /* Editable free-text role of the selected house speaker */
+  .houseid-role { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+  .houseid-role input {
+    flex: 1; min-width: 0; padding: 6px 8px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    font: inherit; font-size: 13px; outline: none;
+  }
+  .houseid-role input:disabled { opacity: .35; }
+  .houseid-role input:focus { border-color: var(--accent); }
   .houseid-sample {
     display: inline-flex; align-items: center; gap: 5px;
     font-size: 11px; color: var(--muted);

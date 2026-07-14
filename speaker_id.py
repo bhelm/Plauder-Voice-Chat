@@ -172,8 +172,10 @@ class Speaker:
     """
     name: str
     embeddings: list[np.ndarray]              # Register-Wolke (>=1 L2-norm. Vektoren)
-    role: str = "guest"                       # "admin" | "guest"
-    relation: str = ""                        # optionale Beziehung, z.B. "Vater"/"Mutter"
+    role: str = ""                            # Freitext-Rolle, z.B. "Admin"/"Vater"/"Freund"
+                                              # (Legacy-Stores: "admin" | "guest")
+    relation: str = ""                        # Legacy-Feld (Beziehung); neu wird alles in
+                                              # `role` gepflegt, `relation` bleibt lesbar
     enrolled_at: float = field(default_factory=time.time)
     registers: list[str] = field(default_factory=list)  # optionale Labels je Register
 
@@ -212,7 +214,7 @@ class Speaker:
             name=d["name"],
             embeddings=embs,
             registers=list(d.get("registers", [])),
-            role=d.get("role", "guest"),
+            role=d.get("role", ""),
             relation=d.get("relation", ""),
             enrolled_at=d.get("enrolled_at", time.time()),
         )
@@ -280,7 +282,7 @@ class SpeakerStore:
             existing = self._speakers.get(name)
             if existing is None:
                 self._speakers[name] = Speaker(
-                    name=name, embeddings=[_l2(new_emb)], role=role or "guest",
+                    name=name, embeddings=[_l2(new_emb)], role=role or "",
                     relation=relation or "",
                     registers=[label] if label else [],
                 )
@@ -312,6 +314,21 @@ class SpeakerStore:
             del self._speakers[old]
             sp.name = new
             self._speakers[new] = sp
+        self.save()
+        return True
+
+    def set_role(self, name: str, role: str) -> bool:
+        """Setzt die Freitext-Rolle eines Sprechers (z.B. "Admin", "Vater",
+        "Freund"); leerer String löscht sie. Die Rolle ersetzt das Legacy-Feld
+        `relation` als LLM-Tag-Qualifier — beim Setzen wird `relation` geleert,
+        damit das Tag nicht doppelt qualifiziert ("Papa, Vater").
+        False bei unbekanntem Sprecher."""
+        with self._lock:
+            sp = self._speakers.get(name)
+            if sp is None:
+                return False
+            sp.role = role.strip()
+            sp.relation = ""
         self.save()
         return True
 
@@ -355,7 +372,7 @@ class SpeakerStore:
             existing = self._speakers.get(name)
             if existing is None:
                 self._speakers[name] = Speaker(
-                    name=name, embeddings=embs, role=role or "guest",
+                    name=name, embeddings=embs, role=role or "",
                     relation=relation or "",
                     registers=list(labels or []),
                 )
@@ -381,7 +398,7 @@ def _l2(v: np.ndarray) -> np.ndarray:
 @dataclass
 class IdentifyResult:
     name: str           # erkannter Name oder "unbekannt"
-    role: str           # "admin" | "guest" | "unknown"
+    role: str           # Freitext-Rolle des Sprechers ("" wenn keine; "unknown" bei Fremden)
     score: float        # beste Cosine-Similarity dieses Segments
     known: bool         # True = sicherer Match (>= Schwelle) ODER fortgeführt
     held: bool = False  # True = angenommen selber Sprecher (Fenster, kein sicherer Match)
@@ -452,7 +469,7 @@ class SpeakerIdentifier:
     def _set_current(self, name: str):
         sp = self.store.get(name)
         self._cur_name = name
-        self._cur_role = sp.role if sp else "guest"
+        self._cur_role = sp.role if sp else ""
         self._cur_relation = sp.relation if sp else ""
 
     # -- Hauptklassifikation (Sticky Speaker) --------------------------------

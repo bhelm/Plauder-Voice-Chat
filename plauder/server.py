@@ -148,7 +148,7 @@ def _house_speakers_payload(ident):
         n = int(getattr(sp, "n_samples", 0) or 0)
         out.append({
             "name": sp.name,
-            "role": getattr(sp, "role", "guest"),
+            "role": getattr(sp, "role", ""),
             "relation": getattr(sp, "relation", ""),
             "samples": [(regs[i] if i < len(regs) else "") for i in range(n)],
         })
@@ -1201,17 +1201,22 @@ async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False,
 
 
 def _speaker_tag(text: str, speaker_info: dict | None) -> str:
+    """Prefix the user text with a speaker tag for the LLM. The qualifier in
+    parentheses is the speaker's free-text role (user-editable, e.g. "Admin",
+    "Vater", "Freund"); legacy stores may still carry the old role enum
+    ("guest" = no information) plus a separate `relation` — both are folded in
+    so old data keeps producing the same tags."""
     if speaker_info is None:
         return text
     nm = speaker_info["name"]
-    role = speaker_info["role"]
-    rel = speaker_info.get("relation") or ""
-    if role == "admin":
-        q = f"admin, {rel}" if rel else "admin"
-        return f"[Speaker: {nm} ({q})] {text}"
-    if speaker_info["known"]:
-        return f"[Speaker: {nm} ({rel})] {text}" if rel else f"[Speaker: {nm}] {text}"
-    return f"[Speaker: {nm}, unknown] {text}"
+    if not speaker_info["known"]:
+        return f"[Speaker: {nm}, unknown] {text}"
+    role = (speaker_info.get("role") or "").strip()
+    if role.lower() in ("guest", "unknown"):   # legacy enum defaults, no info
+        role = ""
+    rel = (speaker_info.get("relation") or "").strip()
+    q = ", ".join(p for p in (role, rel) if p)
+    return f"[Speaker: {nm} ({q})] {text}" if q else f"[Speaker: {nm}] {text}"
 
 
 # After manually closing the conversation window, for this many seconds NO
@@ -2090,6 +2095,23 @@ async def _ws_house_rename(conn: WsConn, data):
     await _house_mutate(conn, "rename", _do)
 
 
+async def _ws_house_role(conn: WsConn, data):
+    # Free-text role of a speaker (goes into the LLM speaker tag). Empty
+    # string clears it.
+    name = str(data.get("name") or "").strip()
+    role = str(data.get("role") or "").strip()[:60]
+
+    def _do(ident):
+        if not name:
+            return False, "bad_name"
+        set_role = getattr(ident.store, "set_role", None)
+        if set_role is None:
+            return False, "unsupported"
+        return (True, None) if set_role(name, role) else (False, "not_found")
+
+    await _house_mutate(conn, "role", _do)
+
+
 async def _ws_house_delete(conn: WsConn, data):
     name = str(data.get("name") or "").strip()
 
@@ -2408,6 +2430,7 @@ _WS_TEXT_HANDLERS = {
     "house.enroll.commit": _ws_house_enroll_commit,
     "house.enroll.abort": _ws_house_enroll_abort,
     "house.rename": _ws_house_rename,
+    "house.role": _ws_house_role,
     "house.delete": _ws_house_delete,
     "house.sample.delete": _ws_house_sample_delete,
     "house.sample.rename": _ws_house_sample_rename,
