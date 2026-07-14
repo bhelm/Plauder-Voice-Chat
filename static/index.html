@@ -1782,9 +1782,11 @@
         else cancelWakeWindowTimer();
       },
       'wake.closed': (m) => {
-        // Window ended (stop command / manual / Alexa one-shot) → timer
-        // off + closing cue. In one-shot mode this happens after EVERY
-        // reply → no bubble (otherwise spam), just the subtle cue.
+        // Window ended (stop command / trailing "Ende" end marker / manual /
+        // Alexa one-shot) → timer off + closing cue. In one-shot mode this
+        // happens after EVERY reply → no bubble (otherwise spam), just the
+        // subtle cue. reason=end_command keeps the default path: the reply
+        // to the rest of the sentence still plays, only the window closes.
         // Ein Stopp-Kommando muss auch die CLIENTSEITIG noch gepufferten
         // Audio-Sekunden stoppen: der Server kann nach audio.end kein
         // audio.stop mehr für diese Id senden (audio_ids bereits geräumt).
@@ -2450,6 +2452,11 @@
         houseIdSwitch.value = String(thr);
         houseIdSwitchLabel.textContent = thr.toFixed(2);
       }
+      // Reset the record-button label — recordTimedTake leaves the last
+      // progress text ("recording … %") behind; not while a take is running.
+      if (houseSpkRecordLabel && !enrolling) {
+        houseSpkRecordLabel.textContent = t('houseid.record');
+      }
       renderHouseSpeakers();
     }
 
@@ -2525,6 +2532,17 @@
           chip.className = 'houseid-sample';
           const txt = document.createElement('span');
           txt.textContent = label || t('houseid.sample_n', { n: i + 1 });
+          const pen = document.createElement('button');
+          pen.type = 'button'; pen.textContent = '✏️';
+          pen.title = t('houseid.sample_rename');
+          pen.addEventListener('click', () => {
+            const cur = label || t('houseid.sample_n', { n: i + 1 });
+            const nn = prompt(t('houseid.sample_rename_prompt'), cur);
+            if (nn && nn.trim() && nn.trim() !== label) {
+              houseSend({ type: 'house.sample.rename', name: houseSelSpeaker,
+                          index: i, label: nn.trim() });
+            }
+          });
           const x = document.createElement('button');
           x.type = 'button'; x.textContent = '✖';
           x.title = t('houseid.sample_delete');
@@ -2535,7 +2553,7 @@
               houseSend({ type: 'house.sample.delete', name: houseSelSpeaker, index: i });
             }
           });
-          chip.appendChild(txt); chip.appendChild(x);
+          chip.appendChild(txt); chip.appendChild(pen); chip.appendChild(x);
           houseSpkSamples.appendChild(chip);
         });
       }

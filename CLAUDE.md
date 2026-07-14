@@ -242,7 +242,8 @@ the persisted `cueVolume` slider (0 = off), and only sound in wake mode.
   — preserve that when adding new streaming hooks.
 - `whisper_local` runs CPU (`WHISPER_DEVICE=cpu`, small model) or GPU
   (`cuda`, `large-v3-turbo`); on a GPU box also set `WHISPER_LOCAL_FILES_ONLY=1`.
-- Speaker-ID (House Mode) is wired but the `speaker_id` module is **not in the repo**;
-  it stays silently disabled unless that module + a CAM++ ONNX model + `speakers.json`
-  are present.
+- Speaker-ID (House Mode): `speaker_id.py` (CAM++ embedder + multi-register
+  fingerprint store) ships in the repo, but the feature stays silently disabled
+  unless a CAM++ ONNX model + `speakers.json` are present (both gitignored;
+  enroll via `enroll_register.py`).
 - See `README.md` for the full backend-switching matrix and config reference.

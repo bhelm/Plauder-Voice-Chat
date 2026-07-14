@@ -1266,6 +1266,15 @@ async def _reopen_wake_window_after_silent(ws, state: TurnState):
     the server gate drift apart by the LLM latency (follow-ups get ignored
     while the mic still glows). Re-sync both with reason='done' (idle timer
     runs from now)."""
+    if CFG and state.wake_word_enabled and state.wake_suppress_reopen:
+        # Window was closed during the turn (manual close / end marker) and
+        # no playback.done will come to consume the flag → consume it here,
+        # with the same trailing echo guard as the playback.done path.
+        # Otherwise the gate would stay closed forever.
+        state.wake_suppress_reopen = False
+        state.wake_closed_until = max(
+            state.wake_closed_until, time.time() + WAKE_CLOSE_GUARD_S)
+        return
     if (CFG and state.wake_word_enabled and state.wake_until > 0
             and not _wake_oneshot()):
         await _open_wake_window(ws, state, reason="done")
@@ -1387,9 +1396,16 @@ async def _apply_wake_gate(ws, state: TurnState, *, segment_id, text,
                 "windowS": CFG.wake_word_window_s, "ts": time.time()})
             return None
 
+    # "… Ende"/"… End" as the LAST word closes the conversation window: the
+    # remaining sentence (if any) is still answered, but afterwards the wake
+    # word is required again. Stripped BEFORE the stop check so a bare
+    # "Ende"/"End" falls through to the stop path below.
+    command_text, end_marker = wake.strip_end_marker(command_text)
+
     # Stop command ("stop", "ok stopp", …) → stop the running reply and
     # close the conversation window (the wake word is needed again).
-    if wake.is_stop_command(command_text):
+    if wake.is_stop_command(command_text) or (
+            end_marker and not (command_text or "").strip()):
         await _cancel_in_flight(state, ws)
         # "Stop" also discards whatever was composed but not yet
         # dispatched — otherwise it silently rides into the NEXT accepted
@@ -1412,8 +1428,24 @@ async def _apply_wake_gate(ws, state: TurnState, *, segment_id, text,
     # — coalescing (not a plain cancel): a follow-up spoken before the
     # reply became audible must carry the committed input over, exactly
     # like the VAD/speaker-gated paths.
-    await _open_wake_window(ws, state, now, reason="command")
+    if not end_marker:
+        await _open_wake_window(ws, state, now, reason="command")
     await _coalesce_cancel(state, ws)
+    if end_marker:
+        # Command ended with "Ende"/"End" → close the window immediately
+        # (same close semantics as the manual 'wake.close': guard against
+        # trailing echo, suppress the playback.done reopen). The command
+        # itself is still dispatched and answered. Set AFTER the coalesce
+        # cancel — _cancel_in_flight clears wake_suppress_reopen.
+        state.wake_until = 0.0
+        state.wake_detected_seg = None
+        state.wake_closed_until = time.time() + WAKE_CLOSE_GUARD_S
+        state.wake_suppress_reopen = True
+        LOG.info("wake: end marker seg=%s → window closed, command dispatched",
+                 segment_id)
+        await ws.send_json({
+            "type": "wake.closed", "turnId": state.turn_id,
+            "reason": "end_command", "ts": time.time()})
     return command_text
 
 
@@ -2090,6 +2122,25 @@ async def _ws_house_sample_delete(conn: WsConn, data):
     await _house_mutate(conn, "sample.delete", _do)
 
 
+async def _ws_house_sample_rename(conn: WsConn, data):
+    name = str(data.get("name") or "").strip()
+    label = str(data.get("label") or "").strip()[:60]
+    try:
+        idx = int(data.get("index"))
+    except (TypeError, ValueError):
+        idx = -1
+
+    def _do(ident):
+        if not name or idx < 0 or not label:
+            return False, "bad_request"
+        rn = getattr(ident.store, "rename_register", None)
+        if rn is None:
+            return False, "unsupported"
+        return (True, None) if rn(name, idx, label) else (False, "not_found")
+
+    await _house_mutate(conn, "sample.rename", _do)
+
+
 async def _ws_voice_clone_start(conn: WsConn, data):
     # Begin buffering a voice-clone reference recording. Same
     # channel discipline as enrollment: drop any half-streamed
@@ -2359,6 +2410,7 @@ _WS_TEXT_HANDLERS = {
     "house.rename": _ws_house_rename,
     "house.delete": _ws_house_delete,
     "house.sample.delete": _ws_house_sample_delete,
+    "house.sample.rename": _ws_house_sample_rename,
     "voice.clone.start": _ws_voice_clone_start,
     "voice.clone.commit": _ws_voice_clone_commit,
     "voice.clone.abort": _ws_voice_clone_abort,

@@ -30,6 +30,11 @@ speaker_profile.json
 speaker_profile_*.json
 # Enroll-Rohdaten (private Sprachaufnahmen)
 enroll_samples/
+# Stimm-Referenzsamples für Voice-Cloning (private Aufnahmen)
+voices/
+# Persönliche One-Shot-Enroll-Skripte (echte Namen/lokale Pfade)
+tools/enroll_house_speakers.py
+tools/enroll_joy_profile.py
 
 # Backups / Editor / OS
 *_orig.py
