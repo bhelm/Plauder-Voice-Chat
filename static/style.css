@@ -817,6 +817,9 @@
     .drawer.open { width: 360px; padding: 18px; overflow-y: auto; overflow-x: hidden; }
     .drawer-overlay { display: none !important; }
     .close-btn { display: none; }   /* docked: close via ☰ */
+    /* Ausnahme: der Waifu-Pop-out-Button nutzt die close-btn-Optik,
+       muss aber auch im Desktop-Layout sichtbar bleiben. */
+    #waifuPopoutBtn { display: inline-block; }
   }
 
   /* === Mobile/narrow: tidier, more compact === */

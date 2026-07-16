@@ -23,14 +23,25 @@ def test_client_js_files_parse():
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_client_js_inline_blocks_parse(tmp_path):
     html = (ROOT / "static/index.html").read_text(encoding="utf-8")
-    blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html,
+    # Capture the opening tag too, so non-JS blocks (e.g. the three-vrm
+    # <script type="importmap"> which is JSON) can be skipped — node --check
+    # would choke on them.
+    blocks = re.findall(r"(<script(?![^>]*\bsrc=)[^>]*>)(.*?)</script>", html,
                         flags=re.S | re.I)
     assert blocks, "no inline script blocks found"
-    for i, block in enumerate(b for b in blocks if b.strip()):
+    JS_TYPES = {"", "text/javascript", "application/javascript", "module"}
+    i = 0
+    for tag, block in blocks:
+        if not block.strip():
+            continue
+        m = re.search(r'\btype\s*=\s*["\']([^"\']*)["\']', tag, flags=re.I)
+        if m and m.group(1).strip().lower() not in JS_TYPES:
+            continue   # importmap / speculationrules / other non-JS payloads
         p = tmp_path / f"block{i}.js"
         p.write_text(block, encoding="utf-8")
         r = subprocess.run([NODE, "--check", str(p)], capture_output=True, text=True)
         assert r.returncode == 0, f"inline block {i}: {r.stderr}"
+        i += 1
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

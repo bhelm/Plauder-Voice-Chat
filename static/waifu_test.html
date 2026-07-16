@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Waifu Test — Joy</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #14161c; color: #e6e6e6; font-family: system-ui, sans-serif; }
+    header { padding: 10px 16px; border-bottom: 1px solid #2a2e38; }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    header .sub { font-size: 12px; color: #8b93a3; margin-top: 2px; }
+    .wrap { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+    .stage {
+      width: 360px; height: 540px; background: radial-gradient(circle at 50% 30%, #232838, #14161c);
+      border: 1px solid #2a2e38; border-radius: 12px; overflow: hidden; position: relative;
+    }
+    #waifuCanvas { width: 100%; height: 100%; display: block; }
+    .panel { min-width: 260px; display: flex; flex-direction: column; gap: 14px; }
+    .row { display: flex; flex-direction: column; gap: 4px; }
+    .row label { font-size: 12px; color: #b8c0d0; }
+    input[type=range] { width: 100%; }
+    button {
+      background: #2b3242; color: #e6e6e6; border: 1px solid #3a4254; border-radius: 8px;
+      padding: 8px 12px; font-size: 13px; cursor: pointer;
+    }
+    button:hover { background: #343d50; }
+    .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+    #status { font-size: 12px; padding: 8px 10px; border-radius: 8px; background: #1c2130; }
+    .ok { color: #7ee081; } .err { color: #ff8a8a; }
+    code { background:#1c2130; padding:1px 5px; border-radius:4px; font-size:12px; }
+  </style>
+  <!-- Import-Map: loest bare specifier ohne Build-Step auf -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three/three.module.js",
+      "three/addons/": "/static/vendor/three/addons/",
+      "three-vrm": "/static/vendor/three-vrm/three-vrm.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <h1>🎭 Waifu Test — Joy</h1>
+    <div class="sub">Isolierte Testseite. Modell: <code>/static/models/joy.vrm</code> · Renderer: three-vrm</div>
+  </header>
+
+  <div class="wrap">
+    <div class="stage">
+      <canvas id="waifuCanvas"></canvas>
+    </div>
+
+    <div class="panel">
+      <div id="status">Lade…</div>
+
+      <div class="row">
+        <label>Mund (Lip-Sync <code>aa</code>): <span id="mouthVal">0.00</span></label>
+        <input id="mouth" type="range" min="0" max="1" step="0.01" value="0" />
+      </div>
+
+      <div class="row">
+        <label>Auto-Lip-Sync (simuliert Sprechen)</label>
+        <div class="btns">
+          <button id="talkBtn">▶ Sprechen simulieren</button>
+          <button id="stopTalkBtn">■ Stop</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label>Emotionen</label>
+        <div class="btns">
+          <button data-emo="happy">😊 happy</button>
+          <button data-emo="angry">😠 angry</button>
+          <button data-emo="sad">😢 sad</button>
+          <button data-emo="relaxed">😌 relaxed</button>
+          <button data-emo="surprised">😲 surprised</button>
+          <button data-emo="neutral">😐 neutral</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label>Hinweis</label>
+        <div style="font-size:12px;color:#8b93a3;">
+          Maus: ziehen = drehen, Scrollen = zoomen. Blink läuft automatisch.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import Waifu from '/static/js/waifu.js';
+
+    const statusEl = document.getElementById('status');
+    const canvas = document.getElementById('waifuCanvas');
+
+    (async () => {
+      try {
+        await Waifu.mount(canvas);
+        // Warten bis wirklich ready
+        const t0 = Date.now();
+        while (!Waifu.isReady() && Date.now() - t0 < 15000) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+        if (Waifu.isReady()) {
+          statusEl.innerHTML = '<span class="ok">✓ Joy geladen &amp; gerendert.</span>';
+          Waifu.resize();
+        } else {
+          statusEl.innerHTML = '<span class="err">⚠ Timeout beim Laden.</span>';
+        }
+      } catch (e) {
+        statusEl.innerHTML = '<span class="err">Fehler: ' + (e?.message || e) + '</span>';
+        console.error(e);
+      }
+    })();
+
+    // Mund-Slider
+    const mouth = document.getElementById('mouth');
+    const mouthVal = document.getElementById('mouthVal');
+    mouth.addEventListener('input', () => {
+      const v = parseFloat(mouth.value);
+      Waifu.setMouth(v);
+      mouthVal.textContent = v.toFixed(2);
+    });
+
+    // Auto-Talk (Sinus-Amplitude als Fake-Audio)
+    let talkRaf = null;
+    document.getElementById('talkBtn').onclick = () => {
+      if (talkRaf) return;
+      const start = performance.now();
+      const tick = (now) => {
+        const t = (now - start) / 1000;
+        // pseudo-random Mundbewegung
+        const v = Math.abs(Math.sin(t * 8) * 0.5 + Math.sin(t * 13) * 0.3) ;
+        Waifu.setMouth(Math.min(1, v));
+        mouthVal.textContent = v.toFixed(2);
+        talkRaf = requestAnimationFrame(tick);
+      };
+      talkRaf = requestAnimationFrame(tick);
+    };
+    document.getElementById('stopTalkBtn').onclick = () => {
+      if (talkRaf) cancelAnimationFrame(talkRaf);
+      talkRaf = null;
+      Waifu.setMouth(0);
+      mouthVal.textContent = '0.00';
+    };
+
+    // Emotionen
+    let lastEmo = null;
+    document.querySelectorAll('[data-emo]').forEach(btn => {
+      btn.onclick = () => {
+        if (lastEmo && lastEmo !== 'neutral') Waifu.setExpression(lastEmo, 0);
+        const emo = btn.dataset.emo;
+        if (emo !== 'neutral') Waifu.setExpression(emo, 1);
+        lastEmo = emo;
+      };
+    });
+  </script>
+</body>
+</html>

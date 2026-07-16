@@ -334,6 +334,11 @@ class Config:
     house_mode: bool = False
     house_data_dir: str = ""
     house_speaker_id: bool = False
+
+    # --- Waifu / VTuber-Avatar ---
+    # Server-Default fuer den optionalen 3D-Avatar (three-vrm). Wenn True, startet
+    # das Frontend mit sichtbarem/aktiviertem Avatar (User kann im UI weiter togglen).
+    waifu_mode: bool = False
     house_wake_word: bool = False
     house_auth: bool = False
 
@@ -528,6 +533,8 @@ class Config:
             house_speaker_id=env_flag("HOUSE_SPEAKER_ID", house_mode),
             house_wake_word=env_flag("HOUSE_WAKE_WORD", house_mode),
             house_auth=env_flag("HOUSE_AUTH", house_mode),
+
+            waifu_mode=env_flag("WAIFU_MODE", False),
 
             speaker_lock_enabled=env_flag("SPEAKER_LOCK_ENABLED", False),
             speaker_model_path=_env("SPEAKER_MODEL_PATH"),

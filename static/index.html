@@ -5,6 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title data-i18n="app_title">🎙️ Plauder</title>
   <link rel="stylesheet" href="__BASE_PATH__/static/style.css?v=__ASSET_VER__">
+
+  <!-- Waifu-Avatar (optional): Import-Map loest three/three-vrm ohne Build-Step auf.
+       Harmlos wenn Avatar aus bleibt — laedt nichts, bis waifu_ui.js mountet. -->
+  <script>
+    // Server-Default fuer den Avatar (aus WAIFU_MODE). "1" = beim Start an.
+    window.__WAIFU_MODE__ = ("__WAIFU_MODE__" === "1");
+  </script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "__BASE_PATH__/static/vendor/three/three.module.js",
+      "three/addons/": "__BASE_PATH__/static/vendor/three/addons/",
+      "three-vrm": "__BASE_PATH__/static/vendor/three-vrm/three-vrm.module.js",
+      "three-vrm-animation": "__BASE_PATH__/static/vendor/three-vrm/three-vrm-animation.module.js"
+    }
+  }
+  </script>
 </head>
 <body>
   <header>
@@ -380,6 +397,35 @@
         </div>
       </details>
 
+      <!-- ── Section: Waifu-Avatar (optional, default aus) ──────────────── -->
+      <details class="acc" data-sec="waifu" id="waifuCard">
+        <summary>🎭 <span data-i18n="settings.sec_waifu">VTuber-Avatar</span></summary>
+        <div class="acc-body">
+          <div class="card">
+            <label class="mode-pill" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+              <input type="checkbox" id="waifuToggle" />
+              <span data-i18n="waifu.enable">Avatar anzeigen</span>
+            </label>
+            <div data-i18n="waifu.enable_help" style="font-size:11px;color:var(--muted);margin-top:6px;">
+              Zeigt Joy als 3D-Avatar. Lädt erst beim Einschalten (kein Overhead wenn aus).
+            </div>
+          </div>
+
+          <div class="card" id="waifuStageCard" style="display:none;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+              <div class="label" style="margin:0;" data-i18n="waifu.avatar">Joy</div>
+              <button id="waifuPopoutBtn" class="close-btn" data-i18n-title="waifu.popout" title="In eigenes Fenster lösen" style="font-size:16px;">⧉</button>
+            </div>
+            <div id="waifuStage" style="width:100%;aspect-ratio:3/4;background:radial-gradient(circle at 50% 30%,#232838,#14161c);border-radius:10px;overflow:hidden;position:relative;">
+              <canvas id="waifuCanvas" style="width:100%;height:100%;display:block;"></canvas>
+              <div id="waifuPoppedNote" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:12px;padding:12px;">
+                <span data-i18n="waifu.popped">Avatar ist im Pop-out-Fenster.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+
       <div class="footer-note" id="footerNote" data-i18n-html="footer.note">
         Speak → pause → the agent replies.<br />
         Speak again while the agent is thinking → its reply is discarded.
@@ -438,6 +484,7 @@
   <script src="__BASE_PATH__/static/js/vct.js?v=__ASSET_VER__"></script>
   <script src="__BASE_PATH__/static/js/playback.js?v=__ASSET_VER__"></script>
   <script src="__BASE_PATH__/static/js/mic.js?v=__ASSET_VER__"></script>
+  <script src="__BASE_PATH__/static/js/waifu_ui.js?v=__ASSET_VER__"></script>
 
   <script>
     /* ===== i18n =====

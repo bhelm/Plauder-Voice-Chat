@@ -308,9 +308,11 @@ async def index(_request):
     # the split CSS/JS files.
     lang = (CFG.app_language if CFG else "en")
     base = (CFG.base_path if CFG else "")
+    waifu = "1" if (CFG and CFG.waifu_mode) else "0"
     html = (INDEX_HTML.read_text(encoding="utf-8")
             .replace("__APP_LANG__", lang)
             .replace("__BASE_PATH__", base)
+            .replace("__WAIFU_MODE__", waifu)
             .replace("__ASSET_VER__", _asset_version()))
     return web.Response(text=html, content_type="text/html")
 
