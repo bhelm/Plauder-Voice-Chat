@@ -213,6 +213,14 @@ class TurnState:
     # Read by _handle_cancelled_push to tell a "heard" push from an "unheard" one;
     # matched by turn_id so a stale report for another turn is ignored.
     playback_stopped: tuple | None = None
+    # Session-reset generation. Bumped on every session reset (own AND peer, the
+    # session is shared across devices). A gateway push still in its slot-wait
+    # loop — which lives only in inflight_tasks and is NOT cancelled by
+    # _cancel_in_flight — reads this after the wait and DROPS itself when it
+    # changed: the push belongs to the old session (sanctioned drop, consistent
+    # with the cancel matrix). A push occupying the slot is handled the classic
+    # way (agent_task cancel → push_cancel_mode "drop").
+    reset_epoch: int = 0
 
     def has_pending(self) -> bool:
         return bool(self.pending_resume or self.pending_texts

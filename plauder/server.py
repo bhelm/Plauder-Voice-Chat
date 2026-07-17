@@ -1103,27 +1103,46 @@ async def _push_to_client(ws, state: TurnState, text: str,
     reply_id = f"reply-{turn_id}"
     me = asyncio.current_task()
     claimed = False
+    # A session reset while we wait DROPS this push (it belongs to the old
+    # session) — captured now, re-checked after the wait (the waiting task lives
+    # only in inflight_tasks and is NOT cancelled by _cancel_in_flight).
+    reset_epoch = state.reset_epoch
     # NOTE: the wait-loop is INSIDE the try — a push cancelled while still
     # waiting for the slot (e.g. a queued second push on disconnect) lives only
     # in inflight_tasks and must also route through _handle_cancelled_push
     # (→ back onto _PENDING_PUSHES), otherwise its content vanishes silently.
     try:
-        # Let a running (or imminent) turn finish first (bounded — a wedged
-        # turn must not silence pushes forever).
+        # Wait for a running (or imminent) turn to finish, then claim the reply
+        # slot ATOMICALLY. Claiming only when the machinery is idle — in the same
+        # synchronous step, with no await in between — means a user turn cannot
+        # slip into the slot between the idle check and the claim (which would
+        # make the push speak concurrently and uncancellable via the slot).
+        # Bounded by PUSH_WAIT_TURN_S: a wedged turn must not silence pushes
+        # forever → on deadline the content degrades to a text bubble (the
+        # governing rule: push content is never silently lost).
         deadline = time.time() + PUSH_WAIT_TURN_S
-        while time.time() < deadline:
+        while True:
+            if state.reset_epoch != reset_epoch:
+                # Session reset (own or peer) while we waited → drop.
+                LOG.info("turn=%s push dropped (session reset while waiting)",
+                         turn_id)
+                return
             if not _reply_machinery_busy(state):
+                # Idle now: claim the agent_task slot so an owner barge-in
+                # (_cancel_in_flight) stops push playback like any reply, and
+                # agent_turn_id lets that barge-in's turn.discarded name THIS
+                # push (state.turn_id belongs to the incoming user turn).
+                state.agent_task = me
+                state.agent_turn_id = turn_id
+                claimed = True
                 break
+            if time.time() >= deadline:
+                LOG.info("turn=%s push wait deadline (%.0fs) → text bubble",
+                         turn_id, PUSH_WAIT_TURN_S)
+                _spawn_tracked(state, _push_text_bubble(ws, text))
+                return
             await asyncio.sleep(0.25)
 
-        # Claim the agent_task slot while idle so an owner barge-in
-        # (_cancel_in_flight) stops push playback like any reply. agent_turn_id
-        # lets that barge-in's turn.discarded name THIS push (state.turn_id
-        # belongs to the incoming user turn, not the push).
-        if state.agent_task is None or state.agent_task.done():
-            state.agent_task = me
-            state.agent_turn_id = turn_id
-            claimed = True
         LOG.info("turn=%s gateway push: %r", turn_id, text[:120])
         await ws.send_json({"type": "reply.start", "turnId": turn_id,
                             "replyId": reply_id, "push": True, "ts": time.time()})
@@ -2520,6 +2539,10 @@ async def _ws_text_message(conn: WsConn, data):
 
 async def _ws_session_reset(conn: WsConn, data):
     ws, state = conn.ws, conn.state
+    # Bump BEFORE any await: a push still WAITING for the slot (only in
+    # inflight_tasks, not cancelled by _cancel_in_flight) reads this generation
+    # after its wait and drops itself — the content belongs to the old session.
+    state.reset_epoch += 1
     # Reset starts a fresh session → a push cancelled here belongs to the OLD
     # session and must be dropped, not re-delivered into the new one.
     await _cancel_in_flight(state, ws, push_on_cancel="drop")
@@ -2576,6 +2599,9 @@ async def _ws_session_reset(conn: WsConn, data):
     for peer_ws, peer_state in list(WS_CLIENTS.items()):
         if peer_ws is ws:
             continue
+        # Same generation bump on the peer so ITS waiting pushes drop too (the
+        # session is shared across devices — the reset applies everywhere).
+        peer_state.reset_epoch += 1
         try:
             await _cancel_in_flight(peer_state, peer_ws, push_on_cancel="drop")
         except Exception:

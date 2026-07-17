@@ -126,7 +126,11 @@ auto-reload.
   `channel_prompt`, so the agent weaves the content into its answer to the
   interrupting utterance). **stop-word** → text bubble; **connection close** →
   re-queue onto `_PENDING_PUSHES` for the next connect; **session reset** → drop
-  (fresh session). The surfaced text bubble is an `external.message`
+  (fresh session) — this also covers a push still *waiting* for the slot (own or
+  peer reset, via `TurnState.reset_epoch` checked after the slot wait), and if
+  the slot stays busy past `PUSH_WAIT_TURN_S` the waiting push degrades to a text
+  bubble rather than talking over the occupant. The surfaced text bubble is an
+  `external.message`
   `source:"push", persist:true` (persisted client-side, unlike the ephemeral
   `source:"system"` notices). Gateway token
   streaming arrives as `agent.partial` frames carrying the full accumulated

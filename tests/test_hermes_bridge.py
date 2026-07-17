@@ -11,7 +11,8 @@ import pytest
 from aiohttp import ClientSession, WSMsgType
 
 from plauder.backends.base import UpstreamTimeoutError
-from plauder.backends.llm.hermes_gateway import HermesGatewayLLMBackend
+from plauder.backends.llm.hermes_gateway import (HermesGatewayLLMBackend,
+                                                 PUSH_DEBOUNCE_S)
 from plauder.config import Config, ConfigError
 
 # The gateway plugin lives in the repo but outside the plauder package;
@@ -487,6 +488,56 @@ def test_streamed_orphan_push_spoken_once():
             assert speak is True
             await asyncio.sleep(1.5)   # a full debounce window later …
             assert got.empty()         # … still exactly ONE dispatch
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_two_streamed_orphan_pushes_distinct_ids_each_dispatch_once():
+    """Two DIFFERENT streamed orphan pushes overlapping inside PUSH_DEBOUNCE_S
+    must NOT be coalesced into each other: each message_id keeps its own
+    debounce buffer, so each is dispatched exactly once with its final text
+    (not merged, not double-spoken)."""
+    async def run():
+        server = _mk_server()
+        await server.start()
+        backend = _mk_backend(server.port)
+        got = asyncio.Queue()
+
+        async def on_push(text, speak=True):
+            await got.put(text)
+
+        backend.set_push_handler(on_push)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            # Both streams start (distinct message_ids) within one debounce
+            # window, interleaved chunk by chunk.
+            await server.send_frame("default", {
+                "type": "agent.message", "text": "Erste",
+                "turn_id": None, "push": True, "message_id": "mA"})
+            await server.send_frame("default", {
+                "type": "agent.message", "text": "Zweite",
+                "turn_id": None, "push": True, "message_id": "mB"})
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": None, "message_id": "mA",
+                "text": "Erste Nachricht fertig.", "finalize": True})
+            await server.send_frame("default", {
+                "type": "agent.partial", "turn_id": None, "message_id": "mB",
+                "text": "Zweite Nachricht fertig.", "finalize": True})
+            first = await asyncio.wait_for(got.get(), timeout=3)
+            second = await asyncio.wait_for(got.get(), timeout=3)
+            assert {first, second} == {"Erste Nachricht fertig.",
+                                       "Zweite Nachricht fertig."}, \
+                (first, second)
+            # A full debounce window later: no extra (coalesced/duplicate) push.
+            await asyncio.sleep(PUSH_DEBOUNCE_S + 0.3)
+            assert got.empty()
         finally:
             await backend.close()
             await server.stop()

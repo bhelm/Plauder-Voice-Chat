@@ -642,3 +642,274 @@ def test_normal_turn_after_push_is_clean():
             await ws.close()
 
     asyncio.run(run())
+
+
+# ============================================================================ #
+# A. Confirmed bugs — the waiting-push slot-wait loop.
+# ============================================================================ #
+def test_session_reset_drops_waiting_push():
+    """A push still in its slot-wait loop (only in inflight_tasks, has NOT
+    claimed agent_task) must be DROPPED by a session reset — reset is the
+    sanctioned drop (the content belongs to the old session). It must not
+    speak into the fresh session, and (unlike a close) must not re-queue."""
+    _configure(tts=SlowTTS(chunk_delay=0.05, chunks=8))
+    t1, t2 = "Erste spricht schon.", "Zweite wartet noch."
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await srv.handle_gateway_push(t1)   # speaks, claims the slot
+            await _collect(ws, until=lambda f: f.get("type") == "audio.start",
+                           timeout=4.0)
+            await srv.handle_gateway_push(t2)   # waits for the slot
+            # Session reset: t1 (speaking) is cancelled via agent_task → dropped;
+            # t2 (still waiting) must ALSO drop.
+            await ws.send_json({"type": "session.reset"})
+            ack, seen, _ = await _drain_until(ws, "session.reset.ack", timeout=4.0)
+            assert ack is not None, f"no reset ack; saw {seen}"
+            # Let the (now-unblocked) waiting push task run if it wrongly would.
+            frames, _ = await _collect(ws, timeout=1.5)
+            spoken = {f.get("text") for f in frames
+                      if f.get("type") == "reply" and f.get("push")}
+            assert t2 not in spoken, (
+                f"a waiting push must NOT speak into the fresh session; got {spoken}")
+            assert not srv._PENDING_PUSHES, (
+                "a reset DROPS the waiting push (not re-queue); got "
+                f"{list(srv._PENDING_PUSHES)}")
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_peer_session_reset_drops_waiting_push_on_other_client():
+    """A reset from ANOTHER connected browser is global (one shared session) →
+    it must drop the peer's still-waiting pushes too, not only the resetter's."""
+    _configure(tts=SlowTTS(chunk_delay=0.05, chunks=6))
+    push_text = "Hintergrund-Info."
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            wsA = await client.ws_connect("/ws")
+            await wsA.receive_json()  # hello
+            wsB = await client.ws_connect("/ws")
+            await wsB.receive_json()  # hello
+            # Occupy A's reply slot with a user turn so a push to A must WAIT.
+            await wsA.send_json({"type": "text.message", "text": "lange frage"})
+            await _collect(wsA, until=lambda f: f.get("type") == "audio.start",
+                           timeout=4.0)
+            # Push reaches BOTH: A queues it (A busy), B speaks it.
+            await srv.handle_gateway_push(push_text)
+            await _collect(wsB, until=lambda f: f.get("type") == "reply.start",
+                           timeout=4.0)
+            # B resets the shared session → A's waiting push must drop as well.
+            await wsB.send_json({"type": "session.reset"})
+            await _drain_until(wsB, "session.reset.ack", timeout=4.0)
+            # A's user turn finishes and frees A's slot; without the peer epoch
+            # bump A's waiting push would then wrongly speak the stale content.
+            frames, _ = await _collect(wsA, timeout=3.0)
+            spoken = {f.get("text") for f in frames
+                      if f.get("type") == "reply" and f.get("push")}
+            assert push_text not in spoken, (
+                f"a peer reset must drop A's waiting push; got {spoken}")
+            assert not srv._PENDING_PUSHES, list(srv._PENDING_PUSHES)
+            await wsA.close()
+            await wsB.close()
+
+    asyncio.run(run())
+
+
+def test_push_slot_claim_failure_degrades_to_text_not_concurrent():
+    """When the reply slot stays occupied for the whole (bounded) wait window,
+    the push must NOT speak concurrently with whatever holds the slot — it
+    degrades to a persisted text bubble on deadline expiry (content never
+    silently lost). Pins agent_task to a live dummy for the wait window."""
+    _configure(tts=SlowTTS())
+    push_text = "Wichtige Info."
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            # Grab the server-side state; pin the reply slot to a live task that
+            # never finishes → the slot is taken for the push's whole window.
+            state = list(srv.WS_CLIENTS.values())[0]
+
+            async def _forever():
+                await asyncio.sleep(30)
+
+            dummy = asyncio.create_task(_forever())
+            state.agent_task = dummy
+            orig_wait = srv.PUSH_WAIT_TURN_S
+            srv.PUSH_WAIT_TURN_S = 0.5   # shrink the bounded wait for the test
+            try:
+                await srv.handle_gateway_push(push_text)
+                frames, _ = await _collect(ws, timeout=2.5)
+            finally:
+                srv.PUSH_WAIT_TURN_S = orig_wait
+                dummy.cancel()
+
+            push_starts = [f for f in frames
+                           if f.get("type") == "reply.start" and f.get("push")]
+            push_replies = [f for f in frames
+                            if f.get("type") == "reply" and f.get("push")]
+            assert not push_starts and not push_replies, (
+                "a push must not speak while the reply slot is taken; saw "
+                f"{_types(frames)}")
+            bubbles = _push_texts_of(frames)
+            assert any(b.get("text") == push_text and b.get("persist")
+                       for b in bubbles), (
+                "a deadline-expired push must degrade to a persisted text "
+                f"bubble; saw {_types(frames)}")
+            await ws.close()
+
+    asyncio.run(run())
+
+
+# ============================================================================ #
+# B. Fragile/untested — pin CURRENT behavior (do NOT change it).
+# ============================================================================ #
+def test_push_reopens_wake_window_on_playback_done_PINNED():
+    """DELIBERATE-OPEN DESIGN QUESTION (user decision pending): after an
+    UNINVITED background push, the client's playback.done currently reopens the
+    wake conversation window (reason='done') exactly like a real reply, leaving
+    the mic wake-free. This PINS the current behavior — do NOT change it."""
+    _configure()
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await ws.send_json({"type": "settings", "wakeWordEnabled": True})
+            await _drain_until(ws, "settings.ack", timeout=2.0)
+            await srv.handle_gateway_push("Hintergrund fertig.")
+            await _drain_until(ws, "audio.end", timeout=5.0)
+            # Client reports playback finished → current behavior reopens window.
+            await ws.send_json({"type": "playback.done"})
+            win, seen, _ = await _drain_until(ws, "wake.window", timeout=3.0)
+            assert win is not None, (
+                f"push playback.done currently reopens the wake window; saw {seen}")
+            assert win.get("reason") == "done"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_push_under_streaming_off_uses_synth_fallback():
+    """STREAMING=0 with a synth-only TTS (no synth_stream): a push always goes
+    through the streaming machinery, degrading via _tts_synth_stream's synth()
+    fallback. End to end: a push reply frame plus streamed VCT2 audio."""
+    _configure(streaming=False, tts=FakeTTS())   # FakeTTS has no synth_stream
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            await srv.handle_gateway_push("Auch ohne Streaming.")
+            reply, seen, b1 = await _drain_until(ws, "reply", timeout=5.0)
+            assert reply is not None, f"no reply; saw {seen}"
+            assert reply.get("push") is True
+            assert reply["text"] == "Auch ohne Streaming."
+            end, seen2, b2 = await _drain_until(ws, "audio.end", timeout=5.0)
+            assert end is not None, f"no audio.end; saw {seen + seen2}"
+            # Streaming machinery is used even under STREAMING=0 → VCT2 chunks.
+            assert (b1 or b2)[:4] == b"VCT2"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_push_reaches_both_clients_bargein_cancels_only_one():
+    """Multi-client: a fresh push reaches BOTH connected browsers; A's barge-in
+    cancels ONLY A's delivery (A gets turn.discarded), while B keeps playing
+    (no turn.discarded, its push reply completes normally)."""
+    llm = RecordingLLM()
+    _configure(tts=SlowTTS(chunk_delay=0.05, chunks=8), llm=llm)
+    push_text = "An alle Geräte."
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            wsA = await client.ws_connect("/ws")
+            await wsA.receive_json()  # hello
+            wsB = await client.ws_connect("/ws")
+            await wsB.receive_json()  # hello
+            await srv.handle_gateway_push(push_text)
+            # Ensure A's push is audibly streaming, then barge in on A only.
+            # (wsB is intentionally NOT drained here: its whole push stream —
+            # including the early `reply` frame — is collected in one pass below.)
+            aA, _ = await _collect(
+                wsA, until=lambda f: f.get("type") == "audio.start", timeout=4.0)
+            assert aA and aA[-1]["type"] == "audio.start"
+            await wsA.send_json({"type": "text.message", "text": "stopp mal"})
+            dA, _ = await _collect(
+                wsA, until=lambda f: f.get("type") == "turn.discarded", timeout=4.0)
+            assert dA and dA[-1]["type"] == "turn.discarded"
+            # B is unaffected: no turn.discarded, its push reply finishes.
+            fB, _ = await _collect(
+                wsB, until=lambda f: f.get("type") == "audio.end", timeout=6.0)
+            assert fB and fB[-1]["type"] == "audio.end", (
+                f"B's push must complete with audio.end; saw {_types(fB)}")
+            assert "turn.discarded" not in _types(fB), (
+                f"B must not be cancelled by A's barge-in; saw {_types(fB)}")
+            assert any(f.get("type") == "reply" and f.get("push")
+                       and f.get("text") == push_text for f in fB), (
+                f"B's push reply must complete; saw {_types(fB)}")
+            await wsA.close()
+            await wsB.close()
+
+    asyncio.run(run())
+
+
+def test_flush_pending_pushes_drains_to_first_connector_only():
+    """Drain-once contract: an offline-queued push is spoken by the FIRST
+    browser that connects; a later second browser gets nothing from the queue."""
+    _configure()
+
+    async def run():
+        await srv.handle_gateway_push("Wartende Nachricht.")   # queued, no client
+        assert len(srv._PENDING_PUSHES) == 1
+
+        async with TestClient(TestServer(srv.build_app())) as client:
+            wsA = await client.ws_connect("/ws")
+            await wsA.receive_json()  # hello
+            rA, seenA, _ = await _drain_until(wsA, "reply", timeout=5.0)
+            assert rA is not None, f"first connector must speak it; saw {seenA}"
+            assert rA["text"] == "Wartende Nachricht." and rA.get("push")
+            assert len(srv._PENDING_PUSHES) == 0
+            # A second, later client gets nothing from the (already drained) queue.
+            wsB = await client.ws_connect("/ws")
+            await wsB.receive_json()  # hello
+            rB, seenB, _ = await _drain_until(wsB, "reply", timeout=1.5)
+            assert rB is None, (
+                f"queue drains ONCE to the first connector only; B saw {seenB}")
+            await wsA.close()
+            await wsB.close()
+
+    asyncio.run(run())
+
+
+def test_queued_silent_notice_delivered_as_system_message_on_connect():
+    """A speak=False push queued while no client is connected → on connect it
+    is delivered as an external.message (source 'system'), with NO
+    reply.start / audio frames (a silent notice, never synthesized)."""
+    _configure()
+
+    async def run():
+        await srv.handle_gateway_push("♻️ Wartung erledigt", speak=False)
+        assert len(srv._PENDING_PUSHES) == 1
+
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await ws.receive_json()  # hello
+            evt, seen, binary = await _drain_until(
+                ws, "external.message", timeout=4.0)
+            assert evt is not None, f"no external.message; saw {seen}"
+            assert evt["text"] == "♻️ Wartung erledigt"
+            assert evt["source"] == "system"
+            assert "reply.start" not in seen
+            assert "audio.start" not in seen
+            assert binary is None
+            assert len(srv._PENDING_PUSHES) == 0
+            await ws.close()
+
+    asyncio.run(run())
