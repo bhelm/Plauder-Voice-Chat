@@ -8,23 +8,28 @@ not even imported in the first place (see STTBackend.from_config).
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import numpy as np
 
 from ... import audio as audio_utils
 from .base import STTBackend
 
+LOG = logging.getLogger("voice-chat")
+
 
 class WhisperLocalSTTBackend(STTBackend):
     def __init__(self, *, model: str = "large-v3-turbo", device: str = "cuda",
                  compute_type: str = "int8", beam_size: int = 5,
-                 language: str | None = "de", local_files_only: bool = True):
+                 language: str | None = "de", local_files_only: bool = True,
+                 condition_on_previous_text: bool = False):
         self.model_name = model
         self.device = device
         self.compute_type = compute_type
         self.beam_size = beam_size
         self.language = language
         self.local_files_only = local_files_only
+        self.condition_on_previous_text = condition_on_previous_text
         self._model = None
         self._lock = asyncio.Lock()
         self.last_no_speech_prob = None
@@ -38,6 +43,7 @@ class WhisperLocalSTTBackend(STTBackend):
             beam_size=cfg.whisper_beam_size,
             language=cfg.stt_language,
             local_files_only=cfg.whisper_local_files_only,
+            condition_on_previous_text=cfg.whisper_condition_on_previous_text,
         )
 
     async def load(self) -> None:
@@ -52,12 +58,36 @@ class WhisperLocalSTTBackend(STTBackend):
             ) from exc
 
         def _build():
-            return WhisperModel(
-                self.model_name,
-                device=self.device,
-                compute_type=self.compute_type,
-                local_files_only=self.local_files_only,
-            )
+            # "Download only when not already local" — the requested behavior:
+            # ALWAYS try an offline load first (from the HF cache or a local
+            # path). Only if the model is genuinely missing do we fall back to
+            # a network download. This avoids the per-start HuggingFace API
+            # revision check that `local_files_only=False` triggers even when
+            # the weights are already cached.
+            #
+            # An explicit WHISPER_LOCAL_FILES_ONLY=1 (self.local_files_only)
+            # stays a hard offline lock: never touch the network, even to
+            # fetch a missing model — the startup then fails loudly, as before.
+            try:
+                return WhisperModel(
+                    self.model_name,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                if self.local_files_only:
+                    # Hard offline lock requested — do not download; re-raise.
+                    raise
+                LOG.info(
+                    "whisper: %r not in local cache (%s) — downloading once",
+                    self.model_name, type(exc).__name__)
+                return WhisperModel(
+                    self.model_name,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    local_files_only=False,
+                )
 
         self._model = await asyncio.to_thread(_build)
 
@@ -82,6 +112,7 @@ class WhisperLocalSTTBackend(STTBackend):
             np.asarray(samples, dtype=np.float32),
             language=self.language,
             beam_size=self.beam_size,
+            condition_on_previous_text=self.condition_on_previous_text,
         )
         parts = []
         no_speech = []

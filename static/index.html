@@ -5,6 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title data-i18n="app_title">🎙️ Plauder</title>
   <link rel="stylesheet" href="__BASE_PATH__/static/style.css?v=__ASSET_VER__">
+
+  <!-- Waifu-Avatar (optional): Import-Map loest three/three-vrm ohne Build-Step auf.
+       Harmlos wenn Avatar aus bleibt — laedt nichts, bis waifu_ui.js mountet. -->
+  <script>
+    // Server-Default fuer den Avatar (aus WAIFU_MODE). "1" = beim Start an.
+    window.__WAIFU_MODE__ = ("__WAIFU_MODE__" === "1");
+  </script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "__BASE_PATH__/static/vendor/three/three.module.js",
+      "three/addons/": "__BASE_PATH__/static/vendor/three/addons/",
+      "three-vrm": "__BASE_PATH__/static/vendor/three-vrm/three-vrm.module.js",
+      "three-vrm-animation": "__BASE_PATH__/static/vendor/three-vrm/three-vrm-animation.module.js"
+    }
+  }
+  </script>
 </head>
 <body>
   <header>
@@ -137,6 +154,95 @@
         </div>
       </details>
 
+      <!-- House-Mode speaker recognition (multi-speaker identification): who is
+           speaking right now. Hidden unless the server has the identifier
+           loaded (hello.houseSpeaker). Reuses the voice-lock card chrome. -->
+      <details class="acc vlock house" id="houseIdCard" style="display:none;" open data-sec="houseid">
+        <summary class="vlock-head">
+          <div class="vlock-badge" id="houseIdBadge">🏠</div>
+          <div>
+            <div class="vlock-title" data-i18n="settings.houseid">Speaker recognition</div>
+            <div class="vlock-sub" data-i18n="houseid.tagline">Knows who is speaking</div>
+          </div>
+          <span class="vlock-chip" id="houseIdChip"></span>
+        </summary>
+        <div class="acc-body">
+          <div data-i18n="houseid.help" style="font-size: 11px; color: var(--muted);">
+            Every spoken segment is matched against the enrolled household voices, so the assistant knows who is talking.
+          </div>
+
+          <div class="vlock-toggle">
+            <span data-i18n="houseid.active_label">Recognition active</span>
+            <label class="switch">
+              <input type="checkbox" id="houseIdToggle" checked />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </label>
+          </div>
+
+          <!-- Speaker management: pick a speaker, add/rename/delete, and
+               manage the samples (voice registers) of the selected one. -->
+          <div class="voices-picker">
+            <select id="houseSpkSelect" class="voice-select" data-i18n-title="houseid.pick_title"></select>
+            <div class="voices-actions">
+              <button id="houseSpkAddBtn" data-i18n-title="houseid.add">➕</button>
+              <button id="houseSpkRenameBtn" data-i18n-title="houseid.rename">✏️</button>
+              <button id="houseSpkDeleteBtn" class="danger" data-i18n-title="houseid.delete">🗑</button>
+            </div>
+          </div>
+          <!-- Free-text role of the selected speaker (e.g. admin/dad/friend);
+               sent to the LLM as part of the speaker tag on every utterance. -->
+          <div class="houseid-role" data-i18n-title="houseid.role_title"
+               title="Sent to the assistant as a tag with everything this person says.">
+            <span data-i18n="houseid.role_label">Role</span>
+            <input id="houseSpkRole" type="text" maxlength="60"
+                   data-i18n-placeholder="houseid.role_placeholder"
+                   placeholder="e.g. admin, dad, friend …" />
+          </div>
+          <div class="vlock-metric">
+            <span data-i18n="houseid.samples">Samples</span>
+            <b id="houseSpkSampleCount">–</b>
+          </div>
+          <div id="houseSpkSamples" class="houseid-samples"></div>
+          <button id="houseSpkRecordBtn" class="vlock-enroll">
+            <span class="vlock-prog" id="houseSpkProg"></span>
+            <span><span class="vlock-rec-dot"></span> <span id="houseSpkRecordLabel" data-i18n="houseid.record">🎙️ Record sample</span></span>
+          </button>
+
+          <!-- Live: last segment's best match (name + score) vs the confirm
+               threshold (marker). Speak to tune. -->
+          <div id="houseIdTuner">
+            <div class="vlock-metric">
+              <span data-i18n="houseid.lastmatch">Last speaker</span>
+              <b id="houseIdScore">–</b>
+            </div>
+            <div class="vlock-meter">
+              <div class="vlock-meter-bar" id="houseIdMeterBar"></div>
+              <div class="vlock-meter-mark" id="houseIdMeterMark"></div>
+            </div>
+            <div class="vlock-metric" style="margin-top:10px;">
+              <span data-i18n="houseid.sim_label">Confirm threshold (same speaker)</span>
+            </div>
+            <div class="slider-row">
+              <input id="houseIdSim" type="range" min="0.2" max="0.9" step="0.02" value="0.5" />
+              <span id="houseIdSimLabel" class="num">0.50</span>
+            </div>
+            <div data-i18n="houseid.sim_help" style="font-size:11px;color:var(--muted);margin-top:4px;">
+              A match right of the marker confirms the recognized speaker. Higher = stricter.
+            </div>
+            <div class="vlock-metric" style="margin-top:10px;">
+              <span data-i18n="houseid.switch_label">Switch threshold (new speaker)</span>
+            </div>
+            <div class="slider-row">
+              <input id="houseIdSwitch" type="range" min="0.2" max="0.95" step="0.02" value="0.6" />
+              <span id="houseIdSwitchLabel" class="num">0.60</span>
+            </div>
+            <div data-i18n="houseid.switch_help" style="font-size:11px;color:var(--muted);margin-top:4px;">
+              How clearly a different voice must match before it takes over as the active speaker. Higher = stickier.
+            </div>
+          </div>
+        </div>
+      </details>
+
       <!-- Voice library: clone a speaking voice (record or upload), name it,
            pick the active one for the whole session. Hidden unless the server
            has voice cloning wired (hello.voiceClone.available). -->
@@ -186,20 +292,41 @@
         <summary>🎚️ <span data-i18n="settings.sec_detection">Detection &amp; timing</span></summary>
         <div class="acc-body">
           <div class="card" id="vadThreshCard">
-            <div class="label" data-i18n="settings.vad_sensitivity">VAD sensitivity</div>
+            <div class="label" data-i18n="settings.vad_sensitivity">VAD sensitivity (speech probability)</div>
             <div class="slider-row">
-              <input id="vadThreshold" type="range" min="0.1" max="0.95" step="0.05" value="0.6" />
-              <span id="vadThresholdLabel" class="num">0.60</span>
+              <input id="vadThreshold" type="range" min="0" max="100" step="1" value="60" />
+              <span id="vadThresholdLabel" class="num">60%</span>
             </div>
-            <div class="vad-prob" data-i18n-title="vad.live_title" title="Live speech level of the VAD">
+            <div class="vad-prob" data-i18n-title="vad.live_title" title="Live speech probability (Silero) — lights up green above the threshold">
               <div id="vadProbBar" class="vad-prob-bar"></div>
-              <div id="vadProbMark" class="vad-prob-mark"></div>
+              <div id="vadThreshMark" class="vad-prob-mark"></div>
             </div>
             <div data-i18n-html="settings.vad_sensitivity_help" style="font-size: 11px; color: var(--muted); margin-top: 6px;">
-              Lower = more sensitive (reacts to quiet/short sounds). Higher = you have to
-              speak more clearly. To test, speak: if the green level stays <b>below</b> the
-              red line while only background noise/TTS is playing, and shoots <b>above</b> it
-              when you speak — then the threshold is right.
+              How sure Silero must be that it hears <b>speech</b> (not noise). The bar
+              shows the live speech probability, the mark is your threshold; it <b>lights
+              up green</b> while speech is detected. Loudness is deliberately ignored here
+              — that is what the microphone level below is for.
+            </div>
+          </div>
+
+          <div class="card" id="micLevelCard">
+            <div class="label" data-i18n="settings.mic_level">Microphone level</div>
+            <div class="vad-prob" data-i18n-title="mic.level_title" title="Live microphone level in dB — the red mark is the activation threshold">
+              <div id="micLevelBar" class="meter-bar"></div>
+              <div id="micLevelMark" class="vad-prob-mark" style="display:none;"></div>
+            </div>
+            <div class="vlock-metric" style="margin-top:10px;">
+              <span data-i18n="settings.mic_min_level">Minimum level (activation)</span>
+            </div>
+            <div class="slider-row">
+              <input id="micMinLevel" type="range" min="-60" max="0" step="1" value="-60" />
+              <span id="micMinLevelLabel" class="num">off</span>
+            </div>
+            <div data-i18n-html="settings.mic_min_level_help" style="font-size: 11px; color: var(--muted); margin-top: 4px;">
+              <b>Hard activation threshold:</b> speech detection only engages while the
+              mic level is above the <b>red mark</b>. Anything quieter — people talking
+              in the background, distant voices — never starts a take and nothing is
+              transcribed. “Off” = every level passes.
             </div>
           </div>
 
@@ -270,6 +397,35 @@
         </div>
       </details>
 
+      <!-- ── Section: Waifu-Avatar (optional, default aus) ──────────────── -->
+      <details class="acc" data-sec="waifu" id="waifuCard">
+        <summary>🎭 <span data-i18n="settings.sec_waifu">VTuber-Avatar</span></summary>
+        <div class="acc-body">
+          <div class="card">
+            <label class="mode-pill" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+              <input type="checkbox" id="waifuToggle" />
+              <span data-i18n="waifu.enable">Avatar anzeigen</span>
+            </label>
+            <div data-i18n="waifu.enable_help" style="font-size:11px;color:var(--muted);margin-top:6px;">
+              Zeigt Joy als 3D-Avatar. Lädt erst beim Einschalten (kein Overhead wenn aus).
+            </div>
+          </div>
+
+          <div class="card" id="waifuStageCard" style="display:none;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+              <div class="label" style="margin:0;" data-i18n="waifu.avatar">Joy</div>
+              <button id="waifuPopoutBtn" class="close-btn" data-i18n-title="waifu.popout" title="In eigenes Fenster lösen" style="font-size:16px;">⧉</button>
+            </div>
+            <div id="waifuStage" style="width:100%;aspect-ratio:3/4;background:radial-gradient(circle at 50% 30%,#232838,#14161c);border-radius:10px;overflow:hidden;position:relative;">
+              <canvas id="waifuCanvas" style="width:100%;height:100%;display:block;"></canvas>
+              <div id="waifuPoppedNote" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:12px;padding:12px;">
+                <span data-i18n="waifu.popped">Avatar ist im Pop-out-Fenster.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+
       <div class="footer-note" id="footerNote" data-i18n-html="footer.note">
         Speak → pause → the agent replies.<br />
         Speak again while the agent is thinking → its reply is discarded.
@@ -328,6 +484,7 @@
   <script src="__BASE_PATH__/static/js/vct.js?v=__ASSET_VER__"></script>
   <script src="__BASE_PATH__/static/js/playback.js?v=__ASSET_VER__"></script>
   <script src="__BASE_PATH__/static/js/mic.js?v=__ASSET_VER__"></script>
+  <script src="__BASE_PATH__/static/js/waifu_ui.js?v=__ASSET_VER__"></script>
 
   <script>
     /* ===== i18n =====
@@ -466,6 +623,28 @@
     const voiceLockThresholdLabel = document.getElementById('voiceLockThresholdLabel');
     const voiceLockToggleRow = document.getElementById('voiceLockToggleRow');
     const voiceLockToggle    = document.getElementById('voiceLockToggle');
+    const houseIdCard      = document.getElementById('houseIdCard');
+    const houseIdBadge     = document.getElementById('houseIdBadge');
+    const houseIdChip      = document.getElementById('houseIdChip');
+    const houseIdToggle    = document.getElementById('houseIdToggle');
+    const houseIdTuner     = document.getElementById('houseIdTuner');
+    const houseIdScore     = document.getElementById('houseIdScore');
+    const houseIdMeterBar  = document.getElementById('houseIdMeterBar');
+    const houseIdMeterMark = document.getElementById('houseIdMeterMark');
+    const houseIdSim       = document.getElementById('houseIdSim');
+    const houseIdSimLabel  = document.getElementById('houseIdSimLabel');
+    const houseIdSwitch      = document.getElementById('houseIdSwitch');
+    const houseIdSwitchLabel = document.getElementById('houseIdSwitchLabel');
+    const houseSpkSelect      = document.getElementById('houseSpkSelect');
+    const houseSpkAddBtn      = document.getElementById('houseSpkAddBtn');
+    const houseSpkRenameBtn   = document.getElementById('houseSpkRenameBtn');
+    const houseSpkDeleteBtn   = document.getElementById('houseSpkDeleteBtn');
+    const houseSpkRole        = document.getElementById('houseSpkRole');
+    const houseSpkSampleCount = document.getElementById('houseSpkSampleCount');
+    const houseSpkSamples     = document.getElementById('houseSpkSamples');
+    const houseSpkRecordBtn   = document.getElementById('houseSpkRecordBtn');
+    const houseSpkRecordLabel = document.getElementById('houseSpkRecordLabel');
+    const houseSpkProg        = document.getElementById('houseSpkProg');
     const voicesCard       = document.getElementById('voicesCard');
     const voicesChip       = document.getElementById('voicesChip');
     const voiceSelect      = document.getElementById('voiceSelect');
@@ -596,7 +775,11 @@
     const vadThreshold      = document.getElementById('vadThreshold');
     const vadThresholdLabel = document.getElementById('vadThresholdLabel');
     const vadProbBar        = document.getElementById('vadProbBar');
-    const vadProbMark       = document.getElementById('vadProbMark');
+    const vadThreshMark     = document.getElementById('vadThreshMark');
+    const micLevelBar       = document.getElementById('micLevelBar');
+    const micLevelMark      = document.getElementById('micLevelMark');
+    const micMinLevel       = document.getElementById('micMinLevel');
+    const micMinLevelLabel  = document.getElementById('micMinLevelLabel');
 
 
     /* ===== Helper functions ===== */
@@ -1135,6 +1318,10 @@
     function opusDownlinkActive() { return opusSupport.dec && serverAudioCaps.opusOut; }
     let serverWake = { available: false, enabled: false }; // wake-word info (from hello)
     let serverSpeaker = { available: false, enrolled: false, count: 0 }; // voice-lock (from hello)
+    let serverHouse = { available: false, count: 0 };  // house speaker-ID (from hello)
+    // Runtime on/off for the house speaker recognition (persisted). Re-asserted
+    // to the server on every (re)connect via sendSettings(); default on.
+    let houseIdOn = localStorage.getItem('houseIdOn') !== '0';
     // Voice library (cloned voices) from hello.voiceClone / voice.state broadcasts.
     let serverVoiceClone = { available: false, active: 'default', voices: [] };
     const VOICE_CLONE_SECONDS = 15;
@@ -1421,6 +1608,8 @@
         serverWake = m.wakeWord || { available: false, enabled: false };
         if (m.speakerLock) serverSpeaker = m.speakerLock;
         updateVoiceLockUi();
+        if (m.houseSpeaker) serverHouse = m.houseSpeaker;
+        updateHouseIdUi();
         if (m.voiceClone) serverVoiceClone = {
           available: !!m.voiceClone.available,
           active: m.voiceClone.active || 'default',
@@ -1611,6 +1800,21 @@
           addBubble('err', t('voicelock.error', { err: m.error || '?' }));
         }
       },
+      'house.speakers': (m) => {
+        // Fresh speaker list after any management mutation (all browsers).
+        serverHouse.speakers = m.speakers || [];
+        serverHouse.count = serverHouse.speakers.length;
+        serverHouse.names = serverHouse.speakers.map(s => s.name);
+        updateHouseIdUi();
+      },
+      'house.enroll.ack': (m) => {
+        if (m.ok) addBubble('sys', t('houseid.saved', { name: m.name, count: m.count }));
+        else addBubble('err', t('houseid.error', { err: m.error || '?' }));
+      },
+      'house.error': (m) => {
+        addBubble('err', t('houseid.error',
+          { err: (m.op ? m.op + ': ' : '') + (m.error || '?') }));
+      },
       'speaker.status': (m) => {
         serverSpeaker.available = !!m.available;
         serverSpeaker.enrolled = !!m.enrolled;
@@ -1635,9 +1839,11 @@
         else cancelWakeWindowTimer();
       },
       'wake.closed': (m) => {
-        // Window ended (stop command / manual / Alexa one-shot) → timer
-        // off + closing cue. In one-shot mode this happens after EVERY
-        // reply → no bubble (otherwise spam), just the subtle cue.
+        // Window ended (stop command / trailing "Ende" end marker / manual /
+        // Alexa one-shot) → timer off + closing cue. In one-shot mode this
+        // happens after EVERY reply → no bubble (otherwise spam), just the
+        // subtle cue. reason=end_command keeps the default path: the reply
+        // to the rest of the sentence still plays, only the window closes.
         // Ein Stopp-Kommando muss auch die CLIENTSEITIG noch gepufferten
         // Audio-Sekunden stoppen: der Server kann nach audio.end kein
         // audio.stop mehr für diese Id senden (audio_ids bereits geräumt).
@@ -1658,6 +1864,7 @@
         // (overwritten by turn.pending below, but for edge cases)
         lastLatency.textContent = `${m.sttMs}ms`;
         if (typeof m.speakerScore === 'number') showVoiceMatch(m.speakerScore);  // voice-lock: owner accepted
+        if (m.speaker) showHouseMatch(m.speaker);   // house speaker-ID: who spoke
         // Voice lock: inline coloring — vanished speech stays visible, struck
         // red in place. Base for the diff: the server's pre-trim full text,
         // or (when Whisper's final pass silently dropped speech a partial had
@@ -1939,6 +2146,9 @@
       };
       if (speakerThreshold != null) s.speakerThreshold = speakerThreshold;
       s.speakerLockEnabled = speakerLockOn;
+      if (houseSimThreshold != null) s.houseSimThreshold = houseSimThreshold;
+      if (houseSwitchThreshold != null) s.houseSwitchThreshold = houseSwitchThreshold;
+      s.houseSpeakerEnabled = houseIdOn;
       s.echoMode = echoMode;
       // Downlink codec wish: opus when both sides support it (see opusSupport).
       s.audioCodec = opusDownlinkActive() ? 'opus' : 'pcm';
@@ -2071,46 +2281,73 @@
     });
     debounce.addEventListener('change', () => { saveSetting('debounce', debounce.value); sendSettings(); });
 
-    // Vom User gewaehlte VAD-Aktivierungsschwelle (0..1). Hoeher = unempfindlicher
-    // (need to speak louder). Persisted in localStorage. MUST come before
-    // the slider wiring (let -> no hoisting/TDZ).
+    // Vom User gewaehlte VAD-Aktivierungsschwelle (0..1). Hoeher = unempfindlicher.
+    // Der Slider zeigt sie als 0–100 % (Silero-Sprachwahrscheinlichkeit);
+    // gespeichert wird weiter der 0..1-Float ('vadThreshold', abwärtskompatibel).
+    // MUST come before the slider wiring (let -> no hoisting/TDZ).
     let vadActivationThreshold = (() => {
       const v = parseFloat(localStorage.getItem('vadThreshold') || '');
-      return Number.isFinite(v) && v > 0 && v < 1 ? v : 0.6;
+      return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.6;
     })();
 
+    // Silero passes p >= positiveSpeechThreshold — at slider 0 % that must
+    // still be reachable, so the value handed to the library floors at 0.01
+    // (display/storage keep the raw percentage).
+    function vadSileroOpts() {
+      const pos = Math.max(0.01, vadActivationThreshold);
+      return {
+        positiveSpeechThreshold: pos,
+        negativeSpeechThreshold: Math.max(0.01, pos - 0.15),
+      };
+    }
+    function renderVadThreshold() {
+      const pct = Math.round(vadActivationThreshold * 100);
+      vadThreshold.value = String(pct);
+      vadThresholdLabel.textContent = pct + '%';
+      if (vadThreshMark) vadThreshMark.style.left = pct + '%';
+    }
     // VAD sensitivity: the slider sets the activation threshold. Takes effect
     // immediately on the barge-in comparison (vadActivationThreshold) and — on the next
     // VAD restart — on the segmentation's positiveSpeechThreshold.
-    function positionVadMark() {
-      if (!vadProbMark) return;
-      const min = 0.1, max = 0.95;
-      const pct = ((vadActivationThreshold - min) / (max - min)) * 100;
-      vadProbMark.style.left = Math.max(0, Math.min(100, pct)) + '%';
-    }
     if (vadThreshold) {
-      vadThreshold.value = String(vadActivationThreshold);
-      vadThresholdLabel.textContent = vadActivationThreshold.toFixed(2);
-      positionVadMark();
+      renderVadThreshold();
       vadThreshold.addEventListener('input', () => {
-        vadActivationThreshold = parseFloat(vadThreshold.value);
-        vadThresholdLabel.textContent = vadActivationThreshold.toFixed(2);
-        positionVadMark();
+        vadActivationThreshold = (parseInt(vadThreshold.value, 10) || 0) / 100;
+        renderVadThreshold();
         // Segmentation threshold follows the slider LIVE while dragging
         // (barge-in already reads vadActivationThreshold directly).
-        applyVadOptionsLive({
-          positiveSpeechThreshold: vadActivationThreshold,
-          negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
-        });
+        applyVadOptionsLive(vadSileroOpts());
       });
       vadThreshold.addEventListener('change', () => {
         localStorage.setItem('vadThreshold', String(vadActivationThreshold));
         // Apply the new threshold to the running VAD segmentation — live if
         // possible, full restart only as fallback.
-        if (vadLike() && micActive && !applyVadOptionsLive({
-              positiveSpeechThreshold: vadActivationThreshold,
-              negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
-            })) restartVadSoon();
+        if (vadLike() && micActive && !applyVadOptionsLive(vadSileroOpts())) restartVadSoon();
+      });
+    }
+
+    // Mic activation gate: slider + red mark live on the mic level meter's dB
+    // scale (−60…0 dBFS), so what you see is exactly what gates. State
+    // (micMinLevelDb, persisted as 'micMinLevelDb') and enforcement live in mic.js.
+    function renderMicMinLevel() {
+      if (!micMinLevel) return;
+      micMinLevel.value = String(micMinLevelDb);
+      micMinLevelLabel.textContent = micMinLevelDb > MIC_GATE_OFF_DB
+        ? micMinLevelDb + ' dB' : t('vad.level_off');
+      if (micLevelMark) {
+        micLevelMark.style.display = micMinLevelDb > MIC_GATE_OFF_DB ? '' : 'none';
+        micLevelMark.style.left = dbToMeterPct(micMinLevelDb) + '%';
+      }
+    }
+    if (micMinLevel) {
+      renderMicMinLevel();
+      micMinLevel.addEventListener('input', () => {
+        const v = parseInt(micMinLevel.value, 10);
+        micMinLevelDb = Number.isFinite(v) ? v : MIC_GATE_OFF_DB;
+        renderMicMinLevel();   // gate reads micMinLevelDb live, no restart needed
+      });
+      micMinLevel.addEventListener('change', () => {
+        localStorage.setItem('micMinLevelDb', String(micMinLevelDb));
       });
     }
 
@@ -2214,6 +2451,238 @@
     if (enrollVoiceBtn) enrollVoiceBtn.addEventListener('click', enrollRecord);
     if (forgetVoiceBtn) forgetVoiceBtn.addEventListener('click', () => {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'speaker.enroll.clear' }));
+    });
+
+    /* ===== House-Mode speaker recognition (identification tuning) =====
+       Mirrors the voice-lock tuner: each spoken segment's best match (name +
+       score) vs the confirm threshold, plus live sliders for the two
+       identification thresholds (persisted + pushed to the server). */
+    const HID_MIN = 0.0, HID_MAX = 0.9;   // meter mapping (foreign voices score ~0.1)
+    function hidStored(key) {
+      const v = parseFloat(localStorage.getItem(key) || '');
+      return Number.isFinite(v) && v >= 0.1 && v <= 0.95 ? v : null;
+    }
+    let houseSimThreshold = hidStored('houseSimThreshold');
+    let houseSwitchThreshold = hidStored('houseSwitchThreshold');
+
+    function hidPct(score) {
+      return Math.max(0, Math.min(100, ((score - HID_MIN) / (HID_MAX - HID_MIN)) * 100));
+    }
+    function hidSimThr() {
+      return houseSimThreshold != null ? houseSimThreshold : (serverHouse.simThreshold || 0.5);
+    }
+    function positionHouseIdMark() {
+      if (houseIdMeterMark) houseIdMeterMark.style.left = hidPct(hidSimThr()) + '%';
+    }
+    function showHouseMatch(sp) {
+      if (!houseIdTuner || !sp || typeof sp.score !== 'number') return;
+      // held = short segment stuck to the current speaker (no confident match).
+      const name = sp.known ? sp.name : t('houseid.unknown');
+      houseIdScore.textContent = `${name}${sp.held ? ' ⏳' : ''} · ${sp.score.toFixed(2)}`;
+      houseIdScore.style.color = sp.known ? 'var(--ok)' : 'var(--err)';
+      houseIdMeterBar.style.width = hidPct(sp.score) + '%';
+    }
+
+    function updateHouseIdUi() {
+      if (!houseIdCard) return;
+      houseIdCard.style.display = serverHouse.available ? '' : 'none';
+      if (!serverHouse.available) return;
+      const paused = !houseIdOn;
+      houseIdCard.classList.toggle('locked', !paused);
+      houseIdCard.classList.toggle('paused', paused);
+      houseIdBadge.textContent = paused ? '💤' : '🏠';
+      houseIdChip.textContent = paused
+        ? t('houseid.chip_paused')
+        : t('houseid.chip_count', { n: serverHouse.count || 0 });
+      if (houseIdToggle) houseIdToggle.checked = houseIdOn;
+      if (houseIdTuner) houseIdTuner.style.display = paused ? 'none' : '';
+      // Initialise the sliders from the stored values or the server defaults.
+      if (houseIdSim) {
+        const thr = hidSimThr();
+        houseIdSim.value = String(thr);
+        houseIdSimLabel.textContent = thr.toFixed(2);
+        positionHouseIdMark();
+      }
+      if (houseIdSwitch) {
+        const thr = houseSwitchThreshold != null
+          ? houseSwitchThreshold : (serverHouse.switchThreshold || 0.6);
+        houseIdSwitch.value = String(thr);
+        houseIdSwitchLabel.textContent = thr.toFixed(2);
+      }
+      // Reset the record-button label — recordTimedTake leaves the last
+      // progress text ("recording … %") behind; not while a take is running.
+      if (houseSpkRecordLabel && !enrolling) {
+        houseSpkRecordLabel.textContent = t('houseid.record');
+      }
+      renderHouseSpeakers();
+    }
+
+    if (houseIdSim) {
+      houseIdSim.addEventListener('input', () => {
+        houseSimThreshold = parseFloat(houseIdSim.value);
+        houseIdSimLabel.textContent = houseSimThreshold.toFixed(2);
+        positionHouseIdMark();
+      });
+      houseIdSim.addEventListener('change', () => {
+        localStorage.setItem('houseSimThreshold', String(houseSimThreshold));
+        sendSettings();   // push the new strictness to the server (runtime)
+      });
+    }
+    if (houseIdSwitch) {
+      houseIdSwitch.addEventListener('input', () => {
+        houseSwitchThreshold = parseFloat(houseIdSwitch.value);
+        houseIdSwitchLabel.textContent = houseSwitchThreshold.toFixed(2);
+      });
+      houseIdSwitch.addEventListener('change', () => {
+        localStorage.setItem('houseSwitchThreshold', String(houseSwitchThreshold));
+        sendSettings();
+      });
+    }
+    if (houseIdToggle) {
+      houseIdToggle.addEventListener('change', () => {
+        houseIdOn = houseIdToggle.checked;
+        localStorage.setItem('houseIdOn', houseIdOn ? '1' : '0');
+        sendSettings();        // push on/off to the server identifier
+        updateHouseIdUi();     // reflect paused visuals
+      });
+    }
+
+    /* --- Speaker management (house.list / enroll / rename / delete) ------ */
+    let houseSelSpeaker = '';   // selected speaker in the management picker
+
+    function houseSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+    // Effective free-text role of a speaker: the editable `role` field, with
+    // the legacy enum defaults ("guest"/"unknown") treated as empty and the
+    // legacy `relation` field as fallback — mirrors the server's LLM tag.
+    function houseRoleText(s) {
+      const r = (s.role || '').trim();
+      if (r && r.toLowerCase() !== 'guest' && r.toLowerCase() !== 'unknown') return r;
+      return (s.relation || '').trim();
+    }
+
+    function renderHouseSpeakers() {
+      if (!houseSpkSelect) return;
+      const list = serverHouse.speakers || [];
+      if (!list.some(s => s.name === houseSelSpeaker)) {
+        houseSelSpeaker = list.length ? list[0].name : '';
+      }
+      houseSpkSelect.innerHTML = '';
+      if (!list.length) {
+        const o = document.createElement('option');
+        o.value = ''; o.textContent = t('houseid.empty');
+        houseSpkSelect.appendChild(o);
+      } else {
+        for (const s of list) {
+          const o = document.createElement('option');
+          o.value = s.name;
+          const role = houseRoleText(s);
+          o.textContent = s.name + (role ? ` (${role})` : '');
+          if (s.name === houseSelSpeaker) o.selected = true;
+          houseSpkSelect.appendChild(o);
+        }
+      }
+      houseSpkSelect.disabled = !list.length;
+      if (houseSpkRenameBtn) houseSpkRenameBtn.disabled = !houseSelSpeaker;
+      if (houseSpkDeleteBtn) houseSpkDeleteBtn.disabled = !houseSelSpeaker;
+      if (houseSpkRecordBtn) houseSpkRecordBtn.disabled = !houseSelSpeaker || enrolling;
+      // Sample chips of the selected speaker (✖ removes one register).
+      const sel = list.find(s => s.name === houseSelSpeaker);
+      if (houseSpkRole) {
+        houseSpkRole.disabled = !sel;
+        // Don't clobber the field while the user is typing in it — the
+        // broadcast after a save re-renders this card.
+        if (document.activeElement !== houseSpkRole) {
+          houseSpkRole.value = sel ? houseRoleText(sel) : '';
+        }
+      }
+      const samples = (sel && sel.samples) || [];
+      if (houseSpkSampleCount) {
+        houseSpkSampleCount.textContent = houseSelSpeaker ? String(samples.length) : '–';
+      }
+      if (houseSpkSamples) {
+        houseSpkSamples.innerHTML = '';
+        samples.forEach((label, i) => {
+          const chip = document.createElement('span');
+          chip.className = 'houseid-sample';
+          const txt = document.createElement('span');
+          txt.textContent = label || t('houseid.sample_n', { n: i + 1 });
+          const pen = document.createElement('button');
+          pen.type = 'button'; pen.textContent = '✏️';
+          pen.title = t('houseid.sample_rename');
+          pen.addEventListener('click', () => {
+            const cur = label || t('houseid.sample_n', { n: i + 1 });
+            const nn = prompt(t('houseid.sample_rename_prompt'), cur);
+            if (nn && nn.trim() && nn.trim() !== label) {
+              houseSend({ type: 'house.sample.rename', name: houseSelSpeaker,
+                          index: i, label: nn.trim() });
+            }
+          });
+          const x = document.createElement('button');
+          x.type = 'button'; x.textContent = '✖';
+          x.title = t('houseid.sample_delete');
+          x.addEventListener('click', () => {
+            const key = samples.length <= 1
+              ? 'houseid.sample_delete_last_confirm' : 'houseid.sample_delete_confirm';
+            if (confirm(t(key, { name: houseSelSpeaker }))) {
+              houseSend({ type: 'house.sample.delete', name: houseSelSpeaker, index: i });
+            }
+          });
+          chip.appendChild(txt); chip.appendChild(pen); chip.appendChild(x);
+          houseSpkSamples.appendChild(chip);
+        });
+      }
+    }
+
+    async function houseRecordSample(name) {
+      if (enrolling || !name) return;
+      if (!serverHouse.available) { addBubble('err', t('voicelock.unavailable')); return; }
+      if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
+      await recordTimedTake({
+        seconds: ENROLL_SECONDS,
+        btn: houseSpkRecordBtn, progEl: houseSpkProg,
+        labelEl: houseSpkRecordLabel, labelKey: 'voicelock.recording',
+        startMsg: { type: 'house.enroll.start', name },
+        commitMsg: () => ({ type: 'house.enroll.commit' }),
+        abortMsg: { type: 'house.enroll.abort' },
+        errKey: 'houseid.error',
+        onDone: () => updateHouseIdUi(),   // also resets the record label
+      });
+    }
+
+    if (houseSpkSelect) houseSpkSelect.addEventListener('change', () => {
+      houseSelSpeaker = houseSpkSelect.value || '';
+      renderHouseSpeakers();
+    });
+    if (houseSpkAddBtn) houseSpkAddBtn.addEventListener('click', () => {
+      const name = prompt(t('houseid.add_prompt'), '');
+      if (!name || !name.trim()) return;
+      // The first committed take creates the speaker in the store.
+      houseSelSpeaker = name.trim();
+      houseRecordSample(houseSelSpeaker);
+    });
+    if (houseSpkRenameBtn) houseSpkRenameBtn.addEventListener('click', () => {
+      if (!houseSelSpeaker) return;
+      const name = prompt(t('houseid.rename_prompt'), houseSelSpeaker);
+      if (!name || !name.trim() || name.trim() === houseSelSpeaker) return;
+      houseSend({ type: 'house.rename', name: houseSelSpeaker, newName: name.trim() });
+      houseSelSpeaker = name.trim();   // keep the selection across the refresh
+    });
+    if (houseSpkDeleteBtn) houseSpkDeleteBtn.addEventListener('click', () => {
+      if (!houseSelSpeaker) return;
+      if (confirm(t('houseid.delete_confirm', { name: houseSelSpeaker }))) {
+        houseSend({ type: 'house.delete', name: houseSelSpeaker });
+      }
+    });
+    if (houseSpkRecordBtn) houseSpkRecordBtn.addEventListener('click', () => {
+      houseRecordSample(houseSelSpeaker);
+    });
+    if (houseSpkRole) houseSpkRole.addEventListener('change', () => {
+      if (!houseSelSpeaker) return;
+      // Empty value clears the role; the confirming house.speakers broadcast
+      // refreshes the picker labels on every device.
+      houseSend({ type: 'house.role', name: houseSelSpeaker,
+                  role: houseSpkRole.value.trim() });
     });
 
     /* ===== Voice library (cloned voices) ===== */

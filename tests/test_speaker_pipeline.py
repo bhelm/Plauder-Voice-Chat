@@ -912,3 +912,32 @@ def test_stale_continuity_anchor_without_playback_done_rejects():
             await ws.close()
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Laughter guard: laughter must never be trimmed/rejected by the speaker gate
+# (it embeds unlike normal speech and looks foreign, but is genuine owner
+# input the LLM needs). See plauder.speaker_gate.is_laughter_only.
+# --------------------------------------------------------------------------- #
+def test_is_laughter_only_matches_whisper_laughter_forms():
+    from plauder.speaker_gate import is_laughter_only as L
+    # Real Whisper renderings of laughter (incl. comma-separated, the exact
+    # form that leaked in the field: "Ha, ha, ha, ha.").
+    for t in ["Hahaha", "Ha ha ha ha", "Ha, ha, ha, ha.", "Hehehe", "Hihihi",
+              "hahahaha", "Ha-ha-ha", "Haha!", "hehe", "HAHAHA", "ho ho ho",
+              "he, he, he", "*Gelächter*", "*Lachen*", "[laughter]",
+              "(laughs)", "*chuckle*", "*giggling*", "mhm", "Hmmm"]:
+        assert L(t) is True, f"laughter not recognized: {t!r}"
+
+
+def test_is_laughter_only_rejects_real_speech():
+    from plauder.speaker_gate import is_laughter_only as L
+    # Genuine speech that must NOT be mistaken for laughter — including tricky
+    # leading interjections ("Ha, das …", "He, komm …") and words containing
+    # laugh syllables ("high five", "hip hop").
+    for t in ["Das ist lustig", "haha das war gut", "Hallo Xena", "ich lache",
+              "Thank you", "he asked me", "Hi there", "Hallo",
+              "was hast du gesagt", "high five", "hip hop", "ahoy",
+              "Ha, das wusste ich nicht", "Ha, echt jetzt?", "He, komm her",
+              "", "   "]:
+        assert L(t) is False, f"speech misclassified as laughter: {t!r}"

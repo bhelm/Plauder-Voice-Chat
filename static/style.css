@@ -183,7 +183,11 @@
     transition: width 80ms linear;
   }
 
-  /* VAD live speech level with threshold marker */
+  /* VAD tuning meter: width = Silero's live speech PROBABILITY (0–100 %),
+     the mark is the chosen threshold; the bar LIGHTS UP (.hot) while the
+     probability clears it. The mic LEVEL has its own meter (micLevelCard,
+     a .meter-bar on the −60…0 dB scale of the activation gate) — the two
+     are deliberately independent. */
   .vad-prob {
     position: relative; height: 10px; margin-top: 8px;
     border-radius: 5px; background: var(--bg);
@@ -191,12 +195,17 @@
   }
   .vad-prob-bar {
     height: 100%; width: 0%;
-    background: linear-gradient(to right, var(--ok), var(--warn));
-    transition: width 60ms linear;
+    background: var(--muted); opacity: .4;
+    transition: width 60ms linear, opacity 80ms linear, background-color 80ms linear;
   }
+  .vad-prob-bar.hot {
+    background: var(--ok); opacity: 1;
+    box-shadow: 0 0 6px var(--ok);
+  }
+  /* Minimum-level gate marker — SAME scale as the level bar. */
   .vad-prob-mark {
     position: absolute; top: -2px; bottom: -2px; width: 2px;
-    background: var(--err); left: 60%;
+    background: var(--err); left: 0%;
     box-shadow: 0 0 2px var(--err);
   }
 
@@ -285,6 +294,30 @@
   .vlock.locked.paused { border-color: rgba(167,139,250,.35); }
   .vlock.paused .vlock-badge { border-color: var(--border); background: var(--panel); box-shadow: none; }
   .vlock.paused .vlock-chip { color: var(--warn); border-color: rgba(251,191,36,.5); }
+  /* House-Mode speaker management: sample chips of the selected speaker */
+  .houseid-samples { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 8px; }
+  /* Editable free-text role of the selected house speaker */
+  .houseid-role { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+  .houseid-role input {
+    flex: 1; min-width: 0; padding: 6px 8px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    font: inherit; font-size: 13px; outline: none;
+  }
+  .houseid-role input:disabled { opacity: .35; }
+  .houseid-role input:focus { border-color: var(--accent); }
+  .houseid-sample {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 2px 6px; background: var(--bg);
+  }
+  .houseid-sample button {
+    background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 10px; padding: 0; line-height: 1;
+  }
+  .houseid-sample button:hover { color: var(--err); }
+
   /* ===== Voice library (cloned voices) — reuses the .vlock card chrome ===== */
   /* Compact picker: the dropdown is the active-voice choice; icon buttons
      (localized via title tooltips) act on the selected voice. Text labels
@@ -784,6 +817,9 @@
     .drawer.open { width: 360px; padding: 18px; overflow-y: auto; overflow-x: hidden; }
     .drawer-overlay { display: none !important; }
     .close-btn { display: none; }   /* docked: close via ☰ */
+    /* Ausnahme: der Waifu-Pop-out-Button nutzt die close-btn-Optik,
+       muss aber auch im Desktop-Layout sichtbar bleiben. */
+    #waifuPopoutBtn { display: inline-block; }
   }
 
   /* === Mobile/narrow: tidier, more compact === */

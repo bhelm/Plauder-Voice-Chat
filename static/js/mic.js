@@ -241,6 +241,101 @@ let currentVadParams = {
   frameMs: 32,
 };
 
+// Level gate: HARD activation threshold in dBFS (−60…0; −60 = off). While the
+// mic level stays below it, Silero's speech detection does NOT activate a
+// take: nothing is streamed, uploaded or transcribed and no barge-in fires —
+// quiet/distant speech (people talking in the background of the room) is
+// ignored entirely, client-side. Complements the Silero threshold, which is
+// loudness/distance-INVARIANT — this is the loudness knob.
+const MIC_GATE_OFF_DB = -60;
+let micMinLevelDb = (() => {
+  const v = parseInt(localStorage.getItem('micMinLevelDb') || '', 10);
+  if (Number.isFinite(v) && v > MIC_GATE_OFF_DB && v <= 0) return v;
+  // One-time migration from the old %-scale gate ('vadMinLevel', rms*250):
+  // pct/250 = rms → dBFS. Kept until the user first saves the new slider.
+  const pct = parseInt(localStorage.getItem('vadMinLevel') || '', 10);
+  if (Number.isFinite(pct) && pct > 0 && pct <= 100) {
+    const db = Math.round(20 * Math.log10(pct / 250));
+    return Math.max(MIC_GATE_OFF_DB + 1, Math.min(0, db));
+  }
+  return MIC_GATE_OFF_DB;
+})();
+// Live mic level in dBFS (updated by startMeter's tick) for the
+// frame-rate activation/barge-in gate.
+let lastLevelDb = -100;
+
+function levelGateOpen() {
+  return micMinLevelDb <= MIC_GATE_OFF_DB || lastLevelDb >= micMinLevelDb;
+}
+
+function rmsToDb(rms) {
+  return rms > 0 ? Math.max(-100, 20 * Math.log10(rms)) : -100;
+}
+// Map dBFS onto the mic level meter (−60 dB = 0 %, 0 dB = 100 %) — bar and
+// red gate mark share this scale, so what you see is exactly what gates.
+function dbToMeterPct(db) {
+  return Math.max(0, Math.min(100, ((db - MIC_GATE_OFF_DB) / -MIC_GATE_OFF_DB) * 100));
+}
+
+function segmentPeakDb(float32) {
+  // Peak RMS over ~100 ms windows → dBFS, same mapping as the mic meter, so
+  // the gate compares against what the level bar SHOWS.
+  const win = 1600;   // 100 ms @ 16 kHz
+  let peak = 0;
+  for (let off = 0; off < float32.length; off += win) {
+    const end = Math.min(float32.length, off + win);
+    let sum = 0;
+    for (let i = off; i < end; i++) sum += float32[i] * float32[i];
+    const rms = Math.sqrt(sum / Math.max(1, end - off));
+    if (rms > peak) peak = rms;
+  }
+  return rmsToDb(peak);
+}
+
+// A Silero take that began BELOW the level gate: not streamed, no barge-in,
+// no UI change. It activates retroactively (preroll ring buffer as lead-in)
+// the moment the level crosses the gate mid-utterance — otherwise it is
+// discarded wholesale at speech end and nothing gets transcribed.
+let vadTakeGated = false;
+
+// Everything that happens when a take really STARTS (gate open): cut TTS
+// playback (barge-in) or duck for voice-lock verification, begin the B1
+// uplink, flip the UI. Shared by onSpeechStart (gate already open) and the
+// mid-utterance un-gate in onFrameProcessed.
+function activateVadTake(source) {
+  vadTakeGated = false;
+  // Wake mode: while speaking, the window must NOT expire
+  // (the chime timer is paused) — otherwise it closes mid-sentence.
+  if (inputMode === 'wake' && wakeWindowActive) cancelWakeWindowTimer();
+  // Only when audio is actually PLAYING: while Antonia merely thinks,
+  // the abort is deferred to the server (post-STT + ghost filter), so
+  // a hallucinated noise segment cannot kill the pending answer.
+  if (bargeInAllowed() && anyAudioPlaying()) bargeInStop(source);
+  // Voice lock: don't stop — duck the playback while the server
+  // verifies the speaker. Owner → server stops it; foreign → restore.
+  else if (voiceLockEngaged() && anyAudioPlaying()
+           && !(inputMode === 'wake' && !wakeWindowActive)) setDuck(true);
+  // B1: start input streaming (frames now flow live; the preroll ring
+  // buffer supplies the lead-in, so a late un-gate loses nothing).
+  if (streamInputActive()) {
+    segmentCounter += 1;
+    segCount.textContent = String(segmentCounter);
+    vadStreamSegId = String(segmentCounter);
+    beginInputStream(vadStreamSegId);
+  }
+  setMicUi('speaking');
+}
+
+function discardVadTake() {
+  // A VAD take is dropped client-side (too short / below the level gate):
+  // release the voice-lock duck, abort a streamed segment, restore the UI.
+  setDuck(false);
+  if (inputStreaming) abortInputStream();
+  vadStreamSegId = null;
+  if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
+  if (micActive && !sttPending.size) setMicUi('listening');
+}
+
 // Barge-in: deliberately kept SIMPLE. As soon as the VAD detects speech or
 // PTT is pressed, audio output is stopped immediately — no
 // config, no ENV. The user controls VAD sensitivity directly via
@@ -387,10 +482,10 @@ async function startMic(silent = false) {
       // Local asset paths (no CDN)
       modelURL: `${BASE}/static/vendor/silero_vad.onnx`,
       workletURL: `${BASE}/static/vendor/vad.worklet.bundle.min.js`,
-      // Vom User per Slider gewaehlte Aktivierungsschwelle. negative liegt
-      // konventionell ~0.15 darunter (Hysterese), min. 0.05.
-      positiveSpeechThreshold: vadActivationThreshold,
-      negativeSpeechThreshold: Math.max(0.05, vadActivationThreshold - 0.15),
+      // Vom User per Slider gewaehlte Aktivierungsschwelle (0–100 % → 0..1,
+      // via vadSileroOpts gefloort). negative liegt konventionell ~0.15
+      // darunter (Hysterese).
+      ...vadSileroOpts(),
       minSpeechFrames: currentVadParams.minSpeechFrames,
       preSpeechPadFrames: currentVadParams.preSpeechPadFrames,
       redemptionFrames: currentVadParams.redemptionFrames,
@@ -401,40 +496,62 @@ async function startMic(silent = false) {
       // the transcription. Latency ~ one frame (~32ms).
       onFrameProcessed: (probs) => {
         const p = probs && Number.isFinite(probs.isSpeech) ? probs.isSpeech : 0;
-        // Show the live speech level in the UI (for tuning the threshold).
-        if (vadProbBar) vadProbBar.style.width = Math.round(p * 100) + '%';
-        // Barge-in: audio is playing AND level above threshold -> stop immediately.
+        // Silero tuning meter: the bar's WIDTH is the live speech
+        // probability (0–100 %), the mark is the chosen threshold; it lights
+        // up (.hot) while the probability clears it. Loudness deliberately
+        // does NOT show here — the mic LEVEL has its own meter
+        // (startMeter → micLevelBar); the two scales are independent.
+        if (vadProbBar) {
+          vadProbBar.style.width = Math.round(p * 100) + '%';
+          vadProbBar.classList.toggle('hot', p >= vadActivationThreshold);
+        }
+        // A take that began below the level gate activates the moment the
+        // mic level crosses the gate while Silero still sees speech (the
+        // preroll ring buffer covers the lead-in).
+        if (vadTakeGated && p >= vadActivationThreshold && levelGateOpen()) {
+          activateVadTake('vad-frame');
+        }
+        // Barge-in: audio is playing AND speech above threshold AND the mic
+        // level clears the level gate -> stop immediately.
         // (In wake mode only with an open window — otherwise not directed at Antonia.)
-        if (anyAudioPlaying() && p >= vadActivationThreshold && bargeInAllowed()) bargeInStop('vad-frame');
+        if (anyAudioPlaying() && p >= vadActivationThreshold && levelGateOpen()
+            && bargeInAllowed()) bargeInStop('vad-frame');
       },
       onSpeechStart: () => {
         // Record speech start for the speaker-ID hold (before bargeInStop,
         // since this is the real start of speech).
         lastSpeechStartTs = Date.now();
-        // Wake mode: while speaking, the window must NOT expire
-        // (the chime timer is paused) — otherwise it closes mid-sentence.
-        if (inputMode === 'wake' && wakeWindowActive) cancelWakeWindowTimer();
-        // Safety net: in case the frame path does not kick in. In wake mode
-        // with a closed window, do NOT abort (speech not directed at Antonia).
-        // Only when audio is actually PLAYING: while Antonia merely thinks,
-        // the abort is deferred to the server (post-STT + ghost filter), so
-        // a hallucinated noise segment cannot kill the pending answer.
-        if (bargeInAllowed() && anyAudioPlaying()) bargeInStop('vad-speech');
-        // Voice lock: don't stop — duck the playback while the server
-        // verifies the speaker. Owner → server stops it; foreign → restore.
-        else if (voiceLockEngaged() && anyAudioPlaying()
-                 && !(inputMode === 'wake' && !wakeWindowActive)) setDuck(true);
-        // B1: start input streaming (frames now flow live).
-        if (streamInputActive()) {
-          segmentCounter += 1;
-          segCount.textContent = String(segmentCounter);
-          vadStreamSegId = String(segmentCounter);
-          beginInputStream(vadStreamSegId);
+        // HARD activation gate: Silero sees speech, but the mic level is
+        // below the minimum — background talkers, distant voices. Do NOT
+        // activate: no barge-in/duck, no uplink, no UI change. The take
+        // un-gates in onFrameProcessed if the level crosses the gate
+        // mid-utterance; otherwise onSpeechEnd discards it wholesale.
+        if (!levelGateOpen()) {
+          vadTakeGated = true;
+          return;
         }
-        setMicUi('speaking');
+        activateVadTake('vad-speech');
       },
       onSpeechEnd: (audio) => {
-        if (inputStreaming && vadStreamSegId) {
+        const gated = vadTakeGated;
+        vadTakeGated = false;
+        // Level gate: the take must have crossed the minimum mic level at
+        // least once (~100 ms window), otherwise it is discarded WHOLESALE —
+        // nothing is uploaded, nothing is transcribed. (Re-checked on the
+        // actual audio: the live gate runs on a requestAnimationFrame meter,
+        // which throttles in background tabs.)
+        if (micMinLevelDb > MIC_GATE_OFF_DB && segmentPeakDb(audio) < micMinLevelDb) {
+          discardVadTake();
+          return;
+        }
+        if (gated) {
+          // The take crossed the gate but the rAF meter never saw it
+          // (throttled tab) → nothing was streamed. Recover by sending the
+          // complete take as one full segment.
+          segmentCounter += 1;
+          segCount.textContent = String(segmentCounter);
+          sendSegment(String(segmentCounter), audio);
+        } else if (inputStreaming && vadStreamSegId) {
           // Already streamed live → only commit now, do NOT send again.
           commitInputStream(vadStreamSegId);
           vadStreamSegId = null;
@@ -454,11 +571,8 @@ async function startMic(silent = false) {
       },
       onVADMisfire: () => {
         // Speech too short → no segment. Discard the running input stream.
-        setDuck(false);   // voice lock: release the duck, nothing to verify
-        if (inputStreaming) abortInputStream();
-        vadStreamSegId = null;
-        if (inputMode === 'wake' && wakeWindowActive && !isBusy()) armWakeWindowTimer(serverWake.windowS);
-        if (micActive && !sttPending.size) setMicUi('listening');
+        vadTakeGated = false;
+        discardVadTake();
       },
     });
     await vad.start();
@@ -532,7 +646,12 @@ async function stopMic(silent = false) {
   audioCtx = null;
   analyser = null;
   meterBar.style.width = '0%';
-  if (vadProbBar && !silent) vadProbBar.style.width = '0%';
+  if (micLevelBar) micLevelBar.style.width = '0%';
+  if (vadProbBar && !silent) {
+    vadProbBar.style.width = '0%';
+    vadProbBar.classList.remove('hot');
+  }
+  vadTakeGated = false;
   if (!silent) {
     // On a silent restart, do not throw the UI to 'stopped/idle' — that
     // caused visible flicker on every slider change.
@@ -546,6 +665,10 @@ function startMeter() {
   // Couple the gradient to the track width (once at startup) → see CSS.
   const trackW = (meterBar.parentElement && meterBar.parentElement.clientWidth) || 90;
   meterBar.style.backgroundSize = trackW + 'px 100%';
+  if (micLevelBar) {
+    const w = (micLevelBar.parentElement && micLevelBar.parentElement.clientWidth) || 200;
+    micLevelBar.style.backgroundSize = w + 'px 100%';
+  }
   const tick = () => {
     if (!analyser) return;
     analyser.getByteTimeDomainData(buf);
@@ -555,8 +678,11 @@ function startMeter() {
       sum += v * v;
     }
     const rms = Math.sqrt(sum / buf.length);
-    const pct = Math.min(100, Math.round(rms * 250));
-    meterBar.style.width = pct + '%';
+    lastLevelDb = rmsToDb(rms);   // consumed by the activation/barge-in gate
+    meterBar.style.width = Math.min(100, Math.round(rms * 250)) + '%';
+    // The mic card's own level meter runs on the gate slider's dB scale
+    // (−60…0 dBFS), so the bar and the red minimum-level mark line up 1:1.
+    if (micLevelBar) micLevelBar.style.width = dbToMeterPct(lastLevelDb) + '%';
     meterRaf = requestAnimationFrame(tick);
   };
   tick();
@@ -564,6 +690,7 @@ function startMeter() {
 function stopMeter() {
   if (meterRaf) cancelAnimationFrame(meterRaf);
   meterRaf = null;
+  lastLevelDb = -100;
 }
 
 /* Timed one-shot recording that OWNS the binary WS channel (enrollment
@@ -808,4 +935,6 @@ async function teardownPttCtx() {
   pttCtx = null;
   analyser = null;
   meterBar.style.width = '0%';
+  if (micLevelBar) micLevelBar.style.width = '0%';
+  if (vadProbBar) { vadProbBar.style.width = '0%'; vadProbBar.classList.remove('hot'); }
 }

@@ -33,6 +33,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
         self.gap_ms = gap_ms
         self.sample_rate = 24000
         self._tts = None
+        self._clone_prompt = None
         self._lock = asyncio.Lock()
 
     @classmethod
@@ -51,6 +52,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
 
     async def load(self) -> None:
         try:
+            import torch  # lazy! GPU dep
             from omnivoice import OmniVoice  # lazy! GPU dep
         except ImportError as exc:
             from ..base import BackendError
@@ -60,8 +62,20 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
             ) from exc
 
         def _build():
-            engine = OmniVoice(self.model, device=self.device)
-            self.sample_rate = getattr(engine, "sample_rate", 24000)
+            engine = OmniVoice.from_pretrained(
+                self.model,
+                device_map=self.device,
+                dtype=torch.float16,
+            )
+            self.sample_rate = getattr(engine, "sampling_rate", 24000)
+            # Precompute the voice-clone prompt once — the voice stays
+            # bit-stable across calls and each synth call gets cheaper.
+            if self.mode == "clone" and self.ref_audio:
+                try:
+                    self._clone_prompt = engine.create_voice_clone_prompt(
+                        ref_audio=self.ref_audio, ref_text=self.ref_text)
+                except Exception:
+                    self._clone_prompt = None  # per-call ref_audio fallback
             return engine
 
         self._tts = await asyncio.to_thread(_build)
@@ -82,18 +96,21 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
         }
 
     def _synth_one(self, text: str, speed: float) -> np.ndarray:
-        # OmniVoice API: generate(text, ...) -> (np.float32, sample_rate)
-        out = self._tts.generate(
-            text,
-            mode=self.mode,
-            ref_audio=self.ref_audio,
-            ref_text=self.ref_text,
-            language=self.language,
-            speed=speed,
-        )
-        samples, sr = out if isinstance(out, tuple) else (out, self.sample_rate)
-        self.sample_rate = sr
-        return np.asarray(samples, dtype=np.float32)
+        # OmniVoice API: generate(text=..., num_step=..., ...) -> list of arrays
+        kwargs: dict = {"text": text, "num_step": 16}
+        if self.language:
+            kwargs["language"] = self.language
+        if speed and speed != 1.0:
+            kwargs["speed"] = float(speed)
+        if self.mode == "clone":
+            if self._clone_prompt is not None:
+                kwargs["voice_clone_prompt"] = self._clone_prompt
+            else:
+                kwargs["ref_audio"] = self.ref_audio
+                if self.ref_text:
+                    kwargs["ref_text"] = self.ref_text
+        out = self._tts.generate(**kwargs)
+        return np.asarray(out[0], dtype=np.float32)
 
     def _synth_sync(self, text: str, speed: float) -> bytes:
         if not self.sentence_split:

@@ -99,6 +99,7 @@ def test_whisper_local_load_raises_clear_error_without_dep():
         whisper_beam_size = 5
         stt_language = "de"
         whisper_local_files_only = True
+        whisper_condition_on_previous_text = False
 
     import importlib.util
     eng = WhisperLocalSTTBackend.from_config(_LocalCfg())
@@ -116,6 +117,7 @@ def test_whisper_local_transcribe_with_mock_model():
     class _LocalCfg:
         whisper_model = "x"; whisper_device = "cpu"; whisper_compute_type = "int8"
         whisper_beam_size = 1; stt_language = "de"; whisper_local_files_only = True
+        whisper_condition_on_previous_text = False
 
     eng = WhisperLocalSTTBackend.from_config(_LocalCfg())
     seg = MagicMock()
@@ -127,3 +129,8 @@ def test_whisper_local_transcribe_with_mock_model():
     text = asyncio.run(eng.transcribe(_pcm(), SAMPLE_RATE))
     assert text == "lokaler text"
     assert eng.last_no_speech_prob == 0.2
+    # The laughter fix: condition_on_previous_text must be forwarded to Whisper
+    # (default False so repetitive/nonverbal audio like "hahaha" is not cleaned
+    # away by previous-text conditioning).
+    _, kwargs = model.transcribe.call_args
+    assert kwargs.get("condition_on_previous_text") is False

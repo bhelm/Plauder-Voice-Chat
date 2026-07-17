@@ -240,6 +240,13 @@ class Config:
     whisper_compute_type: str = "int8"
     whisper_beam_size: int = 5
     whisper_local_files_only: bool = True
+    # Whisper's default (condition_on_previous_text=True) feeds the previous
+    # segment's text back into the decoder. On nonverbal / repetitive audio
+    # (laughter "hahaha", coughs) this biases the decoder toward "cleaning up"
+    # or dropping the repetition, so genuine laughter can vanish from the
+    # transcript. False decodes each window independently → laughter and other
+    # nonverbal vocalizations survive. (Matches the pre-fork behavior.)
+    whisper_condition_on_previous_text: bool = False
 
     # --- STT Partial / Streaming (B2) ---
     # While a segment is still being streamed in (B1), periodically transcribe
@@ -368,6 +375,11 @@ class Config:
     house_mode: bool = False
     house_data_dir: str = ""
     house_speaker_id: bool = False
+
+    # --- Waifu / VTuber-Avatar ---
+    # Server-Default fuer den optionalen 3D-Avatar (three-vrm). Wenn True, startet
+    # das Frontend mit sichtbarem/aktiviertem Avatar (User kann im UI weiter togglen).
+    waifu_mode: bool = False
     house_wake_word: bool = False
     house_auth: bool = False
 
@@ -479,6 +491,8 @@ class Config:
             whisper_compute_type=_first(_env("WHISPER_COMPUTE_TYPE"), default="int8"),
             whisper_beam_size=_env_int("WHISPER_BEAM_SIZE", 5),
             whisper_local_files_only=env_flag("WHISPER_LOCAL_FILES_ONLY", True),
+            whisper_condition_on_previous_text=env_flag(
+                "WHISPER_CONDITION_ON_PREVIOUS_TEXT", False),
 
             # Partials by default only with local Whisper (the API backend would
             # otherwise be called multiple times per second at a cost).
@@ -571,6 +585,8 @@ class Config:
             house_speaker_id=env_flag("HOUSE_SPEAKER_ID", house_mode),
             house_wake_word=env_flag("HOUSE_WAKE_WORD", house_mode),
             house_auth=env_flag("HOUSE_AUTH", house_mode),
+
+            waifu_mode=env_flag("WAIFU_MODE", False),
 
             speaker_lock_enabled=env_flag("SPEAKER_LOCK_ENABLED", False),
             speaker_model_path=_env("SPEAKER_MODEL_PATH"),

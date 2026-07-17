@@ -246,6 +246,47 @@ cancels any in-flight reply, closes the window (`wake_until=0`) and emits
 `wake.closed`. Both cues are client-synthesized (Web Audio, no assets), scaled by
 the persisted `cueVolume` slider (0 = off), and only sound in wake mode.
 
+### Waifu / VTuber avatar (`WAIFU_MODE`, start-default off)
+
+An **optional, fully isolated** 3D avatar (VRM 1.0 via three-vrm) rendered in the
+settings drawer — a client-only feature that never touches the STT/TTS/turn
+pipeline (if it breaks, the voice chat runs on unaffected; every entry point is
+wrapped in try/catch). `WAIFU_MODE` (env, `config.py`) is only the server-side
+start-default, injected into `index.html` via the `__WAIFU_MODE__` placeholder
+(same mechanism as `__APP_LANG__`) and read into `window.__WAIFU_MODE__`; a
+per-user `localStorage` toggle (`waifuEnabled`) overrides it. `start-joy.sh`
+exports `WAIFU_MODE=1` by default.
+
+- **`static/js/waifu.js`** — ES module (loaded via the `<script type="importmap">`
+  in `index.html`: `three`, `three/addons/`, `three-vrm`, `three-vrm-animation`,
+  all vendored under `static/vendor/`). Dynamically imported **only when the
+  toggle turns on** — zero three.js overhead while off. Owns the render loop,
+  scene, and a layered animation system (all additive per frame, damped): rest
+  pose (arms down — the VRM default is a T-pose), breathing, procedural idle
+  randomness (head glances, arm sway, body weight-shift), mode overlays
+  (`idle`/`listening`/`speaking`/`thinking` — thinking is staged by duration:
+  head tilt → squint → wandering eyes via VRM lookAt), and one-shot emotes.
+  `Waifu.emote(name)` plays a matching **VRMA clip** (`static/anims/*.vrma`,
+  from `tk256ailab/vrm-viewer`, MIT) blended over the procedural pose via an
+  AnimationMixer + per-bone quaternion slerp (rotation tracks only — no root
+  motion, no expression-track conflicts with lip-sync); facial expression runs
+  in parallel. Public API: `mount/unmount/setMouth/setState/emote/isReady/resize`.
+- **`static/js/waifu_ui.js`** — classic script (global scope like the others).
+  Owns the toggle, the docked stage, the pop-out window (physically **moves** the
+  canvas into a `window.open()` doc — renderer/state survive; double-click =
+  fullscreen), lazy loading, and the non-invasive hooks: it wraps the global
+  `setMicUi` for body-language state, and wraps `appendAgentBubbleDelta` to (a)
+  set `thinking` on the first reply delta and (b) scan reply text for nonverbal
+  tags (`[laughter]`/`[sigh]`/`*lacht*`/…) → queued emotes. **Lip-sync** is a
+  standalone rAF driver that reads the real playback state (`anyAudioPlaying()`
+  from playback.js, plus `replayPlaying`) — deliberately NOT `setMicUi` events,
+  which fire on VAD/transcript mid-playback and used to kill the mouth. The
+  emote queue only fires while audio actually plays (text streams ahead of
+  speech) and is discarded after real silence.
+- The `joy.vrm` model lives in `static/models/` (gitignored like the other
+  models). `static/waifu_test.html` is a standalone dev harness for the avatar.
+  Avatar UI strings use `waifu.*` / `settings.sec_waifu` i18n keys (both locales).
+
 ## Conventions & gotchas
 
 - **`.env` is the only place for config and secrets** (gitignored). No credentials
@@ -257,7 +298,8 @@ the persisted `cueVolume` slider (0 = off), and only sound in wake mode.
   — preserve that when adding new streaming hooks.
 - `whisper_local` runs CPU (`WHISPER_DEVICE=cpu`, small model) or GPU
   (`cuda`, `large-v3-turbo`); on a GPU box also set `WHISPER_LOCAL_FILES_ONLY=1`.
-- Speaker-ID (House Mode) is wired but the `speaker_id` module is **not in the repo**;
-  it stays silently disabled unless that module + a CAM++ ONNX model + `speakers.json`
-  are present.
+- Speaker-ID (House Mode): `speaker_id.py` (CAM++ embedder + multi-register
+  fingerprint store) ships in the repo, but the feature stays silently disabled
+  unless a CAM++ ONNX model + `speakers.json` are present (both gitignored;
+  enroll via `enroll_register.py`).
 - See `README.md` for the full backend-switching matrix and config reference.

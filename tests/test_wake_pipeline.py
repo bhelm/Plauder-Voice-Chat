@@ -340,6 +340,63 @@ def test_alexa_mode_closes_window_after_reply():
     asyncio.run(run())
 
 
+def test_end_marker_answers_command_and_closes_window():
+    """Trailing "Ende": the command in front of the marker is still answered,
+    but the window closes immediately (wake.closed reason=end_command) — a
+    follow-up without a wake word is ignored afterwards."""
+    _cfg, llm = _configure_wake(
+        stt_texts=["antonia sag was ende", "und was ist mit morgen"],
+        deltas=["Fertig."], mode="conversation")
+    llm.gate.set()
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _enable_wake(ws)
+            await _send_voice(ws, "s1")
+            closed, seen = await _drain_until(ws, "wake.closed")
+            assert closed is not None and closed.get("reason") == "end_command", seen
+            # The marker itself must not reach the LLM; the reply still comes.
+            end, seen2 = await _drain_until(ws, "audio.end")
+            assert end is not None, seen2
+            assert llm.calls and llm.calls[0][-1]["content"] == "sag was"
+            await ws.send_json({"type": "playback.done", "turnId": end.get("turnId"),
+                                "audioId": end.get("audioId")})
+            post = await _collect(ws, 0.15)
+            assert "wake.window" not in post, f"end marker reopened: {post}"
+
+            # Follow-up WITHOUT a wake word → ignored (window is closed).
+            await _send_voice(ws, "s2")
+            ig, seen3 = await _drain_until(ws, "transcript.ignored")
+            assert ig is not None, f"Folgefrage nicht ignoriert: {seen3}"
+            assert "reply.start" not in seen3, f"Folgefrage löste Antwort aus: {seen3}"
+            await ws.close()
+
+    asyncio.run(run())
+
+
+def test_bare_end_marker_acts_as_stop_command():
+    """"Antonia, Ende" (nothing in front of the marker) behaves like a stop
+    command: window closed, no reply started."""
+    _cfg, llm = _configure_wake(
+        stt_texts=["antonia ende"], deltas=["Nie."], mode="conversation")
+    llm.gate.set()
+
+    async def run():
+        async with TestClient(TestServer(srv.build_app())) as client:
+            ws = await client.ws_connect("/ws")
+            await _drain_until(ws, "hello")
+            await _enable_wake(ws)
+            await _send_voice(ws, "s1")
+            closed, seen = await _drain_until(ws, "wake.closed")
+            assert closed is not None and closed.get("reason") == "stop_command", seen
+            assert "reply.start" not in seen and not llm.calls
+            await ws.close()
+
+    asyncio.run(run())
+
+
 def test_hello_advertises_wake_mode():
     _configure_wake(stt_texts=[], deltas=["x"], mode="alexa")
 

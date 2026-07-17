@@ -1,5 +1,6 @@
 """TTS backends (openai + omnivoice_local), mocked — no API calls, no GPU."""
 import asyncio
+import importlib.util
 import sys
 from unittest.mock import MagicMock
 
@@ -101,7 +102,10 @@ def test_omnivoice_load_raises_clear_error_without_dep():
         tts_sentence_split = False; tts_max_chars_per_chunk = 220; tts_sentence_gap_ms = 120
 
     eng = OmniVoiceLocalTTSBackend.from_config(_LocalCfg())
-    if "omnivoice" in sys.modules:
+    # Skip when omnivoice is INSTALLED (importable), not merely already
+    # imported — on a GPU box load() would otherwise really import it and
+    # fail much later on the fake ref audio instead of raising BackendError.
+    if importlib.util.find_spec("omnivoice") is not None:
         pytest.skip("omnivoice installiert — Fehlerpfad nicht testbar")
     with pytest.raises(BackendError):
         asyncio.run(eng.load())

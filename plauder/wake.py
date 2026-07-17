@@ -26,6 +26,10 @@ _LEAD_FILLERS = {
 # Stop commands that end the conversation window ("stop", "ok stopp", …).
 _STOP_WORDS = {"stop", "stopp", "stoppe", "stoppen", "stoppt", "halt", "ende",
                "schluss", "fertig"}
+# Trailing end markers: an utterance whose LAST word is one of these closes
+# the conversation window right after the (remaining) command is answered
+# ("mach das Licht aus, Ende").
+_END_MARKERS = {"ende", "end"}
 # Filler words still allowed AFTER the stop word ("stop danke", "stop jetzt").
 _TRAIL_FILLERS = {"danke", "bitte", "jetzt", "mal", "so", "ok", "okay", "ist", "gut"}
 
@@ -101,6 +105,23 @@ def match_wake(text: str, wake: str, *, fuzzy: bool = True, anywhere: bool = Fal
             if _token_matches(joined, wake_n, fuzzy, ratio) and lead_ok(i):
                 return True, remainder_from(i + 2)
     return False, text
+
+
+def strip_end_marker(text: str) -> tuple[str, bool]:
+    """If the LAST word of ``text`` is an end marker ("Ende"/"End"), strip it.
+
+    Returns ``(text_without_marker, True)`` on a match, else ``(text, False)``.
+    Deliberately exact (no fuzzy): a single trailing word is too little signal
+    for fuzzy matching — "Wende"/"Hände" must not close the window. A marker
+    mid-sentence ("das Ende vom Film") deliberately does NOT trigger."""
+    toks = (text or "").split()
+    if not toks or _norm_tok(toks[-1]) not in _END_MARKERS:
+        return text, False
+    # Only strip the punctuation that BOUND the marker to the sentence
+    # ("… aus, Ende"); terminal punctuation of the command itself stays
+    # ("wie spät ist es? Ende" → "wie spät ist es?").
+    rest = " ".join(toks[:-1]).rstrip(" ,;:–—-").strip()
+    return rest, True
 
 
 def is_stop_command(text: str, *, fuzzy: bool = True, ratio: float = 0.86) -> bool:

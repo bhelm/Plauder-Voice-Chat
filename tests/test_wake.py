@@ -1,7 +1,7 @@
 """Wake-word matching (prefix gate, fuzzy)."""
 import pytest
 
-from plauder.wake import match_wake, is_stop_command
+from plauder.wake import match_wake, is_stop_command, strip_end_marker
 
 
 def test_exact_match_at_start_strips_word():
@@ -99,6 +99,34 @@ def test_stop_command_fuzzy_mishearing():
     assert is_stop_command("stoppp") is True
     # not without fuzzy
     assert is_stop_command("stoppp", fuzzy=False) is False
+
+
+# --- Trailing end marker ("… Ende"/"… End" closes the window) ---
+
+@pytest.mark.parametrize("text,rest", [
+    ("mach das Licht aus, Ende", "mach das Licht aus"),
+    ("wie spät ist es? End", "wie spät ist es?"),
+    ("danke ENDE!", "danke"),
+])
+def test_end_marker_stripped_from_tail(text, rest):
+    assert strip_end_marker(text) == (rest, True)
+
+
+@pytest.mark.parametrize("text", ["Ende", "End.", "ENDE"])
+def test_end_marker_alone_leaves_empty_rest(text):
+    got_rest, ended = strip_end_marker(text)
+    assert ended is True and got_rest == ""
+
+
+@pytest.mark.parametrize("text", [
+    "das Ende vom Film war gut",     # marker mid-sentence → no trigger
+    "wie spät ist es?",
+    "wende",                          # no fuzzy on the single trailing word
+    "am Wochenende",
+    "",
+])
+def test_end_marker_negative(text):
+    assert strip_end_marker(text) == (text, False)
 
 
 def test_shorter_name_does_not_match_wake_word():
