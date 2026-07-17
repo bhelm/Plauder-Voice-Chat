@@ -111,7 +111,24 @@ auto-reload.
   and caches images as vision attachments) and receives **unsolicited pushes**
   (background task results, cron) which `server.handle_gateway_push` speaks
   through the streaming machinery in push mode (`_StreamingReply(push=True)` —
-  like echo, but the bubble is a regular reply marked `push`). Gateway token
+  like echo, but the bubble is a regular reply marked `push`). A push claims
+  the `agent_task` slot under its own `push-<id>`, tracked on
+  `TurnState.agent_turn_id` so a barge-in's `turn.discarded` names the CANCELLED
+  push (not the incoming user turn — else the client suppresses the new turn's
+  bubbles). **Nothing unspoken is dropped** (`_handle_cancelled_push`), and a
+  barged-into push is never re-spoken verbatim. The cancel matrix:
+  **barge-in** decides on how much actually played — the browser reports it via
+  `playback.stopped` (`{turnId, playedS}`, sent by `bargeInStop` for VAD/manual
+  stops) and the threshold is `PUSH_HEARD_THRESHOLD_S` (default 3 s): *heard*
+  (played ≥ threshold) → persisted text bubble only; *unheard* (< threshold, or
+  no report) → text bubble **and** `push.undelivered` to the gateway
+  (`notify_push_undelivered` hook → per-chat note appended to the next turn's
+  `channel_prompt`, so the agent weaves the content into its answer to the
+  interrupting utterance). **stop-word** → text bubble; **connection close** →
+  re-queue onto `_PENDING_PUSHES` for the next connect; **session reset** → drop
+  (fresh session). The surfaced text bubble is an `external.message`
+  `source:"push", persist:true` (persisted client-side, unlike the ephemeral
+  `source:"system"` notices). Gateway token
   streaming arrives as `agent.partial` frames carrying the full accumulated
   text; the backend yields suffix deltas per message and ignores reformatted
   finalize rewrites (no double-speak). Wire protocol + setup:

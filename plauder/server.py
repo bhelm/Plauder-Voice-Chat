@@ -428,6 +428,11 @@ async def _run_turn(ws, state: TurnState):
     state.inflight_combined = combined   # for coalescing (see _capture_coalesce)
     state.inflight_images = list(image_urls)
     state.audio_started = False          # no audio of THIS turn emitted yet
+    # This turn now occupies the reply machinery → a barge-in's turn.discarded
+    # must name THIS turn (matches state.turn_id here, but tracked explicitly so
+    # the push path — where state.turn_id differs from the "push-…" id — reports
+    # the right thing through the same _cancel_in_flight emitter).
+    state.agent_turn_id = turn_id
     if BRIDGE:
         BRIDGE.begin_local_call()
     try:
@@ -440,6 +445,7 @@ async def _run_turn(ws, state: TurnState):
     finally:
         state.inflight_combined = None
         state.inflight_images = []
+        state.agent_turn_id = None
         if BRIDGE:
             BRIDGE.end_local_call()
 
@@ -1044,6 +1050,18 @@ _PENDING_PUSHES: deque = deque(maxlen=20)
 PUSH_WAIT_TURN_S = 180.0
 
 
+def _reply_machinery_busy(state: TurnState) -> bool:
+    """True while a turn occupies (or is imminently about to occupy) the reply
+    machinery: a live agent_task, a live debounce timer, or pending input that
+    a debounce will pick up. A push waits for ALL of these to clear before it
+    speaks, so it never talks over — or races ahead of — a user turn."""
+    a = state.agent_task
+    d = state.debounce_task
+    return ((a is not None and not a.done())
+            or (d is not None and not d.done())
+            or state.has_pending())
+
+
 async def handle_gateway_push(text: str, speak: bool = True) -> None:
     """Entry point wired to the hermes_gateway backend's push handler
     (see app.init_backends). ``speak=False`` = gateway system notice:
@@ -1072,8 +1090,8 @@ def _flush_pending_pushes(ws, state: TurnState) -> None:
 async def _push_to_client(ws, state: TurnState, text: str,
                           speak: bool = True) -> None:
     if not speak:
-        # System notice: silent bubble via the existing external.message
-        # client path (renders text, no audio) — no turn machinery needed.
+        # Gateway system notice: silent bubble via the external.message client
+        # path (renders text, no audio, NOT persisted) — no turn machinery.
         try:
             await ws.send_json({"type": "external.message",
                                 "role": "assistant", "text": text,
@@ -1081,25 +1099,31 @@ async def _push_to_client(ws, state: TurnState, text: str,
         except Exception:
             LOG.exception("silent push send failed")
         return
-    # Let a running turn finish first (bounded — a wedged turn must not
-    # silence pushes forever).
-    deadline = time.time() + PUSH_WAIT_TURN_S
-    while time.time() < deadline:
-        task = state.agent_task
-        if task is None or task.done():
-            break
-        await asyncio.sleep(0.25)
-
     turn_id = f"push-{_short_id()}"
     reply_id = f"reply-{turn_id}"
-    # Claim the agent_task slot while idle so an owner barge-in
-    # (_cancel_in_flight) stops push playback like any reply.
     me = asyncio.current_task()
     claimed = False
-    if state.agent_task is None or state.agent_task.done():
-        state.agent_task = me
-        claimed = True
+    # NOTE: the wait-loop is INSIDE the try — a push cancelled while still
+    # waiting for the slot (e.g. a queued second push on disconnect) lives only
+    # in inflight_tasks and must also route through _handle_cancelled_push
+    # (→ back onto _PENDING_PUSHES), otherwise its content vanishes silently.
     try:
+        # Let a running (or imminent) turn finish first (bounded — a wedged
+        # turn must not silence pushes forever).
+        deadline = time.time() + PUSH_WAIT_TURN_S
+        while time.time() < deadline:
+            if not _reply_machinery_busy(state):
+                break
+            await asyncio.sleep(0.25)
+
+        # Claim the agent_task slot while idle so an owner barge-in
+        # (_cancel_in_flight) stops push playback like any reply. agent_turn_id
+        # lets that barge-in's turn.discarded name THIS push (state.turn_id
+        # belongs to the incoming user turn, not the push).
+        if state.agent_task is None or state.agent_task.done():
+            state.agent_task = me
+            state.agent_turn_id = turn_id
+            claimed = True
         LOG.info("turn=%s gateway push: %r", turn_id, text[:120])
         await ws.send_json({"type": "reply.start", "turnId": turn_id,
                             "replyId": reply_id, "push": True, "ts": time.time()})
@@ -1107,12 +1131,104 @@ async def _push_to_client(ws, state: TurnState, text: str,
                                     combined=text, resolved_imgs=[], push=True)
     except asyncio.CancelledError:
         LOG.info("turn=%s gateway push cancelled (barge-in/close)", turn_id)
+        _handle_cancelled_push(ws, state, text, speak, turn_id)
         raise
     except Exception:
         LOG.exception("turn=%s gateway push failed", turn_id)
     finally:
         if claimed and state.agent_task is me:
             state.agent_task = None
+            state.agent_turn_id = None
+
+
+def _handle_cancelled_push(ws, state: TurnState, text: str, speak: bool,
+                           turn_id: str) -> None:
+    """Decide what happens to a push whose playback was just cancelled. Called
+    from inside the CancelledError handler — must not await (spawns tasks / does
+    sync queue work only). The directive comes from whoever cancelled us:
+
+      connection closing → back onto _PENDING_PUSHES (next connect speaks it);
+                           a re-spawn would resurrect after close.
+      "drop" (session reset) → gone; it belongs to the old session.
+      "text" (stop-command) → surface as a persisted silent text bubble so the
+                           content is never lost, just no longer spoken.
+      "bargein" (default) → threshold decision on how much actually played
+                           (state.playback_stopped, matched by turn id — a
+                           missing report counts as 0.0 = unheard, the safe
+                           default). Both branches persist the text as a bubble:
+                             heard  (played ≥ CFG.push_heard_threshold_s): the
+                                    user knowingly stopped THIS message → nothing
+                                    else.
+                             unheard: also tell the gateway the push was NOT
+                                    delivered, so the agent (which holds the
+                                    conversation history) can weave the content
+                                    into its answer to the interrupting utterance.
+    """
+    if state.closing or ws.closed:
+        _PENDING_PUSHES.append((text, speak))
+        LOG.info("turn=%s push re-queued for next connect (conn closing)", turn_id)
+        return
+    mode = state.push_cancel_mode
+    if mode == "drop":
+        LOG.info("turn=%s push dropped (session reset)", turn_id)
+        return
+    if mode == "text":
+        LOG.info("turn=%s push → text bubble (stop-command)", turn_id)
+        _spawn_tracked(state, _push_text_bubble(ws, text))
+        return
+    # barge-in: how much of THIS push did the user actually hear?
+    played = 0.0
+    rec = state.playback_stopped
+    if rec is not None and rec[0] == turn_id:
+        try:
+            played = max(0.0, float(rec[1]))
+        except (TypeError, ValueError):
+            played = 0.0
+    threshold = CFG.push_heard_threshold_s if CFG is not None else 3.0
+    heard = played >= threshold
+    # Always surface the content as a persisted bubble — never silently lost.
+    _spawn_tracked(state, _push_text_bubble(ws, text))
+    if heard:
+        LOG.info("turn=%s push heard (%.1fs ≥ %.1fs) → text bubble only",
+                 turn_id, played, threshold)
+    else:
+        # Notify the gateway BEFORE the interrupting turn's user.message goes
+        # out. That message is sent by chat_stream only AFTER the debounce
+        # window elapses (the barge-in cancelled us at commit time, well
+        # earlier), so this task's send wins the race on the shared bridge WS.
+        LOG.info("turn=%s push unheard (%.1fs < %.1fs) → text bubble + gateway notify",
+                 turn_id, played, threshold)
+        _spawn_tracked(state, _notify_push_undelivered(text, played))
+
+
+async def _push_text_bubble(ws, text: str) -> None:
+    """Surface a cancelled push's content as a persisted, assistant-attributed
+    chat bubble (never spoken). Distinct from the speak=False system-notice
+    path (source 'system', not persisted): source 'push' + persist so the
+    content survives a reload."""
+    try:
+        await ws.send_json({"type": "external.message", "role": "assistant",
+                            "text": text, "source": "push", "persist": True,
+                            "ts": time.time()})
+    except Exception:
+        LOG.exception("push text bubble send failed")
+
+
+async def _notify_push_undelivered(text: str, played_s: float) -> None:
+    """Best-effort: tell the gateway LLM backend that a push was not delivered,
+    so the agent can weave it into its next answer. Duck-typed hook (same
+    pattern as reset_session / set_push_handler); absent on non-gateway
+    backends. Hook errors are logged and swallowed — they must never break the
+    interrupting turn."""
+    if CONV is None:
+        return
+    hook = getattr(CONV.llm, "notify_push_undelivered", None)
+    if hook is None:
+        return
+    try:
+        await hook(text, played_s)
+    except Exception:
+        LOG.exception("notify_push_undelivered hook failed (ignored)")
 
 
 def _resume_debounce(ws, state: TurnState) -> None:
@@ -1245,7 +1361,18 @@ async def _coalesce_cancel(state: TurnState, ws):
 
 async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False,
                             coalesced_text: str | None = None,
-                            requeued: bool = False):
+                            requeued: bool = False,
+                            push_on_cancel: str = "bargein"):
+    # Per-caller matrix for what happens to a gateway push that is speaking (or
+    # about to) when it gets cancelled here — read by _push_to_client's
+    # CancelledError handler (it runs while we await the cancelled task below):
+    #   barge-in (voice/text via _coalesce_cancel) → "bargein" (default): heard
+    #        → text bubble; unheard → text bubble + push.undelivered to gateway
+    #   wake stop-command                          → "text" (drop audio, show text)
+    #   session reset (own + peer)                 → "drop" (belongs to old session)
+    # Only the push occupying state.agent_task reads this; a push still in its
+    # wait-loop (only in inflight_tasks) is not cancelled here at all.
+    state.push_cancel_mode = push_on_cancel
     # A cancellation ends the running reply → any "do-not-reopen-window" flag
     # that may have been set is thereby moot.
     state.wake_suppress_reopen = False
@@ -1265,7 +1392,11 @@ async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False,
             tasks_to_await.append(tt)
             cancelled = True
     if cancelled:
-        evt = {"type": "turn.discarded", "turnId": state.turn_id,
+        # Name the work that actually occupied the reply machinery. For a push
+        # that is the "push-<id>" turn (state.turn_id already belongs to the
+        # NEXT user turn); for a normal turn agent_turn_id == state.turn_id.
+        evt = {"type": "turn.discarded",
+               "turnId": state.agent_turn_id or state.turn_id,
                "reason": "new-speech-detected",
                "coalesced": coalesced, "ts": time.time()}
         if coalesced:
@@ -1289,6 +1420,9 @@ async def _cancel_in_flight(state: TurnState, ws, coalesced: bool = False,
         # the client stop everything.
         await ws.send_json({"type": "audio.stop", "ts": time.time()})
     state.client_playing = False
+    # The cancelled push (if any) has read the directive during the await above;
+    # reset so an unrelated later cancel defaults to the barge-in decision.
+    state.push_cancel_mode = "bargein"
 
 
 def _speaker_tag(text: str, speaker_info: dict | None) -> str:
@@ -1502,7 +1636,10 @@ async def _apply_wake_gate(ws, state: TurnState, *, segment_id, text,
     # close the conversation window (the wake word is needed again).
     if wake.is_stop_command(command_text) or (
             end_marker and not (command_text or "").strip()):
-        await _cancel_in_flight(state, ws)
+        # User said "stop": silence any speaking push, but still surface its
+        # text (a background result must not vanish just because it was talking
+        # when the stop landed).
+        await _cancel_in_flight(state, ws, push_on_cancel="text")
         # "Stop" also discards whatever was composed but not yet
         # dispatched — otherwise it silently rides into the NEXT accepted
         # turn minutes later.
@@ -1865,6 +2002,22 @@ async def _ws_playback_done(conn: WsConn, data):
             ident.mark_playback_finished()
         except Exception:
             LOG.exception("mark_playback_finished failed (ignored)")
+
+
+async def _ws_playback_stopped(conn: WsConn, data):
+    """The user stopped in-progress STREAMING playback (VAD barge-in or the
+    manual stop button). The browser reports how many seconds of THIS turn it
+    actually played so a cancelled gateway push can be classified heard vs.
+    unheard (see _handle_cancelled_push). Latest report wins; matched by turn
+    id there so a stale one for another turn is ignored."""
+    state = conn.state
+    turn_id = data.get("turnId")
+    try:
+        played_s = max(0.0, float(data.get("playedS") or 0.0))
+    except (TypeError, ValueError):
+        played_s = 0.0
+    if turn_id:
+        state.playback_stopped = (turn_id, played_s)
 
 
 async def _ws_barge_in(conn: WsConn, data):
@@ -2367,7 +2520,9 @@ async def _ws_text_message(conn: WsConn, data):
 
 async def _ws_session_reset(conn: WsConn, data):
     ws, state = conn.ws, conn.state
-    await _cancel_in_flight(state, ws)
+    # Reset starts a fresh session → a push cancelled here belongs to the OLD
+    # session and must be dropped, not re-delivered into the new one.
+    await _cancel_in_flight(state, ws, push_on_cancel="drop")
     state.pending_resume = ""
     state.pending_texts.clear()
     state.pending_segment_ids.clear()
@@ -2422,7 +2577,7 @@ async def _ws_session_reset(conn: WsConn, data):
         if peer_ws is ws:
             continue
         try:
-            await _cancel_in_flight(peer_state, peer_ws)
+            await _cancel_in_flight(peer_state, peer_ws, push_on_cancel="drop")
         except Exception:
             LOG.exception("peer cancel on session reset failed (ignored)")
         peer_state.session_user = new_user
@@ -2516,6 +2671,7 @@ async def _ws_settings(conn: WsConn, data):
 _WS_TEXT_HANDLERS = {
     "ping": _ws_ping,
     "playback.done": _ws_playback_done,
+    "playback.stopped": _ws_playback_stopped,
     "barge_in": _ws_barge_in,
     "wake.close": _ws_wake_close,
     "segment.start": _ws_segment_start,
@@ -2759,6 +2915,9 @@ async def ws_handler(request):
                 LOG.warning("ws error from %s: %s", peer, ws.exception())
                 break
     finally:
+        # Mark BEFORE cancelling tasks: a push cancelled here must re-queue for
+        # the next connect, not re-spawn a delivery task that outlives the close.
+        state.closing = True
         if BRIDGE is not None:
             BRIDGE.unregister_broadcast(ws)
         WS_CLIENTS.pop(ws, None)

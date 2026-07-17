@@ -104,6 +104,13 @@ class TurnState:
     pending_image_urls: list = field(default_factory=list)
     debounce_task: object = None
     agent_task: object = None
+    # Turn id of whatever currently occupies the reply machinery (a normal turn
+    # OR a gateway push). Set when the agent phase / push claims the slot,
+    # cleared in the finally. `_cancel_in_flight` reports THIS as the discarded
+    # turn — for a push it is "push-<id>", which state.turn_id never becomes,
+    # so a barge-in's turn.discarded names the cancelled push, not the new user
+    # turn (which would otherwise get its reply bubbles suppressed client-side).
+    agent_turn_id: str | None = None
     audio_ids: set = field(default_factory=set)
     speed: float = 1.0
     debounce_ms: int = 1200
@@ -184,6 +191,28 @@ class TurnState:
     # Hermes session ID for the voice session (deterministic from the session
     # key so it survives reconnects; rotated on explicit /new).
     hermes_session_id_separate: str = field(default_factory=current_hermes_session_id)
+    # True once the WebSocket is tearing down (set before _cancel_connection_tasks
+    # on the close path). A gateway push cancelled while this is set must NOT
+    # spawn a text-bubble/notify task (it would send on a closing conn) — it goes
+    # back onto the offline _PENDING_PUSHES queue instead.
+    closing: bool = False
+    # How a gateway push occupying the reply machinery should be handled if it is
+    # cancelled by the NEXT _cancel_in_flight. Set by the caller right before it
+    # cancels (see the per-caller matrix in _cancel_in_flight); the cancelled
+    # push reads it in its CancelledError handler:
+    #   "bargein" — barge-in (voice/manual stop): decide by how much of the push
+    #               actually played (see playback_stopped + _handle_cancelled_push):
+    #               heard → silent text bubble; unheard → text bubble + tell the
+    #               gateway so the agent can weave it into the next answer (default).
+    #   "text"    — user said "stop": drop the audio but still surface the text
+    #               (silent bubble) so nothing is lost.
+    #   "drop"    — session reset: the content belongs to the old session, drop.
+    push_cancel_mode: str = "bargein"
+    # Latest client playback-stop report: (turn_id, played_s) sent by the browser
+    # when the user stops in-progress STREAMING playback (barge-in / manual stop).
+    # Read by _handle_cancelled_push to tell a "heard" push from an "unheard" one;
+    # matched by turn_id so a stale report for another turn is ignored.
+    playback_stopped: tuple | None = None
 
     def has_pending(self) -> bool:
         return bool(self.pending_resume or self.pending_texts

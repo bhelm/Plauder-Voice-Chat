@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 
 from aiohttp import ClientSession, WSMsgType
@@ -183,6 +184,26 @@ class HermesGatewayLLMBackend(LLMBackend):
         text = entry["text"].strip()
         if text:
             self._dispatch_push(text, entry["speak"])
+
+    async def notify_push_undelivered(self, text: str,
+                                      played_s: float) -> None:
+        """Tell the gateway a background push was NOT delivered to the user
+        (barge-in cancelled it before he could hear it). The adapter stashes it
+        per chat and appends a note to the NEXT turn's channel_prompt, so the
+        agent can weave the content into its answer. Best-effort: with the
+        bridge down we drop it (the next user.message wouldn't get through
+        either). Sent over the same WS as user.message, and — because the
+        interrupting turn only sends its user.message after the debounce
+        window — this frame reliably precedes it."""
+        ws = self._ws
+        if ws is None:
+            LOG.warning("notify_push_undelivered: bridge not connected — dropped")
+            return
+        try:
+            await ws.send_json({"type": "push.undelivered", "text": text,
+                                "played_s": played_s, "ts": time.time()})
+        except Exception as exc:
+            LOG.warning("notify_push_undelivered send failed: %s", exc)
 
     async def reset_session(self) -> None:
         """Ask the gateway for a fresh session ("New Session" button).

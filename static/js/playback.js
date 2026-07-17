@@ -166,6 +166,7 @@ function startStreamPlayback(turnId, audioId, sampleRate, codec) {
   streamPlayer = {
     turnId, audioId, sampleRate: sampleRate || 24000,
     nextTime: 0, sources: new Set(), ended: false, donePending: true,
+    startTime: null,   // ctx time of the FIRST scheduled chunk (played-seconds anchor)
     lead: 0.04,   // scheduling lead-in; grows after underruns (jitter buffer)
     chunks: [],   // collect PCM for the replay cache
     cachedSamples: 0,
@@ -302,6 +303,7 @@ function pushStreamChunk(turnId, int16) {
     streamPlayer.nextTime = now + streamPlayer.lead;
   }
   const startAt = streamPlayer.nextTime;
+  if (streamPlayer.startTime == null) streamPlayer.startTime = startAt;
   node.start(startAt);
   streamPlayer.nextTime = startAt + buf.duration;
   streamPlayer.sources.add(node);
@@ -345,6 +347,35 @@ function endStreamPlayback(turnId) {
   flushDecodedChunks(turnId);   // opus: ship the sub-threshold tail
   streamPlayer.ended = true;
   maybeFinishStream();
+}
+
+// Seconds of the current streaming turn that ACTUALLY reached the speaker so
+// far. Bounded: 0 if playback never started, and never more than what was
+// scheduled (nextTime - startTime; gapless, so that IS the audio duration,
+// plus any underrun lead the user also waited through). Only the browser knows
+// this — the server uses it to tell a "heard" push from an interrupted one.
+function streamPlayedSeconds(sp) {
+  if (!sp || sp.startTime == null || !playbackCtx) return 0;
+  const scheduledTotal = Math.max(0, sp.nextTime - sp.startTime);
+  const elapsed = playbackCtx.currentTime - sp.startTime;
+  return Math.max(0, Math.min(elapsed, scheduledTotal));
+}
+
+// A user-initiated stop of in-progress STREAMING playback (barge-in / manual
+// stop): tell the server how much of THIS turn was actually heard, so a
+// cancelled gateway push can be classified heard vs. unheard. Natural
+// completion goes through playback.done instead; the classic WAV path is out
+// of scope. Call BEFORE stopStreamPlayback() (it detaches streamPlayer).
+function reportPlaybackStopped() {
+  const sp = streamPlayer;
+  if (!sp) return;
+  try {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'playback.stopped', turnId: sp.turnId,
+        playedS: streamPlayedSeconds(sp), ts: Date.now() }));
+    }
+  } catch (_) {}
 }
 
 function stopStreamPlayback() {

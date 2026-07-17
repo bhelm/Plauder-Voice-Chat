@@ -29,6 +29,15 @@ Browser ⇄ plauder (STT/TTS, port 8319)
   outside the gateway) use the bridge's token-authenticated
   `POST /push` (`standalone_sender_fn`). The home channel for bare
   targets comes from `VOICE_CHAT_HOME_CHANNEL` (default `default`).
+- Undelivered pushes: when a barge-in cancels a background push before the
+  user heard it (< `PUSH_HEARD_THRESHOLD_S` played), plauder sends a
+  `push.undelivered` frame (`{type, text, played_s, ts}`). The bridge stashes
+  it per chat (`consume_undelivered`, bounded FIFO); the adapter consumes it
+  one-shot on the next `user.message` and appends a German agent-facing note
+  (`bridge.format_undelivered_note`) to that turn's `channel_prompt` — so the
+  agent can weave the content into its answer instead of it being lost or
+  re-read out loud. (A *heard* push — user knowingly stopped it — is not
+  notified; plauder just keeps its text as a local chat bubble.)
 - Gateway system notices (restart/online, busy acks, /new confirmation)
   are delivered with `speak: false`: plauder shows a silent chat bubble
   (`external.message`) instead of speaking them. Classification: the

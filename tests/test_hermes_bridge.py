@@ -17,7 +17,12 @@ from plauder.config import Config, ConfigError
 # The gateway plugin lives in the repo but outside the plauder package;
 # only its gateway-free bridge module is imported here.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hermes_plugin"))
-from voice_chat.bridge import CLOSE_UNAUTHORIZED, VoiceBridgeServer  # noqa: E402
+from voice_chat.bridge import (  # noqa: E402
+    CLOSE_UNAUTHORIZED,
+    UNDELIVERED_MAX,
+    VoiceBridgeServer,
+    format_undelivered_note,
+)
 
 TOKEN = "test-bridge-token"
 
@@ -609,6 +614,87 @@ def test_http_push_delivers_or_queues():
             await server.stop()
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Undelivered-push notes (barge-in cancelled a push before it was heard)
+# --------------------------------------------------------------------------- #
+def test_notify_push_undelivered_reaches_bridge_store():
+    """The plauder backend's notify_push_undelivered frame lands in the
+    bridge's per-chat pending store and is consumed one-shot."""
+    async def run():
+        server = _mk_server()
+        await server.start()
+        backend = _mk_backend(server.port)
+        try:
+            await backend.load()
+            for _ in range(100):
+                if server.connected("default"):
+                    break
+                await asyncio.sleep(0.05)
+            assert server.connected("default")
+            await backend.notify_push_undelivered("Der Subagent ist fertig.", 1.2)
+            # Poll until the frame has been routed into the store.
+            pending = []
+            for _ in range(100):
+                pending = server.consume_undelivered("default")
+                if pending:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(pending) == 1
+            assert pending[0]["text"] == "Der Subagent ist fertig."
+            assert pending[0]["played_s"] == 1.2
+            # One-shot: a second consume returns nothing.
+            assert server.consume_undelivered("default") == []
+        finally:
+            await backend.close()
+            await server.stop()
+
+    asyncio.run(run())
+
+
+def test_notify_push_undelivered_without_connection_is_noop():
+    async def run():
+        backend = HermesGatewayLLMBackend(url="ws://127.0.0.1:1/ws",
+                                          token=TOKEN)
+        await backend.notify_push_undelivered("egal", 0.0)   # must not raise
+
+    asyncio.run(run())
+
+
+def test_undelivered_store_is_bounded_fifo():
+    """More than UNDELIVERED_MAX notes: the oldest are dropped, newest kept."""
+    server = _mk_server()
+    for i in range(UNDELIVERED_MAX + 3):
+        server._record_undelivered("default", {"text": f"n{i}", "played_s": 0.0})
+    pending = server.consume_undelivered("default")
+    assert len(pending) == UNDELIVERED_MAX
+    texts = [p["text"] for p in pending]
+    assert texts == [f"n{i}" for i in range(3, UNDELIVERED_MAX + 3)]
+    assert server.consume_undelivered("default") == []
+
+
+def test_record_undelivered_ignores_empty_text():
+    server = _mk_server()
+    server._record_undelivered("default", {"text": "   ", "played_s": 5.0})
+    server._record_undelivered("default", {"played_s": 1.0})
+    assert server.consume_undelivered("default") == []
+
+
+def test_format_undelivered_note_is_pure_and_full_text():
+    long = "Der Subagent hat 12 Dateien geändert und alle Tests laufen grün. " * 3
+    note = format_undelivered_note([
+        {"text": "Kurze Info.", "played_s": 0.0},
+        {"text": long, "played_s": 2.6},
+    ])
+    assert note.startswith("HINWEIS:")
+    assert "»Kurze Info.«" in note
+    assert "(nicht vorgelesen)" in note      # 0 s
+    assert "(nur 3s vorgelesen)" in note      # 2.6 -> 3
+    assert long.strip() in note               # full text, no truncation
+    # Pure: empty in -> empty out.
+    assert format_undelivered_note([]) == ""
+    assert format_undelivered_note([{"text": "  ", "played_s": 1.0}]) == ""
 
 
 # --------------------------------------------------------------------------- #

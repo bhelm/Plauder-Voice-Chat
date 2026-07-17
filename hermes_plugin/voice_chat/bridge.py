@@ -16,6 +16,10 @@ Wire protocol (JSON text frames, both sides ignore unknown types):
      "modality": "voice"|"text", "image_urls": ["data:image/...;base64,…"]}
     {"type": "session.reset"}
         "New Session" in the voice UI -> gateway rotates its session (/new)
+    {"type": "push.undelivered", "text": "...", "played_s": 0.0, "ts": 123.4}
+        a background push was cancelled by a barge-in before the user could
+        hear it -> stashed per chat; the NEXT turn's channel_prompt tells the
+        agent so it can weave the content into its answer (see adapter.py)
 
   gateway -> plauder:
     {"type": "hello.ok", "proto": 1, "platform": "voice_chat"}
@@ -57,6 +61,8 @@ HELLO_TIMEOUT_S = 10.0
 CLOSE_UNAUTHORIZED = 4401
 #: Per-chat cap of frames queued while the voice client is disconnected.
 QUEUE_MAX = 50
+#: Per-chat cap of pending undelivered-push notes (FIFO, oldest dropped).
+UNDELIVERED_MAX = 5
 #: Frame size cap — user.message frames may carry base64 data-URL images.
 MAX_MSG_BYTES = 32 * 1024 * 1024
 #: Leading emoji of the gateway's hardcoded system texts ("♻️ Gateway
@@ -70,6 +76,34 @@ SYSTEM_EMOJI_PREFIXES = ("♻️", "⚠️", "⚡", "✨", "⏳", "🆕")
 def is_system_text(text: str) -> bool:
     """Heuristic system-notice classifier (see SYSTEM_EMOJI_PREFIXES)."""
     return text.lstrip().startswith(SYSTEM_EMOJI_PREFIXES)
+
+
+def format_undelivered_note(pending: list) -> str:
+    """Render the agent-facing note for background pushes the user never (fully)
+    heard, from a list of ``{"text", "played_s", ...}`` dicts. German because
+    it is injected into the voice channel_prompt (like DEFAULT_CHANNEL_PROMPT),
+    which is Bernd's spoken interface. Pure/side-effect-free (unit-tested).
+    The push text is quoted in FULL — the facts are the whole point, so nothing
+    is truncated. Returns "" when there is nothing worth noting."""
+    lines = []
+    for item in pending or []:
+        text = str((item or {}).get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            played = max(0.0, float((item or {}).get("played_s") or 0.0))
+        except (TypeError, ValueError):
+            played = 0.0
+        prefix = (f"(nur {played:.0f}s vorgelesen) " if played >= 0.5
+                  else "(nicht vorgelesen) ")
+        lines.append(f"{prefix}»{text}«")
+    if not lines:
+        return ""
+    return (
+        "HINWEIS: Diese Hintergrund-Nachricht(en) von dir wurden dem Nutzer "
+        "NICHT (bzw. nur kurz) vorgelesen — er kennt sie vermutlich nicht. "
+        "Falls noch relevant, flechte die Kernpunkte in deine Antwort ein:\n"
+        + "\n".join(lines))
 
 
 class VoiceBridgeServer:
@@ -94,6 +128,10 @@ class VoiceBridgeServer:
         self._conns: Dict[str, web.WebSocketResponse] = {}
         #: chat_id -> frames waiting for the next (re)connect.
         self._queues: Dict[str, Deque[dict]] = {}
+        #: chat_id -> pending undelivered-push notes (barge-in cancelled a push
+        #: before the user heard it); consumed one-shot into the next turn's
+        #: channel_prompt. Bounded FIFO (UNDELIVERED_MAX).
+        self._undelivered: Dict[str, Deque[dict]] = {}
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -166,6 +204,32 @@ class VoiceBridgeServer:
             if not await self.send_frame(chat_id, frame):
                 q.appendleft(frame)   # connection died again — keep it
                 return
+
+    # ------------------------------------------------------------------ #
+    # Undelivered-push notes (barge-in cancelled a push before it was heard)
+    # ------------------------------------------------------------------ #
+    def _record_undelivered(self, chat_id: str, frame: dict) -> None:
+        """Stash a ``push.undelivered`` frame for the chat. Bounded FIFO —
+        the oldest note is dropped once the cap is reached."""
+        text = str(frame.get("text") or "").strip()
+        if not text:
+            return
+        try:
+            played = max(0.0, float(frame.get("played_s") or 0.0))
+        except (TypeError, ValueError):
+            played = 0.0
+        q = self._undelivered.setdefault(
+            chat_id, collections.deque(maxlen=UNDELIVERED_MAX))
+        q.append({"text": text, "played_s": played,
+                  "ts": frame.get("ts")})
+        LOG.info("voice_chat: undelivered push stashed for %r (%.1fs): %r",
+                 chat_id, played, text[:80])
+
+    def consume_undelivered(self, chat_id: str) -> list:
+        """Return and clear the chat's pending undelivered-push notes (one-shot,
+        oldest first). Empty list when there is nothing pending."""
+        q = self._undelivered.pop(chat_id, None)
+        return list(q) if q else []
 
     async def _push_handler(self, request: web.Request) -> web.Response:
         """Out-of-process push entry (``hermes send``, standalone cron):
@@ -243,6 +307,8 @@ class VoiceBridgeServer:
                         await self._on_session_reset(chat_id)
                     except Exception:
                         LOG.exception("bridge: session.reset handler failed")
+                elif ftype == "push.undelivered":
+                    self._record_undelivered(chat_id, frame)
                 # Unknown frame types: ignored (forward compatibility).
         finally:
             if self._conns.get(chat_id) is ws:

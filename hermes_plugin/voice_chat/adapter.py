@@ -48,7 +48,11 @@ from gateway.platforms.base import (
     resolve_channel_prompt,
 )
 
-from .bridge import VoiceBridgeServer, is_system_text
+from .bridge import (
+    VoiceBridgeServer,
+    format_undelivered_note,
+    is_system_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +328,19 @@ class VoiceChatAdapter(BasePlatformAdapter):
             media_types=media_types,
             metadata={"vc_turn_id": turn_id, "modality": modality},
         )
-        event.channel_prompt = self._channel_prompt_for(chat_id)
+        channel_prompt = self._channel_prompt_for(chat_id)
+        # A background push cancelled by a barge-in before the user heard it
+        # (push.undelivered): append an agent-facing note so the agent can weave
+        # the content into THIS answer. Ephemeral per-turn context (like the
+        # voice-mode rules) — NOT prepended to the user text, which would
+        # pollute the gateway transcript. One-shot consumption.
+        if self._bridge is not None:
+            note = format_undelivered_note(
+                self._bridge.consume_undelivered(chat_id))
+            if note:
+                channel_prompt = (f"{channel_prompt}\n\n{note}"
+                                  if channel_prompt else note)
+        event.channel_prompt = channel_prompt
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

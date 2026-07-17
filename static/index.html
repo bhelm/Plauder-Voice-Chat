@@ -1442,6 +1442,10 @@
     function wakeOneshot() { return !!(serverWake && serverWake.mode === 'alexa'); }
     function bargeInStop(reason) {
       const wasPlaying = anyAudioPlaying();
+      // 0) Report how much of the streaming reply actually played BEFORE the
+      //    teardown detaches the player — lets the server tell a "heard"
+      //    gateway push from an interrupted one (unheard → agent re-weaves it).
+      reportPlaybackStopped();
       // 1) Stop locally right away (this is the crucial, latency-free part).
       stopCurrentAudio();
       stopStreamPlayback();
@@ -2108,6 +2112,9 @@
       'ack': (_m) => {},
       'external.message': (m) => {
         addExternalBubble(m.role, m.text);
+        // A cancelled gateway push surfaced as text (source 'push') must
+        // survive a reload — system notices (source 'system') stay ephemeral.
+        if (m.persist) persistMsg(m.role === 'assistant' ? 'agent' : 'user', m.text);
       },
     };
 

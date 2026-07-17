@@ -315,6 +315,12 @@ class Config:
     hermes_gateway_ws_url: str = "ws://127.0.0.1:8321/ws"
     hermes_gateway_token: str = ""
     hermes_gateway_chat_id: str = "default"
+    # A gateway push cancelled by a barge-in: if the browser had played at least
+    # this many seconds of it before the stop, the user knowingly interrupted
+    # THAT message (heard) — surface the text, do not renotify. Below it (or no
+    # playback report) the push counts as unheard and the gateway is told so it
+    # can weave the content into its answer. See server._handle_cancelled_push.
+    push_heard_threshold_s: float = 3.0
 
     # --- LLM: OpenClaw (legacy) ---
     openclaw_gateway_url: str = "http://localhost:8080"
@@ -549,6 +555,7 @@ class Config:
             hermes_gateway_token=_env("HERMES_GATEWAY_TOKEN"),
             hermes_gateway_chat_id=_first(_env("HERMES_GATEWAY_CHAT_ID"),
                                           default="default"),
+            push_heard_threshold_s=_env_float("PUSH_HEARD_THRESHOLD_S", 3.0),
 
             # LLM openclaw (legacy)
             openclaw_gateway_url=_first(_env("OPENCLAW_GATEWAY_URL"),
