@@ -62,13 +62,17 @@ file and must not be redeclared elsewhere. After editing client JS run
 every file and inline block and unit-tests the pure modules
 (`tests/client/pure_modules.test.mjs`).
 
-Restarting the running server: it is managed by systemd
-(`voice-chat.service`, `Restart=always`) — use `systemctl restart voice-chat`;
-logs via `journalctl -u voice-chat`. Do **not** `pkill -f "start.sh"` /
-`pkill -f server.py` (the pattern matches the shell running the command and kills
-it, exit 144), and do not start `./start.sh` by hand while the unit is active —
-the port is taken and systemd would race a manual instance. The server does not
-auto-reload.
+Restarting the running server: it is started **by hand from a shell script**
+(`./start.sh`, or the per-voice variants `./start-xena.sh` / `./start-joy.sh`,
+which `exec` into `server.py` — so the running process shows up as
+`.venv/bin/python server.py`, not as the script). It runs in the foreground of
+whatever terminal it was launched from; restarting means `Ctrl+C` there and
+running the script again. There is no systemd unit, no `Restart=always` and no
+`journalctl` — logs go to that terminal. The server does not auto-reload, so
+any server-side change needs a restart; client-side changes only need a reload
+(cache-busted via `?v=__ASSET_VER__`). Do **not** `pkill -f server.py` — the
+pattern also matches the shell running the command and kills it (exit 144);
+target the PID instead.
 
 ## Architecture
 
@@ -89,10 +93,34 @@ auto-reload.
   out of `server.py` to separate process lifecycle from request handling.
 - **`images.py`** — self-contained `/upload` handler + `/uploads/...` → data-URL
   resolution for the multimodal LLM call (no runtime backend state).
-- **`voice_clone.py`** — voice library / cloning handlers: `/voice-upload`,
-  recorded-sample commit, hello capability block, active-voice lookup. Reads
-  `server.*` at call time (same pattern as `app.py`); the wrapper CRUD client
-  is `voices.py` (`VoiceLibrary`).
+- **`ai_voice.py`** — THE module for the voice the assistant speaks with. One
+  feature, two interchangeable sources (`AI_VOICE_SOURCE=auto|wrapper|local`):
+  source selection, library CRUD routed per source, `/voice-upload`,
+  recorded-sample commit, the single `aiVoice` hello block + `aivoice.state`
+  fan-out, and the cloned-vs-designed choice (persisted in `.ai_voice.json`,
+  re-applied on boot by `app.py`). Reads `server.*` at call time (same pattern
+  as `app.py`). A pinned source that is not wired disables the feature rather
+  than falling back silently.
+  **`local`** = `omnivoice_local` in-process, switched on the loaded backend via
+  `set_voice_mode()` (duck-typed: any backend growing that method participates);
+  OmniVoice's own two modes are `clone` (reference recording) and `design`
+  (`instruct` = free-text voice description). Voices + samples are files on
+  disk — `voice_store.py` (`LocalVoiceStore`, `VOICES_DIR`, default `./voices`):
+  a voice keeps SEVERAL takes but clones from exactly ONE (`activeSample`),
+  because OmniVoice takes a single reference recording. Selecting a voice IS
+  re-pointing the backend at that sample. These samples are NOT the House-Mode
+  speaker-ID ones (those identify a speaker, these reproduce a voice).
+  **`wrapper`** = OmniVoice as an HTTP service; `voices.py` (`VoiceLibrary`) is
+  transport only — the CRUD client, not a second backend. It serves finished
+  voices, so voice design and per-sample management are off there
+  (`canDesign`/`canManageSamples` in the state block say so).
+- **AI-Voice UI** — one permanent section at the top of the settings drawer
+  (`data-sec="aivoice"`), never hidden: echo-mode toggle, cloned/synthetic
+  switch, design prompt, voice picker and sample list. When no source is wired
+  the controls disable themselves and the help text says why. Wire protocol:
+  `aivoice.config|list|create|select|rename|delete|record.*|sample.*|preview` →
+  `aivoice.state` (broadcast to every browser), `aivoice.sample.ack`,
+  `aivoice.preview.audio`, `aivoice.error`.
 - **`speaker_gate.py`** — speaker-lock gating POLICY (commit gate incl.
   foreign-passage trim, early barge-in check, owner-watch auto-commit) plus
   all its field-calibrated tunables. Reads `server.*` at call time; the
@@ -286,12 +314,24 @@ exports `WAIFU_MODE=1` by default.
   pose (arms down — the VRM default is a T-pose), breathing, procedural idle
   randomness (head glances, arm sway, body weight-shift), mode overlays
   (`idle`/`listening`/`speaking`/`thinking` — thinking is staged by duration:
-  head tilt → squint → wandering eyes via VRM lookAt), and one-shot emotes.
+  head tilt → squint → star-gazing eyes (5 s): the VRM lookAt target
+  saccade-jumps between points above her head, fixating each for ~1 s
+  (squint reopens, head lifts slightly so the upward gaze reads) → head-scratch emote
+  (once at 7 s; repeats only after 5 s of further thinking past the clip's
+  end; `HeadScratch.vrma` is derived in-repo by
+  `tools/make_head_scratch_vrma.py`: the `Blush.vrma` body gesture — already a
+  head scratch — with only its rotation tracks kept, no facial overlay)),
+  and one-shot emotes.
   `Waifu.emote(name)` plays a matching **VRMA clip** (`static/anims/*.vrma`,
   from `tk256ailab/vrm-viewer`, MIT) blended over the procedural pose via an
   AnimationMixer + per-bone quaternion slerp (rotation tracks only — no root
-  motion, no expression-track conflicts with lip-sync); facial expression runs
-  in parallel. Public API: `mount/unmount/setMouth/setState/emote/isReady/resize`.
+  motion, no expression-track conflicts with lip-sync); blend weights use
+  time-based smoothstep envelopes (zero velocity at both ends), and `CLIP_END`
+  plays the end of clips whose authored return motion is too abrupt
+  (HeadScratch) in slow motion (timeScale ramp, keeps arms/head/body moving
+  continuously) while blending back to the procedural pose; facial expression
+  runs in parallel. Public API: `mount/unmount/setMouth/setState/emote/stopEmote/
+  emoteActive/emoteNames/isReady/resize`.
 - **`static/js/waifu_ui.js`** — classic script (global scope like the others).
   Owns the toggle, the docked stage, the pop-out window (physically **moves** the
   canvas into a `window.open()` doc — renderer/state survive; double-click =
@@ -303,7 +343,11 @@ exports `WAIFU_MODE=1` by default.
   from playback.js, plus `replayPlaying`) — deliberately NOT `setMicUi` events,
   which fire on VAD/transcript mid-playback and used to kill the mouth. The
   emote queue only fires while audio actually plays (text streams ahead of
-  speech) and is discarded after real silence.
+  speech) and is discarded after real silence. An **anim tester** under the
+  docked stage (select + play/stop toggle) triggers every emote (looped) and
+  body-language state (held) manually without the LLM; while a test runs, all
+  automatic hooks (mic/busy/talkDriver/emote queue) skip their `setAvatar`
+  calls so nothing overrides it.
 - The `joy.vrm` model lives in `static/models/` (gitignored like the other
   models). `static/waifu_test.html` is a standalone dev harness for the avatar.
   Avatar UI strings use `waifu.*` / `settings.sec_waifu` i18n keys (both locales).

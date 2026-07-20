@@ -96,6 +96,104 @@
         </div>
       </div>
 
+      <!-- ── Section: AI-Voice ──────────────────────────────────────────
+           The voice the assistant SPEAKS with. Two mutually exclusive modes,
+           mirroring what OmniVoice supports natively: a cloned voice (from a
+           reference recording) or a designed one (free-text description via
+           `instruct`). Echo mode sits on top so any change is immediately
+           audible without going through the LLM.
+           Hidden unless the TTS backend can switch voices at runtime
+           (hello.aiVoice.available — true for omnivoice_local). -->
+      <details class="acc vlock" id="aiVoiceCard" open data-sec="aivoice">
+        <summary class="vlock-head">
+          <div class="vlock-badge">🎙️</div>
+          <div>
+            <div class="vlock-title" data-i18n="aivoice.title">AI-Voice</div>
+            <div class="vlock-sub" data-i18n="aivoice.tagline">The voice the assistant speaks with</div>
+          </div>
+          <span class="vlock-chip" id="aiVoiceChip"></span>
+        </summary>
+        <div class="acc-body">
+          <!-- Echo mode first: repeats your input in the current voice, no LLM
+               — the fastest way to hear the effect of a change. -->
+          <div class="card">
+            <div class="vlock-toggle" data-i18n-title="aivoice.echo_title">
+              <span data-i18n="aivoice.echo_label">🔁 Echo mode</span>
+              <label class="switch">
+                <input type="checkbox" id="echoModeToggle" />
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </label>
+            </div>
+            <div data-i18n="aivoice.echo_help" style="font-size: 11px; color: var(--muted); margin-top: 8px;">
+              Speaks your input back instead of replying — no LLM, no history.
+            </div>
+          </div>
+
+          <!-- Mode switch: cloned vs. designed -->
+          <div class="card">
+            <div class="label" data-i18n="aivoice.mode_label">Voice source</div>
+            <div class="aivoice-modes">
+              <label class="aivoice-mode">
+                <input type="radio" name="aiVoiceMode" value="clone" checked />
+                <span data-i18n="aivoice.mode_clone">🧬 Cloned</span>
+              </label>
+              <label class="aivoice-mode">
+                <input type="radio" name="aiVoiceMode" value="design" />
+                <span data-i18n="aivoice.mode_design">✨ Synthetic</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Designed voice: free-text description -->
+          <div class="card" id="aiVoiceDesignPane">
+            <div class="label" data-i18n="aivoice.instruct_label">Voice description</div>
+            <textarea id="aiVoiceInstruct" rows="3" maxlength="600"
+                      data-i18n-placeholder="aivoice.instruct_placeholder"
+                      placeholder="e.g. a warm, calm female voice in her thirties, speaking slowly"></textarea>
+            <div class="voices-actions" style="margin-top:8px;">
+              <button id="aiVoiceInstructSave" data-i18n="aivoice.apply">Apply</button>
+            </div>
+            <div data-i18n="aivoice.instruct_help" style="font-size:11px;color:var(--muted);margin-top:8px;">
+              Describe the voice in words — no recording needed. Empty = the model picks one itself.
+            </div>
+          </div>
+
+          <!-- Cloned voice: pick a voice, manage ITS samples. These recordings
+               are separate from the House-Mode speaker-ID ones — those identify
+               who is speaking, these reproduce a voice. A voice keeps several
+               takes but clones from exactly one (the marked reference), because
+               OmniVoice takes a single reference recording. -->
+          <div class="card" id="aiVoiceClonePane">
+            <div class="label" data-i18n="aivoice.clone_label">Cloned voice</div>
+            <div class="voices-picker">
+              <select id="aiVoiceSelect" class="voice-select" data-i18n-title="aivoice.pick_title"></select>
+              <div class="voices-actions">
+                <button id="aiVoiceAddBtn" data-i18n-title="aivoice.add">➕</button>
+                <button id="aiVoicePreviewBtn" data-i18n-title="aivoice.preview">🔊</button>
+                <button id="aiVoiceRenameBtn" data-i18n-title="aivoice.rename">✏️</button>
+                <button id="aiVoiceDeleteBtn" class="danger" data-i18n-title="aivoice.delete">🗑</button>
+              </div>
+            </div>
+
+            <div class="vlock-metric" id="aiVoiceSampleCountRow">
+              <span data-i18n="aivoice.samples">Samples</span>
+              <b id="aiVoiceSampleCount">–</b>
+            </div>
+            <div id="aiVoiceSamples" class="houseid-samples"></div>
+
+            <div class="voices-add">
+              <button id="aiVoiceRecordBtn" class="vlock-enroll">
+                <span class="vlock-prog" id="aiVoiceRecProg"></span>
+                <span><span class="vlock-rec-dot"></span> <span id="aiVoiceRecordLabel" data-i18n="aivoice.record">🎙️ Record sample</span></span>
+              </button>
+              <button id="aiVoiceUploadBtn" class="vlock-enroll voices-upload" data-i18n="aivoice.upload">⬆︎ Upload</button>
+              <input id="aiVoiceUploadInput" type="file" accept="audio/*" style="display:none;" />
+            </div>
+            <div id="aiVoiceCloneInfo" style="font-size:11px;color:var(--muted);margin-top:8px;"></div>
+          </div>
+        </div>
+      </details>
+
       <!-- Voice lock (speaker verification): collapsible section with its own
            accent at the top. Hidden unless the server has a speaker model
            loaded (hello.speakerLock). -->
@@ -243,50 +341,6 @@
         </div>
       </details>
 
-      <!-- Voice library: clone a speaking voice (record or upload), name it,
-           pick the active one for the whole session. Hidden unless the server
-           has voice cloning wired (hello.voiceClone.available). -->
-      <details class="acc vlock voices" id="voicesCard" style="display:none;" open data-sec="voices">
-        <summary class="vlock-head">
-          <div class="vlock-badge">🗣️</div>
-          <div>
-            <div class="vlock-title" data-i18n="voices.title">Voices</div>
-            <div class="vlock-sub" data-i18n="voices.tagline">Clone &amp; choose a speaking voice</div>
-          </div>
-          <span class="vlock-chip" id="voicesChip"></span>
-        </summary>
-        <div class="acc-body">
-          <div data-i18n="voices.help" style="font-size: 11px; color: var(--muted);">
-            Record a short sample or upload an audio file to clone a voice, then pick which voice the assistant speaks in. The choice applies to every device and is kept across sessions.
-          </div>
-          <div class="voices-picker">
-            <select id="voiceSelect" class="voice-select" data-i18n-title="voices.pick_title"></select>
-            <div class="voices-actions">
-              <button id="voicePreviewBtn" data-i18n-title="voices.preview">🔊</button>
-              <button id="voiceRenameBtn" data-i18n-title="voices.rename">✏️</button>
-              <button id="voiceDeleteBtn" class="danger" data-i18n-title="voices.delete">🗑</button>
-            </div>
-          </div>
-          <div class="voices-add">
-            <button id="recordVoiceBtn" class="vlock-enroll">
-              <span class="vlock-prog" id="voiceRecProg"></span>
-              <span><span class="vlock-rec-dot"></span> <span id="recordVoiceLabel" data-i18n="voices.record">🎙️ Record a voice</span></span>
-            </button>
-            <button id="uploadVoiceBtn" class="vlock-enroll voices-upload" data-i18n="voices.upload">⬆︎ Upload</button>
-            <input id="uploadVoiceInput" type="file" accept="audio/*" style="display:none;" />
-          </div>
-          <!-- Echo mode: the server skips the LLM and repeats whatever you say
-               in the active voice — a playground to hear a cloned voice live. -->
-          <div class="vlock-toggle" data-i18n-title="voices.echo_title">
-            <span data-i18n="voices.echo_label">🔁 Echo mode</span>
-            <label class="switch">
-              <input type="checkbox" id="echoModeToggle" />
-              <span class="switch-track"><span class="switch-thumb"></span></span>
-            </label>
-          </div>
-        </div>
-      </details>
-
       <!-- ── Section: Detection & timing ────────────────────────────── -->
       <details class="acc" open data-sec="detection">
         <summary>🎚️ <span data-i18n="settings.sec_detection">Detection &amp; timing</span></summary>
@@ -394,6 +448,7 @@
               Keeps the mic from hearing the assistant (speakers, Firefox).
             </div>
           </div>
+
         </div>
       </details>
 
@@ -421,6 +476,11 @@
               <div id="waifuPoppedNote" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;text-align:center;color:var(--muted);font-size:12px;padding:12px;">
                 <span data-i18n="waifu.popped">Avatar ist im Pop-out-Fenster.</span>
               </div>
+            </div>
+            <!-- Anim-Tester: alle Animationen manuell ausloesen (ohne LLM) -->
+            <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+              <select id="waifuAnimSelect" class="voice-select" style="flex:1;min-width:0;" data-i18n-title="waifu.animtest_title" title="Animation manuell auslösen (Test ohne LLM)"></select>
+              <button id="waifuAnimBtn" style="flex:none;width:44px;" data-i18n-title="waifu.anim_play" title="Animation abspielen">▶</button>
             </div>
           </div>
         </div>
@@ -645,17 +705,19 @@
     const houseSpkRecordBtn   = document.getElementById('houseSpkRecordBtn');
     const houseSpkRecordLabel = document.getElementById('houseSpkRecordLabel');
     const houseSpkProg        = document.getElementById('houseSpkProg');
-    const voicesCard       = document.getElementById('voicesCard');
-    const voicesChip       = document.getElementById('voicesChip');
-    const voiceSelect      = document.getElementById('voiceSelect');
-    const voicePreviewBtn  = document.getElementById('voicePreviewBtn');
-    const voiceRenameBtn   = document.getElementById('voiceRenameBtn');
-    const voiceDeleteBtn   = document.getElementById('voiceDeleteBtn');
-    const recordVoiceBtn   = document.getElementById('recordVoiceBtn');
-    const recordVoiceLabel = document.getElementById('recordVoiceLabel');
-    const voiceRecProg     = document.getElementById('voiceRecProg');
-    const uploadVoiceBtn   = document.getElementById('uploadVoiceBtn');
-    const uploadVoiceInput = document.getElementById('uploadVoiceInput');
+    const aiVoiceSelect     = document.getElementById('aiVoiceSelect');
+    const aiVoiceAddBtn     = document.getElementById('aiVoiceAddBtn');
+    const aiVoicePreviewBtn = document.getElementById('aiVoicePreviewBtn');
+    const aiVoiceRenameBtn  = document.getElementById('aiVoiceRenameBtn');
+    const aiVoiceDeleteBtn  = document.getElementById('aiVoiceDeleteBtn');
+    const aiVoiceRecordBtn  = document.getElementById('aiVoiceRecordBtn');
+    const aiVoiceRecordLabel= document.getElementById('aiVoiceRecordLabel');
+    const aiVoiceRecProg    = document.getElementById('aiVoiceRecProg');
+    const aiVoiceUploadBtn  = document.getElementById('aiVoiceUploadBtn');
+    const aiVoiceUploadInput= document.getElementById('aiVoiceUploadInput');
+    const aiVoiceSamplesBox = document.getElementById('aiVoiceSamples');
+    const aiVoiceSampleCount= document.getElementById('aiVoiceSampleCount');
+    const aiVoiceSampleRow  = document.getElementById('aiVoiceSampleCountRow');
     const echoModeToggle   = document.getElementById('echoModeToggle');
 
     /* ===== Persistent UI settings (survive a reload) =====
@@ -1322,8 +1384,13 @@
     // Runtime on/off for the house speaker recognition (persisted). Re-asserted
     // to the server on every (re)connect via sendSettings(); default on.
     let houseIdOn = localStorage.getItem('houseIdOn') !== '0';
-    // Voice library (cloned voices) from hello.voiceClone / voice.state broadcasts.
-    let serverVoiceClone = { available: false, active: 'default', voices: [] };
+    // AI-Voice state (source, mode, voice library) from hello.aiVoice /
+    // aivoice.state broadcasts. Session-global, not a per-browser setting.
+    // AI-Voice: cloned vs. designed voice (hello.aiVoice / aivoice.state).
+    // Session-global like the voice library, not a per-browser setting.
+    let serverAiVoice = { available: false, source: 'none', canDesign: false,
+                          canClone: false, canManageSamples: false,
+                          mode: 'clone', instruct: '', active: 'default', voices: [] };
     const VOICE_CLONE_SECONDS = 15;
     // Runtime on/off for the voice lock (persisted). Re-asserted to the server
     // on every (re)connect via sendSettings(); default on.
@@ -1614,12 +1681,8 @@
         updateVoiceLockUi();
         if (m.houseSpeaker) serverHouse = m.houseSpeaker;
         updateHouseIdUi();
-        if (m.voiceClone) serverVoiceClone = {
-          available: !!m.voiceClone.available,
-          active: m.voiceClone.active || 'default',
-          voices: m.voiceClone.voices || [],
-        };
-        updateVoicesUi();
+        if (m.aiVoice) applyAiVoiceState(m.aiVoice);
+        updateAiVoiceUi();
         addBubble('sys', `🟢 ${m.msg}`);
         // On the first hello, set the start mode: the user's remembered choice
         // (localStorage) takes precedence, otherwise the server default (wakeWord.enabled).
@@ -1662,23 +1725,26 @@
           if (echoModeToggle) echoModeToggle.checked = echoMode;
         }
       },
-      'voice.state': (m) => {
-        serverVoiceClone = { available: true, active: m.active || 'default', voices: m.voices || [] };
-        updateVoicesUi();
+      'aivoice.state': (m) => {
+        applyAiVoiceState(m);
+        updateAiVoiceUi();
       },
-      'voice.clone.ack': (m) => {
+      'aivoice.sample.ack': (m) => {
         if (m.ok) {
-          addBubble('sys', t('voices.saved', { name: (m.voice && m.voice.name) || t('voices.default_name') }));
+          addBubble('sys', t('aivoice.saved', {
+            name: (m.sample && m.sample.name) || (m.voice && m.voice.name) || t('aivoice.default_name') }));
         } else {
-          const emap = { too_short: 'voices.too_short', no_speech: 'voices.no_speech', edge_speech: 'voices.edge_speech', unavailable: 'voices.unavailable' };
-          addBubble('err', t(emap[m.error] || 'voices.error', { err: m.error }));
+          const emap = { too_short: 'aivoice.too_short', no_speech: 'aivoice.no_speech',
+                         edge_speech: 'aivoice.edge_speech', unavailable: 'aivoice.unavailable',
+                         unknown_voice: 'aivoice.unknown_voice' };
+          addBubble('err', t(emap[m.error] || 'aivoice.error', { err: m.error }));
         }
       },
-      'voice.preview.audio': (m) => {
+      'aivoice.preview.audio': (m) => {
         playPreviewAudio(m.audioB64, m.mime);
       },
-      'voice.error': (m) => {
-        addBubble('err', t('voices.error', { err: m.error }));
+      'aivoice.error': (m) => {
+        addBubble('err', t('aivoice.error', { err: m.error }));
       },
       'session.reset.ack': (m) => {
         newSessionBtn.disabled = false;
@@ -2704,64 +2770,208 @@
     if (echoModeToggle) echoModeToggle.addEventListener('change', () => {
       echoMode = !!echoModeToggle.checked;
       sendSettings();
-      addBubble('sys', t(echoMode ? 'voices.echo_on' : 'voices.echo_off'));
+      addBubble('sys', t(echoMode ? 'aivoice.echo_on' : 'aivoice.echo_off'));
     });
 
-    function updateVoicesUi() {
-      if (!voicesCard) return;
-      const avail = !!(serverVoiceClone && serverVoiceClone.available);
-      voicesCard.style.display = avail ? '' : 'none';
-      if (!avail) return;
-      const list = serverVoiceClone.voices || [];
-      const active = serverVoiceClone.active || 'default';
-      const activeVoice = list.find(v => v.id === active);
-      if (voicesChip) voicesChip.textContent = (activeVoice && activeVoice.name) || t('voices.chip_none');
-      if (!voiceSelect) return;
-      // Compact picker (the old per-voice button rows overflowed with long
-      // localized labels): the dropdown IS the active-voice choice, the icon
-      // buttons next to it act on the selected (= active) voice.
-      voiceSelect.innerHTML = '';
-      if (!list.length) {
-        const o = document.createElement('option');
-        o.value = ''; o.textContent = t('voices.empty');
-        voiceSelect.appendChild(o);
-      } else {
-        for (const v of list) {
-          const o = document.createElement('option');
-          o.value = v.id;
-          o.textContent = (v.name || v.id) + (v.isDefault ? ` (${t('voices.builtin')})` : '');
-          if (v.id === active) o.selected = true;
-          voiceSelect.appendChild(o);
-        }
+    /* ===== AI-Voice: cloned vs. designed voice =====
+       The mode is server-side state (session-global, persisted across
+       restarts), so the UI only ever renders what the server reported and
+       never keeps its own copy — every change goes out as aivoice.config and
+       comes back as aivoice.state. */
+    const aiVoiceCard      = document.getElementById('aiVoiceCard');
+    const aiVoiceChip      = document.getElementById('aiVoiceChip');
+    const aiVoiceInstruct  = document.getElementById('aiVoiceInstruct');
+    const aiVoiceSaveBtn   = document.getElementById('aiVoiceInstructSave');
+    const aiVoiceDesign    = document.getElementById('aiVoiceDesignPane');
+    const aiVoiceClonePane = document.getElementById('aiVoiceClonePane');
+    const aiVoiceCloneInfo = document.getElementById('aiVoiceCloneInfo');
+
+    // Copy the server's AI-Voice block wholesale. Picking out single fields
+    // silently drops whatever the server learns to send later (that bug cost
+    // the whole library once: voices/active/can* never reached the UI).
+    function applyAiVoiceState(o) {
+      serverAiVoice = {
+        available: !!o.available,
+        source: o.source || 'none',
+        canDesign: !!o.canDesign,
+        canClone: !!o.canClone,
+        canManageSamples: !!o.canManageSamples,
+        mode: o.mode || 'clone',
+        instruct: o.instruct || '',
+        active: o.active || 'default',
+        voices: o.voices || [],
+      };
+    }
+
+    function sendAiVoice(patch) {
+      if (!serverAiVoice.available) return;
+      voiceSend({ type: 'aivoice.config', ...patch });
+    }
+
+    function updateAiVoiceUi() {
+      if (!aiVoiceCard) return;
+      // The section is a permanent part of the UI — it never hides. When no
+      // source is wired the controls disable themselves and the help text says
+      // why, which beats a section that silently isn't there.
+      const avail = !!(serverAiVoice && serverAiVoice.available);
+      const design = avail && serverAiVoice.mode === 'design';
+      document.querySelectorAll('input[name="aiVoiceMode"]').forEach((r) => {
+        r.disabled = !avail || (r.value === 'design' && !serverAiVoice.canDesign);
+      });
+      if (aiVoiceInstruct) aiVoiceInstruct.disabled = !serverAiVoice.canDesign;
+      if (aiVoiceSaveBtn) aiVoiceSaveBtn.disabled = !serverAiVoice.canDesign;
+      document.querySelectorAll('input[name="aiVoiceMode"]').forEach((r) => {
+        r.checked = (r.value === (avail ? serverAiVoice.mode : 'clone'));
+      });
+      if (aiVoiceDesign) aiVoiceDesign.style.display = design ? '' : 'none';
+      if (aiVoiceClonePane) aiVoiceClonePane.style.display = design ? 'none' : '';
+      // Don't clobber what the user is typing (the state echo arrives while
+      // the textarea may still be focused).
+      if (aiVoiceInstruct && document.activeElement !== aiVoiceInstruct) {
+        aiVoiceInstruct.value = serverAiVoice.instruct || '';
       }
-      voiceSelect.disabled = !list.length;
-      if (voicePreviewBtn) voicePreviewBtn.disabled = !list.length;
+      if (aiVoiceChip) {
+        aiVoiceChip.textContent = !avail ? t('aivoice.chip_off')
+          : t(design ? 'aivoice.chip_design' : 'aivoice.chip_clone');
+      }
+      updateAiVoiceLibraryUi();
+    }
+
+    document.querySelectorAll('input[name="aiVoiceMode"]').forEach((r) => {
+      r.addEventListener('change', () => {
+        if (!r.checked) return;
+        sendAiVoice({ mode: r.value,
+                      instruct: aiVoiceInstruct ? aiVoiceInstruct.value : '' });
+      });
+    });
+    if (aiVoiceSaveBtn) aiVoiceSaveBtn.addEventListener('click', () => {
+      sendAiVoice({ mode: 'design', instruct: aiVoiceInstruct.value });
+      addBubble('sys', t('aivoice.applied'));
+    });
+
+    function updateAiVoiceLibraryUi() {
+      const list = serverAiVoice.voices || [];
+      const active = serverAiVoice.active || 'default';
+      const activeVoice = list.find(v => v.id === active) || null;
+      const canClone = !!serverAiVoice.canClone;
+      const canSamples = !!serverAiVoice.canManageSamples;
+
+      if (aiVoiceSelect) {
+        // Compact picker: the dropdown IS the active-voice choice, the icon
+        // buttons next to it act on the selected (= active) voice.
+        aiVoiceSelect.innerHTML = '';
+        if (!list.length) {
+          const o = document.createElement('option');
+          o.value = ''; o.textContent = t('aivoice.empty');
+          aiVoiceSelect.appendChild(o);
+        } else {
+          for (const v of list) {
+            const o = document.createElement('option');
+            o.value = v.id;
+            o.textContent = v.isDefault ? t('aivoice.builtin') : (v.name || v.id);
+            if (v.id === active) o.selected = true;
+            aiVoiceSelect.appendChild(o);
+          }
+        }
+        aiVoiceSelect.disabled = !list.length;
+      }
       // The built-in default voice can be neither renamed nor deleted.
       const canEdit = !!(activeVoice && !activeVoice.isDefault);
-      if (voiceRenameBtn) voiceRenameBtn.disabled = !canEdit;
-      if (voiceDeleteBtn) voiceDeleteBtn.disabled = !canEdit;
+      // Creating an empty voice up front only exists for the local library;
+      // wrapper voices come into being by cloning.
+      if (aiVoiceAddBtn) aiVoiceAddBtn.disabled = !canSamples;
+      if (aiVoicePreviewBtn) aiVoicePreviewBtn.disabled = !canClone || !list.length;
+      if (aiVoiceRenameBtn)  aiVoiceRenameBtn.disabled  = !canEdit;
+      if (aiVoiceDeleteBtn)  aiVoiceDeleteBtn.disabled  = !canEdit;
+      if (aiVoiceRecordBtn)  aiVoiceRecordBtn.disabled  = !canClone;
+      if (aiVoiceUploadBtn)  aiVoiceUploadBtn.disabled  = !canClone;
+
+      // Sample list — only the local source stores individual takes; the
+      // wrapper hands out finished voices, so the whole block stands down.
+      if (aiVoiceSampleRow) aiVoiceSampleRow.style.display = canSamples ? '' : 'none';
+      if (aiVoiceSamplesBox) aiVoiceSamplesBox.style.display = canSamples ? '' : 'none';
+      const samples = (activeVoice && activeVoice.samples) || [];
+      if (aiVoiceSampleCount) aiVoiceSampleCount.textContent = canSamples ? String(samples.length) : '–';
+      if (aiVoiceSamplesBox && canSamples) {
+        aiVoiceSamplesBox.innerHTML = '';
+        const refId = activeVoice && activeVoice.activeSample;
+        for (const smp of samples) {
+          const row = document.createElement('div');
+          row.className = 'houseid-sample' + (smp.id === refId ? ' is-ref' : '');
+          const label = document.createElement('span');
+          label.className = 'houseid-sample-name';
+          const secs = smp.seconds ? ` · ${smp.seconds.toFixed(1)}s` : '';
+          label.textContent = (smp.name || t('aivoice.sample_unnamed')) + secs;
+          label.title = smp.refText || '';
+          row.appendChild(label);
+          const acts = document.createElement('span');
+          acts.className = 'houseid-sample-actions';
+          // Radio semantics: exactly one sample is THE reference to clone from.
+          const useBtn = document.createElement('button');
+          useBtn.textContent = smp.id === refId ? '★' : '☆';
+          useBtn.title = t('aivoice.sample_use');
+          useBtn.disabled = smp.id === refId;
+          useBtn.addEventListener('click', () => voiceSend({
+            type: 'aivoice.sample.select', voiceId: activeVoice.id, sampleId: smp.id }));
+          const renBtn = document.createElement('button');
+          renBtn.textContent = '✏️'; renBtn.title = t('aivoice.sample_rename');
+          renBtn.addEventListener('click', () => {
+            const n = prompt(t('aivoice.sample_rename_prompt'), smp.name || '');
+            if (n !== null) voiceSend({ type: 'aivoice.sample.rename',
+              voiceId: activeVoice.id, sampleId: smp.id, name: n.trim() });
+          });
+          const delBtn = document.createElement('button');
+          delBtn.textContent = '🗑'; delBtn.className = 'danger';
+          delBtn.title = t('aivoice.sample_delete');
+          delBtn.addEventListener('click', () => {
+            if (confirm(t('aivoice.sample_delete_confirm'))) voiceSend({
+              type: 'aivoice.sample.delete', voiceId: activeVoice.id, sampleId: smp.id });
+          });
+          acts.appendChild(useBtn); acts.appendChild(renBtn); acts.appendChild(delBtn);
+          row.appendChild(acts);
+          aiVoiceSamplesBox.appendChild(row);
+        }
+        if (!samples.length) {
+          const empty = document.createElement('div');
+          empty.className = 'houseid-samples-empty';
+          empty.textContent = t('aivoice.samples_empty');
+          aiVoiceSamplesBox.appendChild(empty);
+        }
+      }
+      if (aiVoiceCloneInfo) {
+        aiVoiceCloneInfo.textContent = serverAiVoice.available
+          ? (canSamples ? t('aivoice.clone_help_local') : t('aivoice.clone_help_wrapper'))
+          : t('aivoice.unavailable_help');
+      }
     }
 
-    function _selectedVoice() {
-      const id = voiceSelect ? voiceSelect.value : '';
-      return (serverVoiceClone.voices || []).find(v => v.id === id) || null;
+    function _selectedAiVoice() {
+      const id = aiVoiceSelect ? aiVoiceSelect.value : '';
+      return (serverAiVoice.voices || []).find(v => v.id === id) || null;
     }
-    if (voiceSelect) voiceSelect.addEventListener('change', () => {
-      if (voiceSelect.value) voiceSend({ type: 'voice.select', id: voiceSelect.value });
+    if (aiVoiceSelect) aiVoiceSelect.addEventListener('change', () => {
+      if (aiVoiceSelect.value) voiceSend({ type: 'aivoice.select', id: aiVoiceSelect.value });
     });
-    if (voicePreviewBtn) voicePreviewBtn.addEventListener('click', () => {
-      if (voiceSelect && voiceSelect.value) voiceSend({ type: 'voice.preview', id: voiceSelect.value });
+    if (aiVoiceAddBtn) aiVoiceAddBtn.addEventListener('click', () => {
+      const name = prompt(t('aivoice.name_prompt'), '');
+      if (name === null) return;
+      voiceSend({ type: 'aivoice.create', name: (name || '').trim() });
     });
-    if (voiceRenameBtn) voiceRenameBtn.addEventListener('click', () => {
-      const v = _selectedVoice();
+    if (aiVoicePreviewBtn) aiVoicePreviewBtn.addEventListener('click', () => {
+      if (aiVoiceSelect && aiVoiceSelect.value) voiceSend({ type: 'aivoice.preview', id: aiVoiceSelect.value });
+    });
+    if (aiVoiceRenameBtn) aiVoiceRenameBtn.addEventListener('click', () => {
+      const v = _selectedAiVoice();
       if (!v || v.isDefault) return;
-      const name = prompt(t('voices.rename_prompt'), v.name || '');
-      if (name && name.trim()) voiceSend({ type: 'voice.rename', id: v.id, name: name.trim() });
+      const name = prompt(t('aivoice.rename_prompt'), v.name || '');
+      if (name && name.trim()) voiceSend({ type: 'aivoice.rename', id: v.id, name: name.trim() });
     });
-    if (voiceDeleteBtn) voiceDeleteBtn.addEventListener('click', () => {
-      const v = _selectedVoice();
+    if (aiVoiceDeleteBtn) aiVoiceDeleteBtn.addEventListener('click', () => {
+      const v = _selectedAiVoice();
       if (!v || v.isDefault) return;
-      if (confirm(t('voices.delete_confirm', { name: v.name || v.id }))) voiceSend({ type: 'voice.delete', id: v.id });
+      if (confirm(t('aivoice.delete_confirm', { name: v.name || v.id }))) {
+        voiceSend({ type: 'aivoice.delete', id: v.id });
+      }
     });
 
     function playPreviewAudio(b64, mime) {
@@ -2774,68 +2984,80 @@
       } catch (_) {}
     }
 
-    // Record a ~15s reference take and register it as a new cloned voice
-    // (generous on purpose: the server trims edge fragments + dead air, so
-    // extra room means cutting never starves the clone of material).
+    // Record a ~15s reference take (generous on purpose: the server trims edge
+    // fragments + dead air, so extra room means cutting never starves the clone
+    // of material). With a voice selected the take becomes another SAMPLE of
+    // it; on the built-in default it starts a new voice.
     // Shares recordTimedTake with enrollRecord: it owns the binary channel
     // (the `enrolling` guard makes the VAD/PTT senders stand down).
-    async function cloneRecord() {
+    async function aiVoiceRecord() {
       if (enrolling) return;
-      if (!serverVoiceClone.available) { addBubble('err', t('voices.unavailable')); return; }
+      if (!serverAiVoice.canClone) { addBubble('err', t('aivoice.unavailable')); return; }
       if (!ws || ws.readyState !== 1) { addBubble('err', t('err.ws_not_connected_segment')); return; }
-      const name = prompt(t('voices.name_prompt'), '');
+      const sel = _selectedAiVoice();
+      const intoExisting = !!(sel && !sel.isDefault);
+      let name = '';
+      if (intoExisting) {
+        name = prompt(t('aivoice.sample_name_prompt'), '') ;
+      } else {
+        name = prompt(t('aivoice.name_prompt'), '');
+      }
       if (name === null) return;                    // cancelled
       await recordTimedTake({
         seconds: VOICE_CLONE_SECONDS,
-        btn: recordVoiceBtn, progEl: voiceRecProg,
-        labelEl: recordVoiceLabel, labelKey: 'voices.recording',
-        startMsg: { type: 'voice.clone.start' },
-        commitMsg: () => ({ type: 'voice.clone.commit', name: (name || '').trim() }),
-        abortMsg: { type: 'voice.clone.abort' },
-        errKey: 'voices.error',
-        onDone: () => { recordVoiceLabel.textContent = t('voices.record'); },
+        btn: aiVoiceRecordBtn, progEl: aiVoiceRecProg,
+        labelEl: aiVoiceRecordLabel, labelKey: 'aivoice.recording',
+        startMsg: { type: 'aivoice.record.start' },
+        commitMsg: () => ({ type: 'aivoice.record.commit',
+                            voiceId: intoExisting ? sel.id : '',
+                            name: (name || '').trim() }),
+        abortMsg: { type: 'aivoice.record.abort' },
+        errKey: 'aivoice.error',
+        onDone: () => { aiVoiceRecordLabel.textContent = t('aivoice.record'); },
       });
-      // Result comes back as 'voice.clone.ack' (+ a 'voice.state' broadcast).
+      // Result comes back as 'aivoice.sample.ack' (+ an 'aivoice.state' broadcast).
     }
 
     async function uploadVoiceFile(file, name, refText) {
+      const sel = _selectedAiVoice();
       const fd = new FormData();
       fd.append('file', file, file.name || 'sample');
       fd.append('name', name || '');
+      if (sel && !sel.isDefault) fd.append('voiceId', sel.id);
       if (refText) fd.append('refText', refText);
-      uploadVoiceBtn.disabled = true;
-      const prevLabel = uploadVoiceBtn.textContent;
-      uploadVoiceBtn.textContent = t('voices.uploading');
+      aiVoiceUploadBtn.disabled = true;
+      const prevLabel = aiVoiceUploadBtn.textContent;
+      aiVoiceUploadBtn.textContent = t('aivoice.uploading');
       try {
         const resp = await fetch(`${BASE}/voice-upload`, { method: 'POST', body: fd });
         const j = await resp.json().catch(() => ({ ok: false, error: 'bad response' }));
         if (!j.ok) {
           if (j.error === 'need_transcript') {
-            const tx = prompt(t('voices.transcript_prompt'), '');
+            const tx = prompt(t('aivoice.transcript_prompt'), '');
             if (tx && tx.trim()) { await uploadVoiceFile(file, name, tx.trim()); return; }
             return;
           }
-          addBubble('err', t('voices.error', { err: j.error || ('HTTP ' + resp.status) }));
+          addBubble('err', t('aivoice.error', { err: j.error || ('HTTP ' + resp.status) }));
           return;
         }
-        addBubble('sys', t('voices.saved', { name: (j.voice && j.voice.name) || name || t('voices.default_name') }));
-        voiceSend({ type: 'voice.list' });   // refresh (also broadcast to peers)
+        addBubble('sys', t('aivoice.saved', { name: name || t('aivoice.default_name') }));
+        voiceSend({ type: 'aivoice.list' });   // refresh (also broadcast to peers)
       } catch (e) {
-        addBubble('err', t('voices.error', { err: (e && e.message) || e }));
+        addBubble('err', t('aivoice.error', { err: (e && e.message) || e }));
       } finally {
-        uploadVoiceBtn.disabled = false;
-        uploadVoiceBtn.textContent = prevLabel;
+        aiVoiceUploadBtn.disabled = false;
+        aiVoiceUploadBtn.textContent = prevLabel;
       }
     }
 
-    if (recordVoiceBtn) recordVoiceBtn.addEventListener('click', cloneRecord);
-    if (uploadVoiceBtn) uploadVoiceBtn.addEventListener('click', () => uploadVoiceInput && uploadVoiceInput.click());
-    if (uploadVoiceInput) uploadVoiceInput.addEventListener('change', () => {
-      const f = uploadVoiceInput.files && uploadVoiceInput.files[0];
-      uploadVoiceInput.value = '';
+    if (aiVoiceRecordBtn) aiVoiceRecordBtn.addEventListener('click', aiVoiceRecord);
+    if (aiVoiceUploadBtn) aiVoiceUploadBtn.addEventListener('click', () => aiVoiceUploadInput && aiVoiceUploadInput.click());
+    if (aiVoiceUploadInput) aiVoiceUploadInput.addEventListener('change', () => {
+      const f = aiVoiceUploadInput.files && aiVoiceUploadInput.files[0];
+      aiVoiceUploadInput.value = '';
       if (!f) return;
       const suggested = (f.name || 'voice').replace(/\.[^.]+$/, '');
-      const name = prompt(t('voices.name_prompt'), suggested);
+      const name = prompt(t('aivoice.name_prompt'), suggested);
       if (name === null) return;
       uploadVoiceFile(f, (name || '').trim(), '');
     });

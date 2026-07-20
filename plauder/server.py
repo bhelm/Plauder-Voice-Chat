@@ -29,15 +29,15 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
+from . import ai_voice
 from . import audio as audio_utils
 from . import opus_codec
 from . import sanitizer
 from . import speaker_gate
-from . import voice_clone
 from . import voices as voices_mod
 from . import wake
 from .backends import LLMBackend, STTBackend, TTSBackend, UpstreamTimeoutError
-from .config import SAMPLE_RATE, Config
+from .config import SAMPLE_RATE, Config, strip_turn_hint
 from .hermes_history import fetch_history
 from .images import _resolve_image_urls
 from .session import ConversationManager
@@ -73,8 +73,9 @@ def _opus_active() -> bool:
     return bool(CFG and CFG.audio_opus and opus_codec.is_available())
 
 
-# Voice library / cloning handlers live in plauder.voice_clone (they read the
-# runtime state below via `server.<name>` at call time).
+# AI-Voice (which voice the assistant speaks with, local or wrapper-backed)
+# lives in plauder.ai_voice; the wrapper's HTTP client is plauder.voices. Both
+# read the runtime state below via `server.<name>` at call time.
 
 # --------------------------------------------------------------------------- #
 # Runtime state (filled by configure() / main()). Module globals, so the
@@ -595,7 +596,7 @@ async def _run_turn_inner(ws, state, turn_id, *, combined, voice_merged,
     await ws.send_json(start_evt)
     t_tts = time.time()
     _synth_kw = {"speed": state.speed}
-    _vid = voice_clone.active_voice_id()
+    _vid = ai_voice.active_voice_id()
     if _vid is not None:
         _synth_kw["voice"] = _vid
     try:
@@ -680,7 +681,7 @@ class _StreamingReply:
 
         self.pron = CFG.pronunciations_file if CFG else None
         # Cloned voice for this whole reply, resolved once (None = backend default).
-        self.reply_voice = voice_clone.active_voice_id()
+        self.reply_voice = ai_voice.active_voice_id()
         self.max_chars = CFG.tts_max_chars_per_chunk if CFG else 220
         # The FIRST sentence gates time-to-first-audio: force-flush it earlier so a
         # long punctuation-free opener doesn't stall TTS for tens of tokens.
@@ -2426,12 +2427,12 @@ async def _ws_house_sample_rename(conn: WsConn, data):
     await _house_mutate(conn, "sample.rename", _do)
 
 
-async def _ws_voice_clone_start(conn: WsConn, data):
-    # Begin buffering a voice-clone reference recording. Same
-    # channel discipline as enrollment: drop any half-streamed
-    # segment + queued metas so their frames can't leak in.
-    if not voice_clone.clone_active():
-        await conn.ws.send_json({"type": "voice.clone.ack", "ok": False,
+async def _ws_ai_voice_record_start(conn: WsConn, data):
+    # Begin buffering a voice sample recording. Same channel discipline as
+    # enrollment: drop any half-streamed segment + queued metas so their
+    # frames can't leak in.
+    if ai_voice.source() is None:
+        await conn.ws.send_json({"type": "aivoice.sample.ack", "ok": False,
                                  "error": "unavailable", "ts": time.time()})
     else:
         if conn.active_stream is not None:
@@ -2441,79 +2442,133 @@ async def _ws_voice_clone_start(conn: WsConn, data):
         conn.clone_stream = bytearray()
 
 
-async def _ws_voice_clone_commit(conn: WsConn, data):
+async def _ws_ai_voice_record_commit(conn: WsConn, data):
+    """Store the recorded buffer as a sample of an existing or brand-new voice."""
     ws = conn.ws
     buf = bytes(conn.clone_stream) if conn.clone_stream is not None else b""
     conn.clone_stream = None
     name = (data.get("name") or "").strip()
-    if not voice_clone.clone_active():
-        await ws.send_json({"type": "voice.clone.ack", "ok": False,
-                            "error": "unavailable", "ts": time.time()})
+    vid = str(data.get("voiceId") or "").strip()
+    src = ai_voice.source()
+    if src == "local":
+        ack = await ai_voice.add_recorded_sample(buf, voice_id=vid, name=name)
+    elif src == "wrapper":
+        ack = await ai_voice.clone_commit(buf, name)
     else:
-        ack = await voice_clone.clone_commit(buf, name)
-        await ws.send_json({"type": "voice.clone.ack", **ack,
-                            "ts": time.time()})
-        if ack.get("ok"):
-            await voice_clone.emit_voice_state(ws)
+        ack = {"ok": False, "error": "unavailable"}
+    await ws.send_json({"type": "aivoice.sample.ack", **ack, "ts": time.time()})
+    if ack.get("ok"):
+        await ai_voice.emit_state(ws)
 
 
-async def _ws_voice_clone_abort(conn: WsConn, data):
+async def _ws_ai_voice_record_abort(conn: WsConn, data):
     conn.clone_stream = None
 
 
-async def _ws_voice_list(conn: WsConn, data):
-    if voice_clone.clone_active():
-        await voice_clone.emit_voice_state(conn.ws)
+async def _ws_ai_voice_list(conn: WsConn, data):
+    await conn.ws.send_json({"type": "aivoice.state",
+                             **(await ai_voice.state_block()), "ts": time.time()})
 
 
-async def _ws_voice_select(conn: WsConn, data):
-    if voice_clone.clone_active():
-        VOICES.set_active(str(data.get("id") or "").strip())
-        await voice_clone.emit_voice_state(conn.ws)
+async def _ws_ai_voice_config(conn: WsConn, data):
+    """AI-Voice: switch between cloned and designed voice (+ the design prompt).
+
+    The choice is global for the session — like the voice library, not a
+    per-connection setting — so every browser is told the new state.
+    """
+    if ai_voice.source() is None:
+        return
+    st = dict(ai_voice.load_state())
+    mode = str(data.get("mode") or "").strip()
+    if mode in ai_voice.MODES:
+        st["mode"] = mode
+    if isinstance(data.get("instruct"), str):
+        st["instruct"] = data["instruct"].strip()[:600]
+    ai_voice.save_state(st)
+    await ai_voice.apply_state(st)
+    await ai_voice.emit_state(conn.ws)
 
 
-async def _ws_voice_rename(conn: WsConn, data):
-    if voice_clone.clone_active():
-        try:
-            await VOICES.rename(str(data.get("id") or ""),
-                                str(data.get("name") or "").strip())
-            await voice_clone.emit_voice_state(conn.ws)
-        except Exception as exc:  # noqa: BLE001
-            await conn.ws.send_json({"type": "voice.error", "op": "rename",
-                                     "error": str(exc), "ts": time.time()})
+async def _ai_voice_op(conn: WsConn, op: str, fn):
+    """Run one library mutation and fan the fresh state out. Errors go back as
+    aivoice.error so the UI can surface them instead of silently not changing."""
+    try:
+        await fn()
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("ai-voice %s failed", op)
+        await conn.ws.send_json({"type": "aivoice.error", "op": op,
+                                 "error": str(exc), "ts": time.time()})
+        return
+    await ai_voice.emit_state(conn.ws)
 
 
-async def _ws_voice_delete(conn: WsConn, data):
-    if voice_clone.clone_active():
-        vid = str(data.get("id") or "")
-        try:
-            await VOICES.delete(vid)
-            # If the deleted voice was active, fall back to default.
-            if VOICES.get_active() == vid:
-                VOICES.set_active(voices_mod.DEFAULT_VOICE_ID)
-            await voice_clone.emit_voice_state(conn.ws)
-        except Exception as exc:  # noqa: BLE001
-            await conn.ws.send_json({"type": "voice.error", "op": "delete",
-                                     "error": str(exc), "ts": time.time()})
+async def _ws_ai_voice_select(conn: WsConn, data):
+    vid = str(data.get("id") or "").strip()
+    await _ai_voice_op(conn, "select", lambda: ai_voice.select_voice(vid))
 
 
-async def _ws_voice_preview(conn: WsConn, data):
+async def _ws_ai_voice_create(conn: WsConn, data):
+    name = str(data.get("name") or "").strip()
+    await _ai_voice_op(conn, "create", lambda: ai_voice.create_voice(name))
+
+
+async def _ws_ai_voice_rename(conn: WsConn, data):
+    vid = str(data.get("id") or "")
+    name = str(data.get("name") or "").strip()
+    await _ai_voice_op(conn, "rename", lambda: ai_voice.rename_voice(vid, name))
+
+
+async def _ws_ai_voice_delete(conn: WsConn, data):
+    vid = str(data.get("id") or "")
+    await _ai_voice_op(conn, "delete", lambda: ai_voice.delete_voice(vid))
+
+
+async def _ws_ai_voice_sample_select(conn: WsConn, data):
+    vid, sid = str(data.get("voiceId") or ""), str(data.get("sampleId") or "")
+    await _ai_voice_op(conn, "sample.select",
+                       lambda: ai_voice.set_active_sample(vid, sid))
+
+
+async def _ws_ai_voice_sample_rename(conn: WsConn, data):
+    vid, sid = str(data.get("voiceId") or ""), str(data.get("sampleId") or "")
+    name = str(data.get("name") or "").strip()
+
+    async def _do():
+        ai_voice.rename_sample(vid, sid, name)
+    await _ai_voice_op(conn, "sample.rename", _do)
+
+
+async def _ws_ai_voice_sample_delete(conn: WsConn, data):
+    vid, sid = str(data.get("voiceId") or ""), str(data.get("sampleId") or "")
+    await _ai_voice_op(conn, "sample.delete",
+                       lambda: ai_voice.delete_sample(vid, sid))
+
+
+async def _ws_ai_voice_preview(conn: WsConn, data):
+    """Speak one short sentence in a voice without changing the active one.
+
+    Wrapper: the voice id rides along per request. Local: the backend holds ONE
+    voice at a time, so previewing a non-active voice would mean re-cloning and
+    restoring — deliberately not done; the local preview always uses the voice
+    that is currently active.
+    """
     ws, state = conn.ws, conn.state
-    if voice_clone.clone_active():
-        vid = str(data.get("id") or voices_mod.DEFAULT_VOICE_ID)
-        ptext = (data.get("text") or voice_clone.preview_sentence()).strip()
-        try:
-            pcm, sr = await TTS.synth(ptext, speed=state.speed, voice=vid)
-            wav = await asyncio.to_thread(
-                audio_utils.pcm16_to_wav_bytes, pcm, sr)
-            await ws.send_json({
-                "type": "voice.preview.audio", "id": vid, "mime": "audio/wav",
-                "audioB64": base64.b64encode(wav).decode("ascii"),
-                "ts": time.time()})
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("voice preview failed")
-            await ws.send_json({"type": "voice.error", "op": "preview",
-                                "error": str(exc), "ts": time.time()})
+    if ai_voice.source() is None:
+        return
+    vid = str(data.get("id") or voices_mod.DEFAULT_VOICE_ID)
+    ptext = (data.get("text") or ai_voice.preview_sentence()).strip()
+    try:
+        kw = {"voice": vid} if ai_voice.library_active() else {}
+        pcm, sr = await TTS.synth(ptext, speed=state.speed, **kw)
+        wav = await asyncio.to_thread(audio_utils.pcm16_to_wav_bytes, pcm, sr)
+        await ws.send_json({
+            "type": "aivoice.preview.audio", "id": vid, "mime": "audio/wav",
+            "audioB64": base64.b64encode(wav).decode("ascii"),
+            "ts": time.time()})
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("voice preview failed")
+        await ws.send_json({"type": "aivoice.error", "op": "preview",
+                            "error": str(exc), "ts": time.time()})
 
 
 async def _ws_text_message(conn: WsConn, data):
@@ -2717,14 +2772,19 @@ _WS_TEXT_HANDLERS = {
     "house.delete": _ws_house_delete,
     "house.sample.delete": _ws_house_sample_delete,
     "house.sample.rename": _ws_house_sample_rename,
-    "voice.clone.start": _ws_voice_clone_start,
-    "voice.clone.commit": _ws_voice_clone_commit,
-    "voice.clone.abort": _ws_voice_clone_abort,
-    "voice.list": _ws_voice_list,
-    "voice.select": _ws_voice_select,
-    "voice.rename": _ws_voice_rename,
-    "voice.delete": _ws_voice_delete,
-    "voice.preview": _ws_voice_preview,
+    "aivoice.config": _ws_ai_voice_config,
+    "aivoice.list": _ws_ai_voice_list,
+    "aivoice.select": _ws_ai_voice_select,
+    "aivoice.create": _ws_ai_voice_create,
+    "aivoice.rename": _ws_ai_voice_rename,
+    "aivoice.delete": _ws_ai_voice_delete,
+    "aivoice.record.start": _ws_ai_voice_record_start,
+    "aivoice.record.commit": _ws_ai_voice_record_commit,
+    "aivoice.record.abort": _ws_ai_voice_record_abort,
+    "aivoice.sample.select": _ws_ai_voice_sample_select,
+    "aivoice.sample.rename": _ws_ai_voice_sample_rename,
+    "aivoice.sample.delete": _ws_ai_voice_sample_delete,
+    "aivoice.preview": _ws_ai_voice_preview,
     "text.message": _ws_text_message,
     "session.reset": _ws_session_reset,
     "settings": _ws_settings,
@@ -2796,7 +2856,7 @@ async def _ws_binary(conn: WsConn, raw: bytes):
 async def _send_hello(ws, state: TurnState) -> None:
     """Advertise server capabilities + session identity right after connect
     (the client adapts its features to this frame)."""
-    clone_caps = await voice_clone.voice_clone_hello()
+    ai_voice_caps = await ai_voice.state_block()
     await ws.send_json({
         "type": "hello", "stage": STAGE,
         "msg": f"Server ready – agent: {CFG.agent_name}.",
@@ -2816,6 +2876,7 @@ async def _send_hello(ws, state: TurnState) -> None:
             "target_chat_id": BRIDGE.target_chat_id if BRIDGE else None,
         },
         "tts": {"sample_rate": TTS.sample_rate if TTS else None, "speed": state.speed},
+        "aiVoice": ai_voice_caps,
         "streaming": bool(CFG.streaming) if CFG else False,
         "streamInput": bool(CFG.streaming) if CFG else False,
         "sttPartial": bool(CFG.stt_partial) if CFG else False,
@@ -2847,7 +2908,6 @@ async def _send_hello(ws, state: TurnState) -> None:
         "houseSpeaker": _house_speaker_hello(),
         # Voice library: available = cloning wired (wrapper behind TTS). Carries
         # the current voice list + active id so the client renders immediately.
-        "voiceClone": clone_caps,
         "turn": {
             "debounce_ms": state.debounce_ms,
             "debounce_ms_min": CFG.debounce_ms_min, "debounce_ms_max": CFG.debounce_ms_max,
@@ -2879,6 +2939,14 @@ async def _load_history(ws, state: TurnState, peer) -> None:
             max_messages=CFG.llm_history_turns * 2,
         )
         if history:
+            # The gateway stores user messages WITH the per-turn voice hint the
+            # LLM backend appends at request time — strip it before the history
+            # reaches the UI or is re-fed into the LLM context.
+            hint = CFG.resolved_voice_turn_hint()
+            extra = (hint,) if hint else ()
+            for m in history:
+                if m.get("role") == "user":
+                    m["content"] = strip_turn_hint(m["content"], extra)
             CONV.seed_history(state.session_user, history)
             # Send displayable history to the client (user/assistant only).
             await ws.send_json({

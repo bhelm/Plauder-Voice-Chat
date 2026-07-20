@@ -5,11 +5,28 @@ import types
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from plauder import server as srv
-from plauder import voice_clone as vc
+from plauder import ai_voice as vc
 from plauder.backends.tts.openai_api import OpenAITTSBackend
 from plauder.voices import DEFAULT_VOICE_ID, VoiceLibrary
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ai_voice_state(tmp_path, monkeypatch):
+    """Keep the module globals of plauder.ai_voice out of the tests.
+
+    ``_STATE_PATH`` points at the project root, so without this a real
+    ``.ai_voice.json`` written by a running server leaks into the assertions
+    (and a test could overwrite the user's actual choice).
+    """
+    monkeypatch.setattr(vc, "_STATE_PATH", tmp_path / ".ai_voice.json")
+    monkeypatch.setattr(vc, "_state", None)
+    monkeypatch.setattr(vc, "_store", vc.LocalVoiceStore(tmp_path / "voices"))
+    yield
+    vc._state = None
+    vc._store = None
 
 
 class _Cfg:
@@ -88,37 +105,52 @@ class _FakeVoices:
 def test_clone_active_and_active_voice_id(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
-    assert vc.clone_active() is True
+    assert vc.library_active() is True
     assert vc.active_voice_id() == "clone-1"
 
 
 def test_clone_inactive_when_disabled(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices())
-    assert vc.clone_active() is False
+    assert vc.library_active() is False
     assert vc.active_voice_id() is None
 
 
 def test_clone_inactive_when_no_library(monkeypatch):
     monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
     monkeypatch.setattr(srv, "VOICES", None)
-    assert vc.clone_active() is False
+    assert vc.library_active() is False
     assert vc.active_voice_id() is None
 
 
-def test_voice_clone_hello_available(monkeypatch):
-    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=True, app_language="en"))
+def test_state_block_wrapper_source(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=True, app_language="en", ai_voice_source="auto",
+        omnivoice_mode="clone", omnivoice_instruct=""))
     monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
-    hello = asyncio.run(vc.voice_clone_hello())
-    assert hello["available"] is True
-    assert hello["active"] == "clone-1"
-    assert {v["id"] for v in hello["voices"]} == {DEFAULT_VOICE_ID, "clone-1"}
+    monkeypatch.setattr(srv, "TTS", object())
+    vc._state = None
+    block = asyncio.run(vc.state_block())
+    vc._state = None
+    assert block["available"] is True and block["source"] == "wrapper"
+    assert block["active"] == "clone-1"
+    assert {v["id"] for v in block["voices"]} == {DEFAULT_VOICE_ID, "clone-1"}
+    # Voice design is an in-process feature — the wrapper only serves voices.
+    assert block["canDesign"] is False and block["canManageSamples"] is False
 
 
-def test_voice_clone_hello_unavailable(monkeypatch):
-    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(tts_clone_enabled=False, app_language="en"))
+def test_state_block_without_any_source(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=False, app_language="en", ai_voice_source="auto",
+        omnivoice_mode="clone", omnivoice_instruct=""))
     monkeypatch.setattr(srv, "VOICES", None)
-    assert asyncio.run(vc.voice_clone_hello()) == {"available": False}
+    monkeypatch.setattr(srv, "TTS", object())
+    vc._state = None
+    block = asyncio.run(vc.state_block())
+    vc._state = None
+    # The section still renders — it just reports that nothing is wired.
+    assert block["available"] is False and block["source"] == "none"
+    assert block["voices"] == []
 
 
 # --- clone commit (recording → cleanup → STT → register) ----------------------
@@ -195,3 +227,110 @@ def test_clone_commit_too_short_raw(monkeypatch):
     _wire(monkeypatch)
     ack = asyncio.run(vc.clone_commit(_f32([_sil(0.5)]), "Me"))
     assert ack == {"ok": False, "error": "too_short"}
+
+
+# --- AI-Voice source selection (merged module) -------------------------------
+class _FakeLocalTts:
+    """Duck-typed local backend: only `set_voice_mode` marks it switchable."""
+    def __init__(self):
+        self.calls = []
+
+    async def set_voice_mode(self, mode, *, instruct=None, ref_audio=None, ref_text=None):
+        self.calls.append((mode, instruct))
+
+
+def _src(monkeypatch, *, want="auto", library=False, local=False):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=True, app_language="en", ai_voice_source=want))
+    monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1") if library else None)
+    monkeypatch.setattr(srv, "TTS", _FakeLocalTts() if local else object())
+    return vc.source()
+
+
+def test_source_auto_prefers_wrapper_over_local(monkeypatch):
+    assert _src(monkeypatch, library=True, local=True) == "wrapper"
+
+
+def test_source_auto_falls_back_to_local(monkeypatch):
+    assert _src(monkeypatch, library=False, local=True) == "local"
+
+
+def test_source_auto_none_when_nothing_wired(monkeypatch):
+    assert _src(monkeypatch, library=False, local=False) is None
+
+
+def test_pinned_source_does_not_silently_fall_back(monkeypatch):
+    """A pinned source that isn't wired disables the feature — falling back
+    would hide the misconfiguration behind a working-looking UI."""
+    assert _src(monkeypatch, want="wrapper", library=False, local=True) is None
+    assert _src(monkeypatch, want="local", library=True, local=False) is None
+
+
+def test_library_active_only_for_wrapper_source(monkeypatch):
+    _src(monkeypatch, want="local", library=True, local=True)
+    assert vc.library_active() is False       # local pinned → no HTTP library
+    assert vc.active_voice_id() is None
+
+
+def test_state_block_reports_local_source(monkeypatch, tmp_path):
+    _src(monkeypatch, want="local", library=False, local=True)
+    monkeypatch.setattr(srv.CFG, "omnivoice_mode", "design", raising=False)
+    monkeypatch.setattr(srv.CFG, "omnivoice_instruct", "warm voice", raising=False)
+    monkeypatch.setattr(vc, "_store", vc.LocalVoiceStore(tmp_path))
+    vc._state = None                           # re-read from the stub CFG
+    block = asyncio.run(vc.state_block())
+    vc._state = None
+    assert block["available"] is True and block["source"] == "local"
+    assert block["canDesign"] is True and block["canManageSamples"] is True
+    assert block["mode"] == "design" and block["instruct"] == "warm voice"
+
+
+def test_state_block_field_set_is_stable(monkeypatch):
+    """The client copies this block field by field (applyAiVoiceState in
+    index.html, guarded by tests/client/pure_modules.test.mjs). A new key here
+    must be added there too, or it silently never reaches the UI — which is
+    exactly how the voice list once went missing."""
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=False, app_language="en", ai_voice_source="auto",
+        omnivoice_mode="clone", omnivoice_instruct=""))
+    monkeypatch.setattr(srv, "VOICES", None)
+    monkeypatch.setattr(srv, "TTS", object())
+    vc._state = None
+    block = asyncio.run(vc.state_block())
+    vc._state = None
+    assert set(block) == {
+        "available", "source", "canDesign", "canClone", "canManageSamples",
+        "mode", "instruct", "active", "voices",
+    }
+
+
+def test_create_voice_adds_and_selects_it(monkeypatch, tmp_path):
+    """'New voice' makes an EMPTY voice active so the next recording lands in
+    it — and leaves the backend on its current reference until a sample exists,
+    so the assistant does not lose its voice in between."""
+    tts = _FakeLocalTts()
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=False, app_language="en", ai_voice_source="local",
+        omnivoice_mode="clone", omnivoice_instruct="", omnivoice_ref_audio=None,
+        omnivoice_ref_text=None))
+    monkeypatch.setattr(srv, "VOICES", None)
+    monkeypatch.setattr(srv, "TTS", tts)
+    monkeypatch.setattr(vc, "_store", vc.LocalVoiceStore(tmp_path))
+    monkeypatch.setattr(vc, "_state", {"mode": "clone", "instruct": ""})
+
+    voice = asyncio.run(vc.create_voice("Neue"))
+    assert voice["name"] == "Neue" and voice["samples"] == []
+    assert vc.store().get_active() == voice["id"]
+    # applied in clone mode, but WITHOUT a reference (no sample yet)
+    mode, _instruct = tts.calls[-1]
+    assert mode == "clone"
+    assert vc.store().reference() is None
+    vc._state = None
+
+
+def test_create_voice_is_local_only(monkeypatch):
+    monkeypatch.setattr(srv, "CFG", types.SimpleNamespace(
+        tts_clone_enabled=True, app_language="en", ai_voice_source="wrapper"))
+    monkeypatch.setattr(srv, "VOICES", _FakeVoices("clone-1"))
+    monkeypatch.setattr(srv, "TTS", object())
+    assert asyncio.run(vc.create_voice("Neue")) is None

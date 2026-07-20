@@ -21,6 +21,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
     def __init__(self, *, model: str = "k2-fsa/OmniVoice", device: str = "cuda",
                  mode: str = "clone", ref_audio: str | None = None,
                  ref_text: str | None = None, language: str | None = None,
+                 instruct: str | None = None,
                  sentence_split: bool = False, max_chars: int = 220, gap_ms: int = 120):
         self.model = model
         self.device = device
@@ -28,6 +29,9 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
         self.ref_audio = ref_audio
         self.ref_text = ref_text
         self.language = language
+        # Voice design ("design" mode): free-text description of the desired
+        # voice, passed to OmniVoice as `instruct` — no reference audio.
+        self.instruct = instruct
         self.sentence_split = sentence_split
         self.max_chars = max_chars
         self.gap_ms = gap_ms
@@ -45,6 +49,7 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
             ref_audio=cfg.omnivoice_ref_audio,
             ref_text=cfg.omnivoice_ref_text,
             language=cfg.omnivoice_language,
+            instruct=cfg.omnivoice_instruct,
             sentence_split=cfg.tts_sentence_split,
             max_chars=cfg.tts_max_chars_per_chunk,
             gap_ms=cfg.tts_sentence_gap_ms,
@@ -91,9 +96,44 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
             "device": self.device,
             "mode": self.mode,
             "language": self.language,
+            "instruct": self.instruct,
             "sample_rate": self.sample_rate,
             "loaded": self.loaded,
         }
+
+    async def set_voice_mode(self, mode: str, *, instruct: str | None = None,
+                             ref_audio: str | None = None,
+                             ref_text: str | None = None) -> None:
+        """Switches between cloned and designed voice at runtime (AI-Voice UI).
+
+        Serialized on the synth lock so a switch can never land between the
+        sentences of a running turn — the voice would change mid-reply.
+        Re-entering clone mode rebuilds the cached clone prompt (it is bound to
+        one reference); design mode drops it so a later switch back re-derives
+        it from the then-current reference.
+        """
+        async with self._lock:
+            self.mode = mode
+            if mode == "design":
+                self.instruct = instruct or self.instruct
+                self._clone_prompt = None
+                return
+            changed = (ref_audio is not None and ref_audio != self.ref_audio) or \
+                      (ref_text is not None and ref_text != self.ref_text)
+            if ref_audio is not None:
+                self.ref_audio = ref_audio
+            if ref_text is not None:
+                self.ref_text = ref_text
+            if self._tts is None or not self.ref_audio:
+                return
+            if self._clone_prompt is None or changed:
+                def _build_prompt():
+                    return self._tts.create_voice_clone_prompt(
+                        ref_audio=self.ref_audio, ref_text=self.ref_text)
+                try:
+                    self._clone_prompt = await asyncio.to_thread(_build_prompt)
+                except Exception:
+                    self._clone_prompt = None  # per-call ref_audio fallback
 
     def _synth_one(self, text: str, speed: float) -> np.ndarray:
         # OmniVoice API: generate(text=..., num_step=..., ...) -> list of arrays
@@ -102,7 +142,13 @@ class OmniVoiceLocalTTSBackend(TTSBackend):
             kwargs["language"] = self.language
         if speed and speed != 1.0:
             kwargs["speed"] = float(speed)
-        if self.mode == "clone":
+        if self.mode == "design":
+            # Voice design: `instruct` describes the voice, no reference audio.
+            # Without an instruct text OmniVoice falls back to "auto" mode and
+            # picks a voice itself — which is a usable state, not an error.
+            if self.instruct:
+                kwargs["instruct"] = self.instruct
+        elif self.mode == "clone":
             if self._clone_prompt is not None:
                 kwargs["voice_clone_prompt"] = self._clone_prompt
             else:

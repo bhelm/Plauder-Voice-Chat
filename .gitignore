@@ -21,6 +21,8 @@ house_data/
 # Persisted active cloned-voice id (runtime state; see TTS_CLONE_ENABLED)
 .active_voice
 .active_voice.tmp
+.ai_voice.json
+.ai_voice.json.tmp
 
 # Speaker lock: downloaded embedding models + the enrolled voice profile
 models/

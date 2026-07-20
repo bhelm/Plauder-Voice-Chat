@@ -213,6 +213,23 @@ def test_voice_mode_system_full_override():
     assert cfg.resolved_voice_system() == "NUR DAS HIER."
 
 
+def test_strip_turn_hint():
+    from plauder.config import _DEFAULT_TURN_HINTS, strip_turn_hint
+
+    en = _DEFAULT_TURN_HINTS["en"]
+    de = _DEFAULT_TURN_HINTS["de"]
+    # Default hints in either language are stripped (gateway history may
+    # contain both when APP_LANGUAGE changed between sessions).
+    assert strip_turn_hint(f"Hallo Joy\n\n{en}") == "Hallo Joy"
+    assert strip_turn_hint(f"Hallo Joy\n\n{de}") == "Hallo Joy"
+    # Custom hint via extra + stacked hints.
+    custom = "[Custom voice rule]"
+    assert strip_turn_hint(f"Hi\n\n{custom}\n\n{en}", (custom,)) == "Hi"
+    # Untouched cases.
+    assert strip_turn_hint("Just text") == "Just text"
+    assert strip_turn_hint("") == ""
+
+
 def test_real_env_file_loads(tmp_path, monkeypatch):
     """``load_config`` reads a .env file and yields a valid cloud config.
 

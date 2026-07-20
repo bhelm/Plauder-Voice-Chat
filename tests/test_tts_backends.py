@@ -99,6 +99,7 @@ def test_omnivoice_load_raises_clear_error_without_dep():
         omnivoice_model = "k2-fsa/OmniVoice"; omnivoice_device = "cuda"
         omnivoice_mode = "clone"; omnivoice_ref_audio = "/x.wav"
         omnivoice_ref_text = None; omnivoice_language = "de"
+        omnivoice_instruct = None
         tts_sentence_split = False; tts_max_chars_per_chunk = 220; tts_sentence_gap_ms = 120
 
     eng = OmniVoiceLocalTTSBackend.from_config(_LocalCfg())
@@ -117,6 +118,7 @@ def test_omnivoice_synth_with_mock_engine():
     class _LocalCfg:
         omnivoice_model = "x"; omnivoice_device = "cpu"; omnivoice_mode = "instruct"
         omnivoice_ref_audio = None; omnivoice_ref_text = None; omnivoice_language = "de"
+        omnivoice_instruct = None
         tts_sentence_split = False; tts_max_chars_per_chunk = 220; tts_sentence_gap_ms = 120
 
     eng = OmniVoiceLocalTTSBackend.from_config(_LocalCfg())
@@ -126,6 +128,36 @@ def test_omnivoice_synth_with_mock_engine():
     pcm, sr = asyncio.run(eng.synth("Hallo", speed=1.0))
     assert sr == 24000
     assert len(pcm) == 6  # 3 int16
+
+
+def test_omnivoice_design_mode_passes_instruct():
+    """AI-Voice 'synthetic': the description reaches OmniVoice as `instruct`,
+    and no cloning kwargs are sent alongside it."""
+    from plauder.backends.tts.omnivoice_local import OmniVoiceLocalTTSBackend
+
+    eng = OmniVoiceLocalTTSBackend(mode="design", instruct="a warm calm voice",
+                                   ref_audio="/x.wav", ref_text="ref")
+    fake = MagicMock()
+    fake.generate.return_value = (np.array([0.0], dtype=np.float32), 24000)
+    eng._tts = fake
+    asyncio.run(eng.synth("Hallo", speed=1.0))
+    kwargs = fake.generate.call_args.kwargs
+    assert kwargs["instruct"] == "a warm calm voice"
+    assert "ref_audio" not in kwargs and "voice_clone_prompt" not in kwargs
+
+
+def test_omnivoice_set_voice_mode_switches_and_drops_clone_prompt():
+    """Switching to 'design' must drop the cached clone prompt — otherwise the
+    next synth would still carry the old cloned voice."""
+    from plauder.backends.tts.omnivoice_local import OmniVoiceLocalTTSBackend
+
+    eng = OmniVoiceLocalTTSBackend(mode="clone", ref_audio="/x.wav")
+    eng._tts = MagicMock()
+    eng._clone_prompt = object()
+    asyncio.run(eng.set_voice_mode("design", instruct="bright and fast"))
+    assert eng.mode == "design"
+    assert eng.instruct == "bright and fast"
+    assert eng._clone_prompt is None
 
 
 # --- synth_stream (true chunked streaming) ----------------------------------
