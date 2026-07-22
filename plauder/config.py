@@ -122,7 +122,12 @@ _DEFAULT_VOICE_HINTS = {
         "[surprise-wa], [dissatisfaction-hnn]. German forms like *lacht*, "
         "*seufzt*, *brummt*, *staunt* also work.\n"
         "• For real laughter, write [laughter] immediately followed by a "
-        "spelled-out laugh, e.g.: [laughter] Hahaha!"
+        "spelled-out laugh, e.g.: [laughter] Hahaha!\n"
+        "• Silent avatar tags — never read aloud, they only animate your "
+        "avatar: [blush] when embarrassed or flattered, [clapping] to "
+        "applaud, [jump] when excited, [lookaround] when searching or "
+        "curious, [relax] to unwind, [sleepy] when tired, [wave] to greet "
+        "or say goodbye. Use them sparingly."
     ),
     "de": (
         "\n\n---\n"
@@ -147,6 +152,12 @@ _DEFAULT_VOICE_HINTS = {
         "Formen wie *lacht*, *seufzt*, *brummt*, *staunt* funktionieren auch.\n"
         "• Für echtes Lachen schreibe [laughter] direkt gefolgt von einem "
         "ausgeschriebenen Lachen, z.B.: [laughter] Hahaha!\n"
+        "• Stumme Avatar-Tags — werden nie vorgelesen, sie steuern nur "
+        "deinen Avatar: [blush] wenn dir etwas peinlich oder schmeichelhaft "
+        "ist, [clapping] zum Applaudieren, [jump] wenn du dich richtig "
+        "freust, [lookaround] wenn du suchst oder neugierig bist, [relax] "
+        "zum Entspannen, [sleepy] wenn du müde bist, [wave] zum Winken bei "
+        "Begrüßung oder Abschied. Sparsam einsetzen.\n"
         "• ANTONIA-KERN (im Voice besonders wichtig): Du betreibst Bernds "
         "Lebens-System bereits (Tagesschleife, Todo-App, Briefings, Kalender) — "
         "biete NIE an, so etwas 'aufzusetzen' oder 'einzurichten', es läuft. "
@@ -179,6 +190,28 @@ _DEFAULT_TURN_HINTS = {
         "bleiben vom Tisch.]"
     ),
 }
+
+def strip_turn_hint(text: str, extra: tuple[str, ...] = ()) -> str:
+    """Remove trailing per-turn voice hints (see _DEFAULT_TURN_HINTS) from a
+    history message. The hint is appended to the latest user message at
+    LLM-request time (openai_compat._inject_turn_hint), so the gateway stores
+    it as part of the message — when session history is fetched back
+    (hermes_history), the hint must not re-enter the UI or the LLM context.
+    *extra* carries the currently resolved (possibly custom) hint; the loop
+    also strips stacked hints defensively."""
+    if not text:
+        return text
+    out = text.rstrip()
+    hints = [h for h in (*extra, *_DEFAULT_TURN_HINTS.values()) if h]
+    changed = True
+    while changed:
+        changed = False
+        for h in hints:
+            if out.endswith(h):
+                out = out[: -len(h)].rstrip()
+                changed = True
+    return out
+
 
 # UI / app languages that ship with a full translation.
 SUPPORTED_LANGUAGES = ("en", "de")
@@ -277,7 +310,7 @@ class Config:
 
     # --- Voice cloning / voice library (needs the OmniVoice wrapper behind TTS;
     # plain OpenAI TTS cannot clone). When on, the server advertises the voice
-    # library (hello.voiceClone) and mediates record/upload/select against the
+    # library (hello.aiVoice) and mediates record/upload/select against the
     # wrapper's /v1/audio/voices CRUD API. The chosen voice is global (whole
     # session) and its id persists in active_voice_state_path across restarts. ---
     tts_clone_enabled: bool = False
@@ -286,14 +319,25 @@ class Config:
     # trim_clone_reference). Applies to recorded AND uploaded samples.
     tts_clone_trim: bool = True
     active_voice_state_path: str = ""
+    # Where the AI voice comes from: "wrapper" (OmniVoice over HTTP, needs
+    # TTS_BACKEND=openai + a base url) | "local" (omnivoice_local, in-process)
+    # | "auto" (wrapper if wired, else local). Pinning a source that is not
+    # actually wired disables the feature instead of falling back silently.
+    ai_voice_source: str = "auto"
+    # Where locally cloned voices + their samples live (local source).
+    voices_dir: str = ""
 
     # --- TTS: OmniVoice (local) ---
     omnivoice_model: str = "k2-fsa/OmniVoice"
     omnivoice_device: str = "cuda"
+    # mode: "clone" (ref_audio) | "design" (instruct) | "auto" (model picks)
     omnivoice_mode: str = "clone"
     omnivoice_ref_audio: str | None = None
     omnivoice_ref_text: str | None = None
     omnivoice_language: str | None = None
+    # Voice design: free-text description of the wanted voice. Start default —
+    # the AI-Voice UI overrides it at runtime and persists its own state.
+    omnivoice_instruct: str | None = None
 
     # --- LLM: OpenAI-compatible (Fireworks/OpenAI/…) ---
     llm_api_key: str = ""
@@ -524,6 +568,8 @@ class Config:
             tts_clone_enabled=env_flag("TTS_CLONE_ENABLED", False),
             tts_clone_trim=env_flag("TTS_CLONE_TRIM", True),
             active_voice_state_path=_env("ACTIVE_VOICE_STATE_PATH", ""),
+            ai_voice_source=(_env("AI_VOICE_SOURCE", "auto") or "auto").strip().lower(),
+            voices_dir=_env("VOICES_DIR", ""),
 
             # TTS omnivoice
             omnivoice_model=_first(_env("OMNIVOICE_MODEL"), default="k2-fsa/OmniVoice"),
@@ -532,6 +578,7 @@ class Config:
             omnivoice_ref_audio=(_env("OMNIVOICE_REF_AUDIO") or None),
             omnivoice_ref_text=(_env("OMNIVOICE_REF_TEXT") or None),
             omnivoice_language=(_first(_env("OMNIVOICE_LANGUAGE"), default=app_language) or None),
+            omnivoice_instruct=(_env("OMNIVOICE_INSTRUCT") or None),
 
             # LLM openai_compat (fallback: FIREWORKS_*, OPENCLAW_GATEWAY_TOKEN)
             llm_api_key=_first(_env("LLM_API_KEY"), _env("FIREWORKS_API_KEY"),

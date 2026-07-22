@@ -66,4 +66,32 @@ assert.equal(g('parseFramedWav(_b)'), null);
 assert.equal(g('parsePcmChunk(_b)'), null);
 assert.equal(g('parseOpusChunk(_b)'), null);
 
-console.log(`pure_modules ok (${keysEn.length} i18n keys, md + vct asserts passed)`);
+// --- index.html: the AI-Voice state copy keeps EVERY server field ----------
+// Regression guard: this used to pick out four fields by hand, silently
+// dropping voices/active/can* — the whole library never reached the UI.
+// The key list mirrors plauder/ai_voice.state_block(); test_voices.py asserts
+// the server side produces exactly these.
+const html = readFileSync(join(ROOT, 'static/index.html'), 'utf8');
+const fnSrc = html.match(/function applyAiVoiceState\(o\) \{[\s\S]*?\n    \}/);
+assert.ok(fnSrc, 'applyAiVoiceState not found in index.html');
+const aiCtx = vm.createContext({ serverAiVoice: null });
+vm.runInContext(fnSrc[0] + '\n', aiCtx, { filename: 'applyAiVoiceState' });
+const SERVER_BLOCK = {
+  available: true, source: 'local', canDesign: true, canClone: true,
+  canManageSamples: true, mode: 'design', instruct: 'warm voice',
+  active: 'voice-1', voices: [{ id: 'voice-1', name: 'xena' }],
+};
+aiCtx._in = SERVER_BLOCK;
+vm.runInContext('applyAiVoiceState(_in)', aiCtx);
+const out = JSON.parse(vm.runInContext('JSON.stringify(serverAiVoice)', aiCtx));
+for (const k of Object.keys(SERVER_BLOCK)) {
+  assert.deepEqual(out[k], SERVER_BLOCK[k], `applyAiVoiceState dropped/changed "${k}"`);
+}
+// Defaults must be safe when the server says "nothing wired".
+vm.runInContext('applyAiVoiceState({})', aiCtx);
+const empty = JSON.parse(vm.runInContext('JSON.stringify(serverAiVoice)', aiCtx));
+assert.equal(empty.available, false);
+assert.deepEqual(empty.voices, []);
+assert.equal(empty.canClone, false);
+
+console.log(`pure_modules ok (${keysEn.length} i18n keys, md + vct + aivoice asserts passed)`);

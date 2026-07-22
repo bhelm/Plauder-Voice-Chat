@@ -317,6 +317,12 @@
     cursor: pointer; font-size: 10px; padding: 0; line-height: 1;
   }
   .houseid-sample button:hover { color: var(--err); }
+  .houseid-sample button.danger:hover { color: var(--err); }
+  .houseid-sample-name { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .houseid-sample-actions { display: inline-flex; gap: 4px; }
+  /* AI-Voice: the sample a voice actually clones from (★) */
+  .houseid-sample.is-ref { color: var(--text); border-color: var(--accent); }
+  .houseid-samples-empty { font-size: 11px; color: var(--muted); padding: 2px 0; }
 
   /* ===== Voice library (cloned voices) — reuses the .vlock card chrome ===== */
   /* Compact picker: the dropdown is the active-voice choice; icon buttons
@@ -341,6 +347,28 @@
   .voices-add { display: flex; gap: 8px; }
   .voices-add .vlock-enroll { flex: 1; }
   .voices-add .voices-upload { flex: 0 0 auto; width: auto; padding-left: 12px; padding-right: 12px; }
+  /* AI-Voice: cloned vs. designed voice — segmented radio pair */
+  .aivoice-modes { display: flex; gap: 6px; }
+  .aivoice-mode { flex: 1; cursor: pointer; }
+  .aivoice-mode input { position: absolute; opacity: 0; pointer-events: none; }
+  .aivoice-mode span {
+    display: block; text-align: center; padding: 7px 10px; font-size: 13px;
+    color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; transition: color .12s, border-color .12s, background .12s;
+  }
+  .aivoice-mode:hover span { color: var(--text); }
+  .aivoice-mode input:checked + span {
+    color: var(--text); border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+  }
+  .aivoice-mode input:focus-visible + span { border-color: var(--accent); }
+  #aiVoiceInstruct {
+    width: 100%; box-sizing: border-box; resize: vertical; min-height: 60px;
+    padding: 8px 10px; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; font: inherit;
+    font-size: 13px; outline: none;
+  }
+  #aiVoiceInstruct:focus { border-color: var(--accent); }
   /* Generic slide toggle */
   .switch { position: relative; display: inline-flex; flex-shrink: 0; cursor: pointer; }
   .switch input { position: absolute; opacity: 0; width: 0; height: 0; }

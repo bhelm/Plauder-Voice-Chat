@@ -137,8 +137,11 @@ def test_ws_hello_frame():
             assert hello["agent_name"] == "Antonia"
             assert hello["stt"]["engine"] == "fake-stt"
             assert "vad" in hello["turn"]
-            # Voice library capability is always advertised; disabled by default.
-            assert hello["voiceClone"] == {"available": False}
+            # AI-Voice capability is always advertised (the section is a
+            # permanent part of the UI); no source wired in this fixture.
+            assert hello["aiVoice"]["available"] is False
+            assert hello["aiVoice"]["source"] == "none"
+            assert hello["aiVoice"]["voices"] == []
             await ws.close()
 
     asyncio.run(run())

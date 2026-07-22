@@ -16,7 +16,7 @@ import time
 
 from aiohttp import web
 
-from . import server, voice_clone
+from . import ai_voice, server
 from .backends import LLMBackend, STTBackend, TTSBackend
 from .config import SAMPLE_RATE, Config, load_config
 from .images import UPLOAD_DIR, upload_image
@@ -48,7 +48,7 @@ def build_app() -> web.Application:
     app.router.add_get(p("/healthz"), server.healthz)
     app.router.add_get(p("/ws"), server.ws_handler)
     app.router.add_post(p("/upload"), upload_image)
-    app.router.add_post(p("/voice-upload"), voice_clone.upload_voice_sample)
+    app.router.add_post(p("/voice-upload"), ai_voice.upload_voice_sample)
     if server.STATIC_DIR.exists():
         app.router.add_static(p("/static/"), server.STATIC_DIR, show_index=False)
     app.router.add_static(p("/uploads/"), UPLOAD_DIR, show_index=False)
@@ -144,8 +144,21 @@ async def main():
     if callable(push_hook):
         push_hook(server.handle_gateway_push)
         LOG.info("🔗 Gateway push delivery wired (%s)", cfg.llm_backend)
-    if voices is not None:
-        LOG.info("🗣️  Voice library active (active voice=%s)", voices.get_active())
+    # AI-Voice: report the active source and, for the local one, re-apply the
+    # persisted cloned/designed choice — without this a restart would silently
+    # fall back to the .env start defaults.
+    src = ai_voice.source()
+    if src == "wrapper":
+        LOG.info("🗣️  AI-Voice source=wrapper (active voice=%s)", voices.get_active())
+    elif src == "local":
+        st = ai_voice.load_state()
+        await ai_voice.bootstrap()    # adopt existing WAVs + apply the choice
+        LOG.info("🗣️  AI-Voice source=local · mode=%s%s · active=%s", st["mode"],
+                 " (designed)" if st["mode"] == "design" and st["instruct"] else "",
+                 ai_voice.store().get_active())
+    elif cfg.ai_voice_source != "auto":
+        LOG.warning("AI_VOICE_SOURCE=%s pinned, but that source is not wired "
+                    "— AI-Voice disabled.", cfg.ai_voice_source)
     if speaker is not None:
         LOG.info("🔒 Speaker lock active (enrolled=%s, threshold=%.2f)",
                  speaker.has_profile(), speaker.threshold)

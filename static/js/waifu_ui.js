@@ -15,10 +15,13 @@
   'use strict';
 
   var toggle, stageCard, stage, canvas, poppedNote, popoutBtn;
+  var animSelect, animBtn;
   var waifu = null;            // window.Waifu instance nach Load
   var loading = false;
   var popWin = null;           // Pop-out-Fenster
   var speakingPulse = null;    // Fallback-Mundanimation wenn keine Audio-Amplitude
+  var speakingPulseIsTimeout = false; // true, wenn speakingPulse gerade per setTimeout laeuft (Tab hidden)
+  var animTest = null;         // { kind:'emote'|'state', name, timer } — manueller Anim-Test
   var LS_KEY = 'waifuEnabled';
 
   function $(id) { return document.getElementById(id); }
@@ -30,10 +33,14 @@
     canvas = $('waifuCanvas');
     poppedNote = $('waifuPoppedNote');
     popoutBtn = $('waifuPopoutBtn');
+    animSelect = $('waifuAnimSelect');
+    animBtn = $('waifuAnimBtn');
     if (!toggle) return; // Sektion nicht vorhanden -> nichts tun
 
     toggle.addEventListener('change', onToggle);
     if (popoutBtn) popoutBtn.addEventListener('click', onPopout);
+    if (animBtn) animBtn.addEventListener('click', onAnimToggle);
+    if (animSelect) animSelect.addEventListener('change', function () { if (animTest) stopAnimTest(); });
 
     // Startzustand bestimmen:
     //   - Server-Default via window.__WAIFU_MODE__ (aus WAIFU_MODE env)
@@ -53,6 +60,7 @@
     }
 
     hookMicUi();
+    hookAgentBusy();
     hookReplyTags();
   }
 
@@ -66,6 +74,7 @@
         stageCard.style.display = 'none';
         try { localStorage.setItem(LS_KEY, '0'); } catch (_) {}
         if (popWin && !popWin.closed) popWin.close();
+        stopAnimTest();
         stopTalkDriver();
         if (waifu) { try { waifu.unmount(); } catch (_) {} waifu = null; }
       }
@@ -84,10 +93,89 @@
       var W = (mod && mod.default) || window.Waifu;
       await W.mount(canvas);
       waifu = W;
+      fillAnimList();
       startTalkDriver();
     } finally {
       loading = false;
     }
+  }
+
+  /* ---- Anim-Tester: alle Animationen manuell ausloesen (ohne LLM) --------
+     Emotes laufen in Schleife (One-Shots werden nach jedem Durchlauf neu
+     getriggert), Koerpersprache-Zustaende werden gehalten. Solange ein Test
+     laeuft, blenden alle automatischen Hooks (Mic/Busy/TalkDriver/Emote-
+     Queue) ihre setAvatar-Aufrufe aus, damit nichts dazwischenfunkt. */
+  var TEST_STATES = ['listening', 'speaking', 'thinking'];
+
+  function tr(key, fb) {
+    try {
+      if (typeof t === 'function') {
+        var s = t(key);
+        if (s && s !== key) return s;
+      }
+    } catch (_) {}
+    return fb;
+  }
+
+  function fillAnimList() {
+    if (!animSelect || animSelect.options.length) return;
+    var addGroup = function (label, kind, names) {
+      var g = document.createElement('optgroup');
+      g.label = label;
+      names.forEach(function (n) {
+        var o = document.createElement('option');
+        o.value = kind + ':' + n;
+        o.textContent = n.replace(/^unused\//, '');
+        g.appendChild(o);
+      });
+      animSelect.appendChild(g);
+    };
+    var emotes = (waifu && waifu.emoteNames) ? waifu.emoteNames() : [];
+    addGroup(tr('waifu.anim_emotes', 'Emotes'), 'emote', emotes);
+    addGroup(tr('waifu.anim_states', 'States'), 'state', TEST_STATES);
+    // Roh-Clips ohne Emote-Mapping (siehe PREVIEW_CLIPS in waifu.js) —
+    // Preview-Rubrik, um Kandidaten fuer neue Mappings zu sichten.
+    var clips = (waifu && waifu.clipNames) ? waifu.clipNames() : [];
+    if (clips.length) addGroup(tr('waifu.anim_clips', 'Unused clips'), 'clip', clips);
+  }
+
+  function onAnimToggle() {
+    try {
+      if (animTest) { stopAnimTest(); return; }
+      if (!waifu || !animSelect || !animSelect.value) return;
+      var sep = animSelect.value.indexOf(':');
+      var kind = animSelect.value.slice(0, sep), name = animSelect.value.slice(sep + 1);
+      animTest = { kind: kind, name: name, timer: null };
+      if (kind === 'state') {
+        setAvatar(name);
+      } else {
+        // 'emote' oder 'clip' (Roh-Clip-Preview) — beide loopen ueber
+        // emoteActive(): neu ausloesen, sobald der vorige Durchlauf (inkl.
+        // VRMA-Clip-Ausblenden) wirklich fertig ist.
+        var fire = (kind === 'clip')
+          ? function () { waifu.playRawClip(name); }
+          : function () { waifu.emote(name); };
+        fire();
+        animTest.timer = setInterval(function () {
+          try { if (waifu && !waifu.emoteActive()) fire(); } catch (_) {}
+        }, 300);
+      }
+      if (animBtn) { animBtn.textContent = '⏹'; animBtn.title = tr('waifu.anim_stop', 'Stop'); }
+    } catch (e) {
+      console.warn('[waifu-ui] anim test failed:', e);
+      stopAnimTest();
+    }
+  }
+
+  function stopAnimTest() {
+    var wasState = !!(animTest && animTest.kind === 'state');
+    if (animTest && animTest.timer) clearInterval(animTest.timer);
+    animTest = null;
+    if (waifu) {
+      try { if (waifu.stopEmote) waifu.stopEmote(); } catch (_) {}
+      if (wasState) setAvatar('idle');   // ab hier uebernimmt wieder die Automatik
+    }
+    if (animBtn) { animBtn.textContent = '▶'; animBtn.title = tr('waifu.anim_play', 'Play'); }
   }
 
   /* ---- Pop-out: Canvas in eigenes Fenster verschieben ------------------ */
@@ -153,24 +241,61 @@
     };
   }
 
+  // Eigener Turn-Zustand, unabhaengig von der Mic-Zustandsmaschine: die feuert
+  // nach turn.commit noch asynchrone 'listening'-Events (STT-done-Timeouts) und
+  // wuerde 'thinking' sofort wieder wegkippen. agentThinking wird deshalb am
+  // ECHTEN Turn-Lebenszyklus gefuehrt: an bei setAgentBusy(true) (= reply.start,
+  // die "denkt nach"-Bubble), aus beim ersten echten Audio (talkDriver) oder
+  // wenn der Turn ohne Audio endet (reply.silent/error, Abbruch, Barge-in).
+  var agentThinking = false;
+  var avatarMode = 'idle';   // zuletzt gesetzter Avatar-State (waifu hat keinen Getter)
+
+  function setAvatar(s) {
+    avatarMode = s;
+    if (waifu) waifu.setState(s);
+  }
+
   function applyState(state) {
     if (!waifu) return;
+    if (animTest) return;    // manueller Anim-Test hat Vorrang
     // Plauder-States -> Avatar (nur Koerpersprache; der Mund laeuft im
     // talkDriver direkt am echten Playback-Zustand, s.u.)
+    if (state === 'playing') { setAvatar('speaking'); return; }
+    if (state === 'thinking') { agentThinking = true; setAvatar('thinking'); return; }
+    if (agentThinking) { setAvatar('thinking'); return; }   // sticky bis Audio/Turn-Ende
     switch (state) {
-      case 'playing':          // Agent spricht (TTS laeuft)
-        waifu.setState('speaking');
-        break;
       case 'speaking':         // NUTZER spricht gerade
-        waifu.setState('listening');
+      case 'collecting':       // Nutzereingabe laeuft noch (Partial/Debounce)
+      case 'transcribing':     // STT verarbeitet die Nutzereingabe
+      case 'transcribing_slow':
+        setAvatar('listening');
         break;
-      case 'loading':
-      case 'collecting':
-        waifu.setState('thinking');
-        break;
-      default:                 // listening / idle / recording / error
-        waifu.setState('idle');
+      default:                 // listening / idle / loading / recording / error
+        setAvatar('idle');
     }
+  }
+
+  // setAgentBusy(true) faellt exakt mit reply.start / "Joy denkt nach" zusammen;
+  // false kommt nur auf Nicht-Audio-Enden (silent/error/discard/abort).
+  function hookAgentBusy() {
+    if (typeof window.setAgentBusy !== 'function') {
+      return setTimeout(hookAgentBusy, 300);
+    }
+    if (window.__waifuBusyHooked) return;
+    window.__waifuBusyHooked = true;
+    var orig = window.setAgentBusy;
+    window.setAgentBusy = function (v) {
+      try {
+        if (v) {
+          agentThinking = true;
+          if (waifu && !animTest) setAvatar('thinking');
+        } else {
+          agentThinking = false;
+          if (waifu && !animTest && avatarMode === 'thinking') setAvatar('idle');
+        }
+      } catch (_) {}
+      return orig.apply(this, arguments);
+    };
   }
 
   // Lip-Sync-Treiber: laeuft dauerhaft solange der Avatar gemountet ist und
@@ -188,68 +313,91 @@
         playing = (typeof anyAudioPlaying === 'function' && anyAudioPlaying())
                || (typeof replayPlaying !== 'undefined' && replayPlaying);
       } catch (_) {}
-      if (playing) {
+      // Anim-Test 'speaking': Fake-Mund, damit der Zustand komplett zu sehen ist
+      var testTalk = !!(animTest && animTest.kind === 'state' && animTest.name === 'speaking');
+      if (playing || testTalk) {
+        if (!animTest) {
+          // TTS laeuft wirklich -> Nachdenken ist vorbei, Sprech-Koerpersprache.
+          agentThinking = false;
+          if (avatarMode !== 'speaking') setAvatar('speaking');
+        }
         var t = (now - t0) / 1000;
         var v = Math.abs(Math.sin(t * 9) * 0.5 + Math.sin(t * 14) * 0.3);
         waifu.setMouth(Math.min(1, v));
       } else {
+        if (!animTest && avatarMode === 'speaking') setAvatar('idle');
         waifu.setMouth(0);
       }
-      pumpEmotes(playing, now);
-      speakingPulse = requestAnimationFrame(step);
+      scheduleTalkPulse(step);
     };
-    speakingPulse = requestAnimationFrame(step);
+    scheduleTalkPulse(step);
+  }
+
+  // requestAnimationFrame pausiert/drosselt in Hintergrund-Tabs (siehe waifu.js
+  // scheduleFrame) -> ohne Fallback wuerde Lip-Sync/Emote-Pumping komplett
+  // stehen bleiben, sobald der Tab in den Hintergrund geht.
+  function scheduleTalkPulse(step) {
+    if (typeof document !== 'undefined' && document.hidden) {
+      speakingPulseIsTimeout = true;
+      speakingPulse = setTimeout(function () { step(performance.now()); }, 200);
+    } else {
+      speakingPulseIsTimeout = false;
+      speakingPulse = requestAnimationFrame(step);
+    }
   }
 
   function stopTalkDriver() {
-    if (speakingPulse) cancelAnimationFrame(speakingPulse);
+    if (speakingPulse) {
+      if (speakingPulseIsTimeout) clearTimeout(speakingPulse); else cancelAnimationFrame(speakingPulse);
+    }
     speakingPulse = null;
     if (waifu) waifu.setMouth(0);
   }
 
-  /* ---- Nonverbal-Tags -> Emotes ----------------------------------------- */
-  // Tags stehen im Reply-Text ([laughter], [sigh], *lacht*, ...). Der Text
-  // laeuft der Stimme voraus, deshalb werden erkannte Emotes gepuffert und
-  // erst abgespielt, wenn wirklich Audio laeuft (talkDriver zieht sie ab).
-  var TAG_EMOTES = [
-    [/\[laughter\]|\*lacht\*|\bhaha+h*a*\b/i, 'laugh'],
-    [/\[sigh\]|\*seufzt\*/i, 'sigh'],
-    [/\[surprise-wa\]|\*staunt\*/i, 'surprise'],
-    [/\[confirmation-en\]|\*nickt\*/i, 'nod'],
-    [/\[dissatisfaction-hnn\]|\*brummt\*/i, 'grumble'],
-    [/\*laechelt\*|\*lächelt\*|\*grinst\*/i, 'smile'],
-  ];
-  var emoteQueue = [];
-  var emoteTail = '';        // Delta-Grenzen: Tag kann ueber 2 Deltas splitten
-  var lastEmoteAt = 0;
-  var lastPlayingAt = 0;     // letzter Zeitpunkt mit aktivem Audio (Stille-Timeout)
+  /* ---- Audio-coupled cues (server audio.mark) --------------------------
+     ALL emotes are driven by server `audio.mark` events now: the server
+     detects the tags per sentence (incl. the silent avatar tags, BEFORE the
+     sanitizer strips them) and ships a mark right before that sentence's
+     audio chunks; playback.js pins it to the exact playback moment and hands
+     us the delay-until-start on the audio clock. So an emote fires when the
+     TTS actually SPEAKS the tagged sentence — not when the text streamed in
+     (the old TAG_EMOTES scan ran ahead of the voice by a variable distance).
+     'laughter' additionally carries the real laugh duration and is stopped
+     with the sound; all other kinds are start-only, the clip runs through
+     (or is overridden by the next emote). Global hooks so the voice chat is
+     untouched. */
   var thinkingTurn = null;   // Turn, fuer den bereits 'thinking' gesetzt wurde
-
-  function scanForEmotes(delta) {
-    var text = emoteTail + (delta || '');
-    for (var i = 0; i < TAG_EMOTES.length; i++) {
-      if (TAG_EMOTES[i][0].test(text)) {
-        if (emoteQueue.length < 4) emoteQueue.push(TAG_EMOTES[i][1]);
-        text = text.replace(TAG_EMOTES[i][0], '');
-      }
-    }
-    emoteTail = text.slice(-24);
+  var cueTimers = [];
+  var lastCueEmote = null;   // zuletzt per Cue gestartetes Emote
+  function clearCueTimers() {
+    while (cueTimers.length) clearTimeout(cueTimers.pop());
   }
-
-  function pumpEmotes(playing, now) {
-    if (!playing) {
-      // Erst nach laengerer Stille verwerfen (kurze Luecken zwischen
-      // Audio-Chunks sollen einen gepufferten Emote nicht wegwerfen).
-      if (emoteQueue.length && now - lastPlayingAt > 4000) emoteQueue.length = 0;
-      return;
+  // Barge-in / hard stop (from playback.js): drop scheduled cues AND cut an
+  // emote that is already playing — otherwise the clip runs its full length
+  // after the audio was cut.
+  window.__cancelAudioCue = function () {
+    clearCueTimers();
+    lastCueEmote = null;
+    try { if (waifu && waifu.stopEmote) waifu.stopEmote(); } catch (_) {}
+  };
+  window.__playAudioCue = function (kind, delayMs, durMs) {
+    if (!waifu || animTest) return;                 // test mode owns the avatar
+    var emote = (kind === 'laughter') ? 'lachen' : kind;
+    cueTimers.push(setTimeout(function () {
+      try {
+        if (waifu && waifu.isReady()) { lastCueEmote = emote; waifu.emote(emote); }
+      } catch (_) {}
+    }, Math.max(0, delayMs | 0)));
+    // Laughter is duration-coupled: stop when the laugh AUDIO ends (stopEmote
+    // fades out) — unless a later cue already took over the avatar.
+    if (kind === 'laughter') {
+      cueTimers.push(setTimeout(function () {
+        try {
+          if (waifu && waifu.stopEmote && lastCueEmote === 'lachen') waifu.stopEmote();
+        } catch (_) {}
+      }, Math.max(0, (delayMs | 0) + (durMs | 0))));
     }
-    lastPlayingAt = now;
-    if (!emoteQueue.length) return;
-    // Mindestabstand nur ZWISCHEN Emotes; das erste nach Audio-Start sofort.
-    if (lastEmoteAt && now - lastEmoteAt < 1600) return;
-    lastEmoteAt = now;
-    try { waifu.emote(emoteQueue.shift()); } catch (_) {}
-  }
+  };
 
   function hookReplyTags() {
     if (typeof window.appendAgentBubbleDelta !== 'function') {
@@ -261,13 +409,13 @@
     window.appendAgentBubbleDelta = function (turnId, delta) {
       try {
         if (waifu) {
-          // Erstes Delta dieses Turns => das LLM formuliert gerade => nachdenken.
-          // (Bleibt bis der talkDriver bei echtem Audio auf 'speaking' schaltet.)
+          // Fallback: erstes Delta dieses Turns => LLM arbeitet. Normalerweise
+          // steht agentThinking schon seit reply.start (hookAgentBusy); das
+          // hier greift nur, falls der Busy-Hook nicht installiert werden konnte.
           if (turnId !== thinkingTurn) {
             thinkingTurn = turnId;
-            waifu.setState('thinking');
+            if (!animTest && avatarMode !== 'speaking') { agentThinking = true; setAvatar('thinking'); }
           }
-          scanForEmotes(delta);
         }
       } catch (_) {}
       return orig.apply(this, arguments);
