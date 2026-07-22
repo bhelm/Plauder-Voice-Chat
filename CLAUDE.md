@@ -325,31 +325,46 @@ exports `WAIFU_MODE=1` by default.
   `Waifu.emote(name)` plays a matching **VRMA clip** (`static/anims/*.vrma`,
   from `tk256ailab/vrm-viewer`, MIT) blended over the procedural pose via an
   AnimationMixer + per-bone quaternion slerp (rotation tracks only — no root
-  motion, no expression-track conflicts with lip-sync); blend weights use
+  motion, no expression-track conflicts with lip-sync; exception:
+  `ROOT_MOTION_CLIPS` (Jump) keep the hips-position track, applied as the
+  weighted VERTICAL delta vs. the clip's first frame so the model really
+  lifts off without lateral drift); blend weights use
   time-based smoothstep envelopes (zero velocity at both ends), and `CLIP_END`
   plays the end of clips whose authored return motion is too abrupt
   (HeadScratch) in slow motion (timeScale ramp, keeps arms/head/body moving
   continuously) while blending back to the procedural pose; facial expression
   runs in parallel. Public API: `mount/unmount/setMouth/setState/emote/stopEmote/
-  emoteActive/emoteNames/isReady/resize`.
+  emoteActive/emoteNames/clipNames/playRawClip/isReady/resize` (`clipNames`/
+  `playRawClip` = unmapped raw clips, the anim tester's extra "unused clips"
+  group).
 - **`static/js/waifu_ui.js`** — classic script (global scope like the others).
   Owns the toggle, the docked stage, the pop-out window (physically **moves** the
   canvas into a `window.open()` doc — renderer/state survive; double-click =
   fullscreen), lazy loading, and the non-invasive hooks: it wraps the global
-  `setMicUi` for body-language state, and wraps `appendAgentBubbleDelta` to (a)
-  set `thinking` on the first reply delta and (b) scan reply text for nonverbal
-  tags (`[laughter]`/`[sigh]`/`*lacht*`/…) → queued emotes. **Lip-sync** is a
+  `setMicUi` for body-language state, and wraps `appendAgentBubbleDelta` to
+  set `thinking` on the first reply delta. **Emotes are audio-cued, not
+  text-cued:** the server detects nonverbal tags per sentence
+  (`_EMOTE_TAG_PATTERNS` in server.py, on the RAW sentence before
+  `sanitize_for_tts` strips the silent avatar tags) and ships in-order
+  `audio.mark` events ahead of that sentence's chunks; playback.js pins them
+  to the WebAudio clock (`streamCues`/`markStreamCue`) and calls
+  `__playAudioCue`, so an emote fires when the TTS actually SPEAKS the tagged
+  sentence. `laughter` additionally carries the real laugh duration (own
+  synthesis unit via `_split_laugh_units`) and is stopped with the sound; all
+  other kinds are start-only and the clip runs through (marks are per-turn,
+  cancelled on barge-in via `__cancelAudioCue`). No marks on the classic
+  `STREAMING=0` path — emotes simply don't fire there. **Lip-sync** is a
   standalone rAF driver that reads the real playback state (`anyAudioPlaying()`
   from playback.js, plus `replayPlaying`) — deliberately NOT `setMicUi` events,
-  which fire on VAD/transcript mid-playback and used to kill the mouth. The
-  emote queue only fires while audio actually plays (text streams ahead of
-  speech) and is discarded after real silence. An **anim tester** under the
-  docked stage (select + play/stop toggle) triggers every emote (looped) and
-  body-language state (held) manually without the LLM; while a test runs, all
-  automatic hooks (mic/busy/talkDriver/emote queue) skip their `setAvatar`
-  calls so nothing overrides it.
-- The `joy.vrm` model lives in `static/models/` (gitignored like the other
-  models). `static/waifu_test.html` is a standalone dev harness for the avatar.
+  which fire on VAD/transcript mid-playback and used to kill the mouth. An
+  **anim tester** under the docked stage (select + play/stop toggle) triggers
+  every emote (looped) and body-language state (held) manually without the
+  LLM; while a test runs, all automatic hooks (mic/busy/talkDriver/cues) skip
+  their `setAvatar` calls so nothing overrides it.
+- Models live in `static/models/`: `joy.vrm` (gitignored — size/licensing) is
+  preferred; the freely usable `default.vrm` IS committed and serves as the
+  fallback (`MODEL_URLS` chain in waifu.js), so a fresh checkout has a working
+  avatar. `static/waifu_test.html` is a standalone dev harness for the avatar.
   Avatar UI strings use `waifu.*` / `settings.sec_waifu` i18n keys (both locales).
 
 ## Conventions & gotchas

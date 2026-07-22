@@ -10,10 +10,14 @@
  *   Waifu.setMouth(v)        -> Lip-Sync: v in [0..1] auf 'aa'-Expression
  *   Waifu.setState(s)        -> 'idle' | 'listening' | 'speaking' | 'thinking'
  *   Waifu.emote(n)           -> kurze Emote-Animation: 'lachen'|'sigh'|'surprise'|
- *                               'nod'|'grumble'|'smile'|'scratch'; liefert Dauer (s)
+ *                               'nod'|'grumble'|'blush'|'question'|'scratch'|
+ *                               'clap'|'jump'|'lookaround'|'relax'|'sleepy'|
+ *                               'wave'; liefert Dauer (s)
  *   Waifu.stopEmote()        -> laufendes Emote (inkl. VRMA-Clip) weich abbrechen
  *   Waifu.emoteActive()      -> bool: Emote oder Clip laeuft gerade noch
  *   Waifu.emoteNames()       -> Liste aller Emote-Namen (fuer den Anim-Tester)
+ *   Waifu.clipNames()        -> ungemappte Roh-Clips (fuer den Anim-Tester)
+ *   Waifu.playRawClip(n)     -> Roh-Clip einmal abspielen (Preview)
  *   Waifu.setExpression(n,v) -> beliebige VRM-Expression setzen (happy/angry/...)
  *   Waifu.isReady()          -> bool
  *
@@ -28,20 +32,38 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VRMLoaderPlugin, VRMUtils } from 'three-vrm';
 import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from 'three-vrm-animation';
 
-const MODEL_URL = (window.__BASE_PATH__ || '') + '/static/models/joy.vrm';
+// Bevorzugtes Modell zuerst; joy.vrm ist gitignoriert (Lizenz/Groesse),
+// default.vrm liegt frei nutzbar im Repo — Fallback fuer frische Checkouts.
+const MODEL_URLS = [
+  (window.__BASE_PATH__ || '') + '/static/models/joy.vrm',
+  (window.__BASE_PATH__ || '') + '/static/models/default.vrm',
+];
 const ANIM_URL = (window.__BASE_PATH__ || '') + '/static/anims/';
 
 // Emote -> VRMA-Clip (aus tk256ailab/vrm-viewer, MIT). Nicht gemappte Emotes
-// (nod) bleiben prozedural.
+// (nod) bleiben prozedural, bis ein passender Clip gefunden ist.
 const EMOTE_CLIPS = {
   lachen: 'Lachen',       // Lach-Koerperbewegung ohne Klatschen, happy/Lach-Augen
                           // darueber (tools/make_lachen_vrma.py)
   sigh: 'Sad',
   surprise: 'Surprised',
   grumble: 'Angry',
-  smile: 'Blush',
+  blush: 'Blush',
+  question: 'HeadScratch', // wie die Thinking-Kratz-Geste, nur sofort (s. Emote-Case)
   scratch: 'HeadScratch', // Blush-Koerpergeste ohne Mimik (tools/make_head_scratch_vrma.py)
+  clap: 'Clapping',
+  jump: 'Jump',           // ROOT_MOTION_CLIPS: hebt wirklich ab
+  lookaround: 'LookAround',
+  relax: 'Relax',
+  sleepy: 'Sleepy',
+  wave: 'Wave',           // selbst geschrieben: tools/make_wave_vrma.py
 };
+
+// Noch keinem Emote zugeordnete Roh-Clips — nur fuer die Preview im
+// Anim-Tester (eigene Rubrik), Kandidaten fuer spaetere Mappings.
+const PREVIEW_CLIPS = [
+  'unused/Goodbye', 'unused/Thinking',
+];
 
 // Ruhepose: Arme entspannt nach unten (VRM-Grundpose ist T-Pose)
 const REST = {
@@ -56,7 +78,12 @@ const BONES = ['head', 'neck', 'spine', 'chest', 'hips',
   'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm', 'rightHand'];
 
 // Emote-Dauern in Sekunden
-const EMOTE_DUR = { lachen: 2.4, sigh: 2.8, surprise: 1.6, nod: 1.4, grumble: 2.0, smile: 2.5, scratch: 5.3 };
+const EMOTE_DUR = {
+  lachen: 2.4, sigh: 2.8, surprise: 1.6, nod: 1.4, grumble: 2.0, blush: 2.5,
+  question: 5.3, scratch: 5.3,
+  clap: 3.9, jump: 3.9, lookaround: 3.9, relax: 3.9, sleepy: 3.9,  // = Cliplaenge
+  wave: 3.6,
+};
 
 const state = {
   renderer: null, scene: null, camera: null, controls: null,
@@ -140,7 +167,16 @@ function initScene(canvas) {
 async function loadVRM() {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
-  const gltf = await loader.loadAsync(MODEL_URL);
+  let gltf = null;
+  for (const url of MODEL_URLS) {
+    try {
+      gltf = await loader.loadAsync(url);
+      break;
+    } catch (e) {
+      console.warn('[waifu] model not loadable, trying fallback:', url, e);
+    }
+  }
+  if (!gltf) throw new Error('no VRM model loadable (' + MODEL_URLS.join(', ') + ')');
   const vrm = gltf.userData.vrm;
 
   VRMUtils.removeUnnecessaryVertices(gltf.scene);
@@ -174,9 +210,25 @@ const CLIP_FADE_OUT = 0.9;   // s: Ausblenden am Clip-Ende bzw. nach stopEmote()
 // nur langsamer; parallel blendet ein Smoothstep (fadeAt -> fadeEnd) auf die
 // prozedurale Idle-Pose. Alle Zeiten in CLIP-Zeit (action.time); realDur ist
 // die resultierende Echtzeit-Dauer (fuer die Emote-Buchhaltung, simuliert).
-const CLIP_END = { HeadScratch: {
-  slowAt: 2.45, slowEnd: 2.75, slowTo: 0.4, fadeAt: 2.9, fadeEnd: 3.7, realDur: 5.3,
-} };
+const CLIP_END = {
+  HeadScratch: {
+    slowAt: 2.45, slowEnd: 2.75, slowTo: 0.4, fadeAt: 2.9, fadeEnd: 3.7, realDur: 5.3,
+  },
+  // Wave: KEIN Slow-Motion (slowTo 1), nur ein spaeter Fade. Der generische
+  // Once-Fade wuerde 0.9s vor Clip-Ende beginnen und den noch winkenden Arm
+  // Richtung Ruhepose (Arme unten) ziehen — der Unterarm sackte mitten im
+  // Winken ab. Der Clip senkt den Arm selbst (2.7-3.55, endet exakt auf der
+  // Ruhepose), der Fade laeuft nur parallel zum authored Abstieg.
+  Wave: {
+    slowAt: 9, slowEnd: 10, slowTo: 1, fadeAt: 3.0, fadeEnd: 3.55, realDur: 3.6,
+  },
+};
+
+// Root-Motion-Ausnahme: Clips, deren Hips-Translation NICHT verworfen wird,
+// damit z.B. ein Sprung wirklich abhebt. Angewendet wird nur der VERTIKALE
+// Anteil relativ zum ersten Frame (updateClip) — seitliche Drift wuerde das
+// Modell von der Buehne tragen. Name ohne 'unused/'-Prefix.
+const ROOT_MOTION_CLIPS = new Set(['Jump']);
 
 async function loadClip(name) {
   if (state.clipCache[name]) return state.clipCache[name];
@@ -188,14 +240,29 @@ async function loadClip(name) {
   const clip = createVRMAnimationClip(anim, state.vrm);
   // Nur Rotations-Tracks: hips.position (Root-Motion) wuerde das Modell
   // versetzen, Expression-Tracks kollidieren mit Lip-Sync/Emotionen.
-  clip.tracks = clip.tracks.filter((tr) => tr.name.endsWith('.quaternion'));
+  // Ausnahme ROOT_MOTION_CLIPS: deren Hips-Position-Track bleibt drin und
+  // wird in updateClip auf den vertikalen Anteil reduziert.
+  const hipsNode = state.vrm.humanoid && state.vrm.humanoid.getNormalizedBoneNode('hips');
+  const keepRoot = hipsNode && ROOT_MOTION_CLIPS.has(name.replace(/^unused\//, ''));
+  let pos = null;
+  clip.tracks = clip.tracks.filter((tr) => {
+    if (tr.name.endsWith('.quaternion')) return true;
+    if (!keepRoot || !tr.name.endsWith('.position')) return false;
+    if (THREE.PropertyBinding.parseTrackName(tr.name).nodeName !== hipsNode.name) return false;
+    pos = {
+      node: hipsNode,
+      ref: new THREE.Vector3(tr.values[0], tr.values[1], tr.values[2]),
+      rest: hipsNode.position.clone(),
+    };
+    return true;
+  });
   const nodes = [];
   for (const tr of clip.tracks) {
     const nodeName = THREE.PropertyBinding.parseTrackName(tr.name).nodeName;
     const node = THREE.PropertyBinding.findNode(state.vrm.scene, nodeName);
     if (node && !nodes.includes(node)) nodes.push(node);
   }
-  const entry = { clip, nodes };
+  const entry = { clip, nodes, pos };
   state.clipCache[name] = entry;
   return entry;
 }
@@ -220,6 +287,8 @@ async function playClip(name, opts) {
     state.clip = {
       name, action, nodes: entry.nodes,
       pre: entry.nodes.map(() => new THREE.Quaternion()),
+      mix: null,                 // letzte Mixer-Pose je Node (s. updateClip)
+      pos: entry.pos || null,    // Root-Motion (ROOT_MOTION_CLIPS): Hips-Hoehe
       w: 0, once: !!opts.once, dur: effDur, end, t: 0,
       fade: null, fadeFrom: 0,   // stopEmote(): zeitbasierter Abbruch-Fade
     };
@@ -263,6 +332,7 @@ function updateClip(dt) {
   }
   if (c.w <= 0.001 && c.t > CLIP_FADE_IN) {
     c.action.stop();
+    if (c.pos) c.pos.node.position.copy(c.pos.rest);   // Hips sicher zurueck
     state.clip = null;
     return;
   }
@@ -272,8 +342,26 @@ function updateClip(dt) {
     // Ruhepose (Identity) — sonst bleibt Clip-Residuum haengen.
     if (!state.boneNodes || !state.boneNodes.has(n)) n.quaternion.copy(IDENT_Q);
     c.pre[i].copy(n.quaternion);
+    // three's PropertyMixer schreibt nur bei WERT-AENDERUNG auf den Node
+    // ("value has changed -> update scene graph"). Bei konstanten Keyframes
+    // (z.B. der gehaltene Arm im Wave-Clip) bliebe sonst die soeben gesetzte
+    // prozedurale Pose stehen und der Slerp saehe den Clip nie — der Arm
+    // sackte mitten in der Geste auf die Ruhepose ab. Deshalb vor dem
+    // Mixer-Update die letzte Mixer-Pose zuruecklegen; der Mixer
+    // ueberschreibt sie nur, wenn sich der Track-Wert wirklich aendert.
+    if (c.mix) n.quaternion.copy(c.mix[i]);
   }
   state.mixer.update(dt);
+  if (!c.mix) c.mix = c.nodes.map((n) => n.quaternion.clone());
+  else for (let i = 0; i < c.nodes.length; i++) c.mix[i].copy(c.nodes[i].quaternion);
+  if (c.pos) {
+    // Root-Motion: nur der Hoehenanteil relativ zum ersten Frame des Tracks,
+    // gewichtet wie die Rotations-Blends — seitliche/bleibende Drift faellt
+    // weg, und bei w->0 landet die Hips exakt auf der Ruhe-Position.
+    const jumpY = c.pos.node.position.y - c.pos.ref.y;
+    c.pos.node.position.copy(c.pos.rest);
+    c.pos.node.position.y += jumpY * c.w;
+  }
   for (let i = 0; i < c.nodes.length; i++) {
     const n = c.nodes[i];
     _q.copy(c.pre[i]).slerp(n.quaternion, c.w);
@@ -382,14 +470,42 @@ function computeTargets(dt) {
         break;
       case 'nod':
         exprT.happy = 0.25 * amp;
-        add('head', Math.sin(p * Math.PI * 4) * 0.12 * (1 - p), 0, 0);
+        add('head', Math.sin(p * Math.PI * 4) * 0.19 * (1 - p), 0, 0);
+        add('neck', Math.sin(p * Math.PI * 4) * 0.05 * (1 - p), 0, 0);
+        break;
+      case 'question':
+        // Wie Thinking, nur OHNE Staffelung: Kopf sofort schief legen
+        // (Stufe-1-Werte) — die Kratz-Geste (HeadScratch-Clip) laeuft
+        // parallel direkt an.
+        add('head', 0.04 * amp, 0.08 * amp, 0.20 * amp);
+        add('neck', 0, 0, 0.06 * amp);
         break;
       case 'grumble':
         exprT.angry = 0.5 * amp;
+        squint = Math.max(squint, 0.35 * amp);  // Zukneifen wie im Thinking
         break;
-      case 'smile':
+      case 'blush':
         exprT.happy = 0.6 * amp;
         add('head', -0.02 * amp, 0, 0.04 * amp);
+        break;
+      case 'clap':
+        exprT.happy = 0.7 * amp;
+        break;
+      case 'jump':
+        exprT.happy = amp;              // freudiger Sprung
+        break;
+      case 'lookaround':
+        exprT.surprised = 0.2 * amp;    // neugierig; Kopf/Blick kommt aus dem Clip
+        break;
+      case 'relax':
+        exprT.relaxed = 0.8 * amp;
+        break;
+      case 'sleepy':
+        exprT.relaxed = 0.6 * amp;
+        squint = Math.max(squint, 0.8 * amp);   // Augen fallen zu
+        break;
+      case 'wave':
+        exprT.happy = 0.6 * amp;                // freundliches Winken
         break;
     }
     if (p >= 1) state.emote = null;
@@ -568,6 +684,11 @@ const Waifu = {
   },
   emoteActive() { return !!(state.emote || state.clip); },
   emoteNames() { return Object.keys(EMOTE_DUR); },
+  clipNames() { return PREVIEW_CLIPS.slice(); },
+  playRawClip(name) {
+    if (!PREVIEW_CLIPS.includes(name)) return;
+    playClip(name, { once: true });
+  },
   setExpression(name, v) { state.vrm?.expressionManager?.setValue(name, v); },
   resize: onResize,
   isReady() { return state.ready; },

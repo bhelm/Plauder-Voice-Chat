@@ -175,6 +175,10 @@ function startStreamPlayback(turnId, audioId, sampleRate, codec) {
     coalesce: [],        // decoded opus packets awaiting one merged push
     coalesceSamples: 0,
   };
+  // Drop only STALE cues (different turn): a mark at the very start of a
+  // reply arrives BEFORE this audio.start creates the player — those cues
+  // belong to THIS turn and must survive.
+  streamCues = streamCues.filter((c) => c.turnId === turnId);
   if (codec === 'opus') {
     try {
       streamPlayer.decoder = makeDownlinkOpusDecoder(turnId, sampleRate || 24000);
@@ -274,6 +278,18 @@ function closeStreamDecoder(sp) {
   }
 }
 
+// audio.mark: arrives just before the marked unit's audio chunks, so it pins
+// to the NEXT scheduled chunk (see pushStreamChunk). Kept in a module queue,
+// not on streamPlayer: a mark at the very start of a reply arrives BEFORE
+// audio.start creates the player, and the cue must survive that gap. turnId
+// carries the match instead. A queue (not a single slot): a sentence can
+// carry several emote tags, so several marks may precede the same chunk.
+let streamCues = [];   // [{ turnId, kind, durMs }] in arrival order
+function markStreamCue(turnId, kind, durMs) {
+  streamCues.push({ turnId, kind, durMs: durMs || 0 });
+  if (streamCues.length > 16) streamCues.shift();   // runaway guard
+}
+
 function pushStreamChunk(turnId, int16) {
   if (!streamPlayer || streamPlayer.turnId !== turnId) return;
   if (!int16 || !int16.length) return;
@@ -304,6 +320,19 @@ function pushStreamChunk(turnId, int16) {
   }
   const startAt = streamPlayer.nextTime;
   if (streamPlayer.startTime == null) streamPlayer.startTime = startAt;
+  // Pending cues (audio.mark: laughter + emote tags) pin to THIS chunk: its
+  // audio starts at startAt on the ctx clock, so we hand the avatar the exact
+  // delay-until-start (and duration, where the mark carries one). Kept out of
+  // the pipeline via an optional global hook — the voice chat runs on
+  // unaffected if the avatar is off.
+  if (streamCues.length) {
+    const fire = [];
+    streamCues = streamCues.filter((c) => (c.turnId === turnId ? (fire.push(c), false) : true));
+    const delayMs = Math.max(0, (startAt - ctx.currentTime) * 1000);
+    for (const cue of fire) {
+      try { window.__playAudioCue && window.__playAudioCue(cue.kind, delayMs, cue.durMs); } catch (_) {}
+    }
+  }
   node.start(startAt);
   streamPlayer.nextTime = startAt + buf.duration;
   streamPlayer.sources.add(node);
@@ -385,6 +414,11 @@ function stopStreamPlayback() {
   streamPlayer = null;            // detach first, so onended does nothing anymore
   closeStreamDecoder(sp);         // opus: drop in-flight decodes with the stream
   for (const n of sp.sources) { try { n.stop(); } catch (_) {} try { n.disconnect(); } catch (_) {} }
+  // Barge-in / hard stop: kill cues scheduled ahead on the ctx clock. Only
+  // THIS turn's cues — cues for the turn that is ABOUT to start (marks
+  // already received, audio.start triggered this stop) must survive.
+  streamCues = streamCues.filter((c) => c.turnId !== sp.turnId);
+  try { window.__cancelAudioCue && window.__cancelAudioCue(); } catch (_) {}
   if (currentTurnId === sp.turnId) { currentTurnId = null; currentAudioId = null; }
   // Aborted (barge-in/stop) → don't cache; possibly clear the pause flag.
   if (playbackUserPaused) { playbackUserPaused = false; if (playbackCtx) { try { playbackCtx.resume(); } catch (_) {} } }

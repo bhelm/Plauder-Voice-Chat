@@ -2,7 +2,7 @@
 """Derive HeadScratch.vrma from Blush.vrma (body animation only).
 
 The Blush clip from tk256ailab/vrm-viewer carries the classic embarrassed
-head-scratch gesture as its BODY animation — the smiling face of the 'smile'
+head-scratch gesture as its BODY animation — the smiling face of the 'blush'
 emote is procedural in waifu.js, not part of the file (Blush.vrma has no
 expression/lookAt tracks at all). For the thinking stage we reuse exactly
 that gesture; the 'scratch' emote has no facial overlay, so the face stays

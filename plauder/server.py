@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from collections import deque
@@ -651,6 +652,77 @@ async def _tts_synth_stream(text: str, speed: float, voice: str | None = None):
             yield pcm, sr
 
 
+# A laughter unit = the nonverbal tag plus the spelled-out laugh right after it
+# (the system prompt writes "[laughter] Hahaha!"), or a bare spelled laugh, or
+# the German soft tag. Split on these so the LAUGH becomes its own TTS unit —
+# its audio then has a known start offset + duration, which is what lets the
+# avatar's laugh animation be coupled to the actual sound instead of the text
+# stream (see the laughter-coupling plan). Matches sanitizer's laughter set.
+_LAUGH_UNIT_RE = re.compile(
+    r"\[laugh(?:s|ter)?\](?:\s*(?:ha|he|hi){2,}h?[!.…]*)?"
+    r"|\*lacht\*"
+    r"|\b(?:ha){2,}h?\b|\b(?:he){2,}h?\b|\b(?:hi){2,}h?\b",
+    re.IGNORECASE)
+
+
+# Emote tags -> avatar cue kind. Mirrors the client's cue table (waifu_ui.js
+# __playAudioCue): every kind here maps 1:1 onto a client emote name. Detected
+# on the RAW sentence in _release() — BEFORE sanitize_for_tts strips the
+# silent avatar tags ([blush], [wave], ...) — and shipped as start-only
+# `audio.mark` events right before the sentence's audio chunks, so the emote
+# fires when the TTS actually SPEAKS that sentence (same principle as the
+# laughter mark, just without the duration coupling: clips run through).
+# Laughter is NOT here — it has its own audio-coupled path (_split_laugh_units).
+_EMOTE_TAG_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\[sigh\]|\*seufzt\*", re.IGNORECASE), "sigh"),
+    (re.compile(r"\[surprise-(?:ah|oh|wa|yo)\]|\*staunt\*|\*überrascht\*|\*ueberrascht\*",
+                re.IGNORECASE), "surprise"),
+    (re.compile(r"\[question-(?:en|ah|oh|ei|yi)\]", re.IGNORECASE), "question"),
+    (re.compile(r"\[confirmation-en\]|\*nickt\*", re.IGNORECASE), "nod"),
+    (re.compile(r"\[dissatisfaction-hnn\]|\*brummt\*", re.IGNORECASE), "grumble"),
+    (re.compile(r"\[blush(?:es|ing)?\]", re.IGNORECASE), "blush"),
+    (re.compile(r"\[clap(?:s|ping)?\]|\[applause\]", re.IGNORECASE), "clap"),
+    (re.compile(r"\[jump(?:s|ing)?\]", re.IGNORECASE), "jump"),
+    (re.compile(r"\[look(?:s)?[ -]?around\]", re.IGNORECASE), "lookaround"),
+    (re.compile(r"\[relax(?:es|ed)?\]", re.IGNORECASE), "relax"),
+    (re.compile(r"\[sleepy\]|\[yawn(?:s|ing)?\]|\[tired\]", re.IGNORECASE), "sleepy"),
+    (re.compile(r"\[wave(?:s|ing)?(?:-hand)?\]", re.IGNORECASE), "wave"),
+]
+
+
+def _detect_emote_kinds(text: str) -> list[str]:
+    """Cue kinds in order of first appearance (one per kind)."""
+    hits = []
+    for rx, kind in _EMOTE_TAG_PATTERNS:
+        m = rx.search(text)
+        if m:
+            hits.append((m.start(), kind))
+    hits.sort()
+    return [kind for _, kind in hits]
+
+
+def _split_laugh_units(text: str) -> list[tuple[str, bool]]:
+    """Cut a sentence into ordered ``(text, is_laugh)`` parts. Non-laugh text is
+    left whole, so a sentence without any laughter is returned unchanged as a
+    single non-laugh part — no behaviour change for the common case."""
+    parts: list[tuple[str, bool]] = []
+    last = 0
+    for m in _LAUGH_UNIT_RE.finditer(text):
+        if m.start() > last:
+            pre = text[last:m.start()].strip()
+            if pre:
+                parts.append((pre, False))
+        laugh = m.group().strip()
+        if laugh:
+            parts.append((laugh, True))
+        last = m.end()
+    if last < len(text):
+        rest = text[last:].strip()
+        if rest:
+            parts.append((rest, False))
+    return parts or [(text, False)]
+
+
 class _StreamingReply:
     """One streaming turn (A1+A2): LLM tokens are read live; as soon as a
     sentence is complete, it goes into the TTS queue. A parallel TTS worker
@@ -696,6 +768,7 @@ class _StreamingReply:
         self.parts: list[str] = []     # all LLM deltas received so far
         self.held: list[str] = []      # finished sentences still waiting for TTS release
         self.pending = ""              # partial sentence not yet split off
+        self.pending_kinds: list[str] = []  # emote tags of tag-only sentences (no audio)
         self.flushed_any = False
         self.sent_len = 0              # text length already sent to the client
         self.audio_started = False
@@ -742,13 +815,31 @@ class _StreamingReply:
         sem = asyncio.Semaphore(1 + TTS_PREFETCH)
         order_q: asyncio.Queue = asyncio.Queue()
 
-        async def _synth_to_queue(sentence: str, chunk_q: asyncio.Queue):
+        async def _synth_to_queue(sentence: str, chunk_q: asyncio.Queue,
+                                  is_laugh: bool = False,
+                                  marks: list[str] | None = None):
             if self.t_tts0 is None:
                 self.t_tts0 = time.time()
+            # Start-only cues (emote tags of this sentence): shipped ahead of
+            # the sentence's audio chunks, in-order — the client pins them to
+            # the playback clock like the laughter mark (no duration).
+            for kind in (marks or []):
+                await chunk_q.put({"mark": kind})
             # Per-sentence lead gate: OmniVoice prepends a faint noise blob to
             # every synthesis — audible as a tiny "hah" at each sentence seam.
             gate = None
             last_sr = None
+            # Laugh unit: buffer the whole (short) blob so its exact duration is
+            # known, then emit an `audio.mark` at its HEAD — the client schedules
+            # the laugh animation against its playback clock (sample-accurate).
+            buf: list | None = [] if is_laugh else None
+
+            async def _emit(pcm, sr):
+                if buf is not None:
+                    buf.append((pcm, sr))
+                else:
+                    await chunk_q.put((pcm, sr))
+
             try:
                 async for pcm, sr in _tts_synth_stream(sentence, state.speed,
                                                        self.reply_voice):
@@ -757,13 +848,20 @@ class _StreamingReply:
                     last_sr = sr
                     pcm = gate.process(pcm)
                     if pcm:
-                        await chunk_q.put((pcm, sr))
+                        await _emit(pcm, sr)
                 # Never-opened gate: ship the held tail as silence so the
                 # sentence's duration (and thus pause timing) is preserved.
                 if gate is not None and last_sr is not None:
                     tail = gate.flush()
                     if tail:
-                        await chunk_q.put((tail, last_sr))
+                        await _emit(tail, last_sr)
+                if buf is not None:
+                    total = sum(len(p) for p, _ in buf)
+                    sr = last_sr or (self.sr or 24000)
+                    dur_ms = int(total / 2 / sr * 1000)   # int16 bytes → ms
+                    await chunk_q.put({"mark": "laughter", "durMs": dur_ms})
+                    for item in buf:
+                        await chunk_q.put(item)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -774,16 +872,27 @@ class _StreamingReply:
 
         async def _feeder():
             while True:
-                sentence = await self.sentence_q.get()
-                if sentence is None:
+                item = await self.sentence_q.get()
+                if item is None:
                     await order_q.put(None)
                     return
-                await sem.acquire()
-                chunk_q: asyncio.Queue = asyncio.Queue()
-                task = asyncio.create_task(_synth_to_queue(sentence, chunk_q))
-                synth_tasks.add(task)
-                task.add_done_callback(synth_tasks.discard)
-                await order_q.put(chunk_q)
+                sentence, kinds = item
+                # Split the laugh out so it is its own synthesis unit (for the
+                # audio-coupled laugh animation). Sentences without laughter come
+                # back as a single non-laugh part — unchanged behaviour. The
+                # emote-tag marks ride on the sentence's FIRST unit, so they
+                # fire when the sentence starts playing.
+                first = True
+                for text, is_laugh in _split_laugh_units(sentence):
+                    await sem.acquire()
+                    chunk_q: asyncio.Queue = asyncio.Queue()
+                    task = asyncio.create_task(
+                        _synth_to_queue(text, chunk_q, is_laugh,
+                                        kinds if first else None))
+                    first = False
+                    synth_tasks.add(task)
+                    task.add_done_callback(synth_tasks.discard)
+                    await order_q.put(chunk_q)
 
         feeder_task = asyncio.create_task(_feeder())
 
@@ -799,7 +908,16 @@ class _StreamingReply:
                     yield item
 
         try:
-            async for pcm, sr in _iter_chunks_in_order():
+            async for item in _iter_chunks_in_order():
+                if isinstance(item, dict) and "mark" in item:
+                    # In-order cue (laughter): shipped right before the laugh's
+                    # audio chunks so the client can align the animation to it.
+                    await ws.send_json({
+                        "type": "audio.mark", "turnId": turn_id,
+                        "kind": item["mark"], "durMs": item.get("durMs", 0),
+                        "ts": time.time()})
+                    continue
+                pcm, sr = item
                 if not pcm:
                     continue
                 if not self.audio_started:
@@ -882,11 +1000,20 @@ class _StreamingReply:
         if not self.flushed_any and not force and sanitizer.is_no_reply_prefix(full):
             return  # could still become NO_REPLY → hold back the sentences
         while self.held:
-            cleaned = sanitizer.sanitize_for_tts(self.held.pop(0),
+            raw = self.held.pop(0)
+            # Detect emote tags BEFORE sanitizing — the silent avatar tags
+            # would not survive sanitize_for_tts. A sentence that consists of
+            # nothing but a silent tag produces no audio; its kinds ride
+            # along on the next spoken sentence instead of getting lost.
+            kinds = self.pending_kinds + _detect_emote_kinds(raw)
+            cleaned = sanitizer.sanitize_for_tts(raw,
                                                  pronunciations_file=self.pron)
             if cleaned:
-                await self.sentence_q.put(cleaned)
+                self.pending_kinds = []
+                await self.sentence_q.put((cleaned, kinds))
                 self.flushed_any = True
+            else:
+                self.pending_kinds = kinds
 
     async def _echo_stream(self):
         yield self.combined

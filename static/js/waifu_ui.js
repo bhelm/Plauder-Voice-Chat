@@ -125,7 +125,7 @@
       names.forEach(function (n) {
         var o = document.createElement('option');
         o.value = kind + ':' + n;
-        o.textContent = n;
+        o.textContent = n.replace(/^unused\//, '');
         g.appendChild(o);
       });
       animSelect.appendChild(g);
@@ -133,6 +133,10 @@
     var emotes = (waifu && waifu.emoteNames) ? waifu.emoteNames() : [];
     addGroup(tr('waifu.anim_emotes', 'Emotes'), 'emote', emotes);
     addGroup(tr('waifu.anim_states', 'States'), 'state', TEST_STATES);
+    // Roh-Clips ohne Emote-Mapping (siehe PREVIEW_CLIPS in waifu.js) —
+    // Preview-Rubrik, um Kandidaten fuer neue Mappings zu sichten.
+    var clips = (waifu && waifu.clipNames) ? waifu.clipNames() : [];
+    if (clips.length) addGroup(tr('waifu.anim_clips', 'Unused clips'), 'clip', clips);
   }
 
   function onAnimToggle() {
@@ -145,11 +149,15 @@
       if (kind === 'state') {
         setAvatar(name);
       } else {
-        waifu.emote(name);
-        // Schleife: neu ausloesen, sobald der vorige Durchlauf (inkl.
+        // 'emote' oder 'clip' (Roh-Clip-Preview) — beide loopen ueber
+        // emoteActive(): neu ausloesen, sobald der vorige Durchlauf (inkl.
         // VRMA-Clip-Ausblenden) wirklich fertig ist.
+        var fire = (kind === 'clip')
+          ? function () { waifu.playRawClip(name); }
+          : function () { waifu.emote(name); };
+        fire();
         animTest.timer = setInterval(function () {
-          try { if (waifu && !waifu.emoteActive()) waifu.emote(name); } catch (_) {}
+          try { if (waifu && !waifu.emoteActive()) fire(); } catch (_) {}
         }, 300);
       }
       if (animBtn) { animBtn.textContent = '⏹'; animBtn.title = tr('waifu.anim_stop', 'Stop'); }
@@ -320,7 +328,6 @@
         if (!animTest && avatarMode === 'speaking') setAvatar('idle');
         waifu.setMouth(0);
       }
-      pumpEmotes(playing, now);
       scheduleTalkPulse(step);
     };
     scheduleTalkPulse(step);
@@ -347,50 +354,50 @@
     if (waifu) waifu.setMouth(0);
   }
 
-  /* ---- Nonverbal-Tags -> Emotes ----------------------------------------- */
-  // Tags stehen im Reply-Text ([laughter], [sigh], *lacht*, ...). Der Text
-  // laeuft der Stimme voraus, deshalb werden erkannte Emotes gepuffert und
-  // erst abgespielt, wenn wirklich Audio laeuft (talkDriver zieht sie ab).
-  var TAG_EMOTES = [
-    [/\[laugh(?:s|ter)?\]|\*lacht\*|\b(?:ha){2,}h?\b|\b(?:he){2,}h?\b|\b(?:hi){2,}h?\b/i, 'lachen'],
-    [/\[sigh\]|\*seufzt\*/i, 'sigh'],
-    [/\[surprise-wa\]|\*staunt\*/i, 'surprise'],
-    [/\[confirmation-en\]|\*nickt\*/i, 'nod'],
-    [/\[dissatisfaction-hnn\]|\*brummt\*/i, 'grumble'],
-    [/\*laechelt\*|\*lächelt\*|\*grinst\*/i, 'smile'],
-  ];
-  var emoteQueue = [];
-  var emoteTail = '';        // Delta-Grenzen: Tag kann ueber 2 Deltas splitten
-  var lastEmoteAt = 0;
-  var lastPlayingAt = 0;     // letzter Zeitpunkt mit aktivem Audio (Stille-Timeout)
+  /* ---- Audio-coupled cues (server audio.mark) --------------------------
+     ALL emotes are driven by server `audio.mark` events now: the server
+     detects the tags per sentence (incl. the silent avatar tags, BEFORE the
+     sanitizer strips them) and ships a mark right before that sentence's
+     audio chunks; playback.js pins it to the exact playback moment and hands
+     us the delay-until-start on the audio clock. So an emote fires when the
+     TTS actually SPEAKS the tagged sentence — not when the text streamed in
+     (the old TAG_EMOTES scan ran ahead of the voice by a variable distance).
+     'laughter' additionally carries the real laugh duration and is stopped
+     with the sound; all other kinds are start-only, the clip runs through
+     (or is overridden by the next emote). Global hooks so the voice chat is
+     untouched. */
   var thinkingTurn = null;   // Turn, fuer den bereits 'thinking' gesetzt wurde
-
-  function scanForEmotes(delta) {
-    var text = emoteTail + (delta || '');
-    for (var i = 0; i < TAG_EMOTES.length; i++) {
-      if (TAG_EMOTES[i][0].test(text)) {
-        if (emoteQueue.length < 4) emoteQueue.push(TAG_EMOTES[i][1]);
-        text = text.replace(TAG_EMOTES[i][0], '');
-      }
-    }
-    emoteTail = text.slice(-24);
+  var cueTimers = [];
+  var lastCueEmote = null;   // zuletzt per Cue gestartetes Emote
+  function clearCueTimers() {
+    while (cueTimers.length) clearTimeout(cueTimers.pop());
   }
-
-  function pumpEmotes(playing, now) {
-    if (animTest) { emoteQueue.length = 0; return; }   // Test laeuft -> nichts dazwischenfunken
-    if (!playing) {
-      // Erst nach laengerer Stille verwerfen (kurze Luecken zwischen
-      // Audio-Chunks sollen einen gepufferten Emote nicht wegwerfen).
-      if (emoteQueue.length && now - lastPlayingAt > 4000) emoteQueue.length = 0;
-      return;
+  // Barge-in / hard stop (from playback.js): drop scheduled cues AND cut an
+  // emote that is already playing — otherwise the clip runs its full length
+  // after the audio was cut.
+  window.__cancelAudioCue = function () {
+    clearCueTimers();
+    lastCueEmote = null;
+    try { if (waifu && waifu.stopEmote) waifu.stopEmote(); } catch (_) {}
+  };
+  window.__playAudioCue = function (kind, delayMs, durMs) {
+    if (!waifu || animTest) return;                 // test mode owns the avatar
+    var emote = (kind === 'laughter') ? 'lachen' : kind;
+    cueTimers.push(setTimeout(function () {
+      try {
+        if (waifu && waifu.isReady()) { lastCueEmote = emote; waifu.emote(emote); }
+      } catch (_) {}
+    }, Math.max(0, delayMs | 0)));
+    // Laughter is duration-coupled: stop when the laugh AUDIO ends (stopEmote
+    // fades out) — unless a later cue already took over the avatar.
+    if (kind === 'laughter') {
+      cueTimers.push(setTimeout(function () {
+        try {
+          if (waifu && waifu.stopEmote && lastCueEmote === 'lachen') waifu.stopEmote();
+        } catch (_) {}
+      }, Math.max(0, (delayMs | 0) + (durMs | 0))));
     }
-    lastPlayingAt = now;
-    if (!emoteQueue.length) return;
-    // Mindestabstand nur ZWISCHEN Emotes; das erste nach Audio-Start sofort.
-    if (lastEmoteAt && now - lastEmoteAt < 1600) return;
-    lastEmoteAt = now;
-    try { waifu.emote(emoteQueue.shift()); } catch (_) {}
-  }
+  };
 
   function hookReplyTags() {
     if (typeof window.appendAgentBubbleDelta !== 'function') {
@@ -409,7 +416,6 @@
             thinkingTurn = turnId;
             if (!animTest && avatarMode !== 'speaking') { agentThinking = true; setAvatar('thinking'); }
           }
-          scanForEmotes(delta);
         }
       } catch (_) {}
       return orig.apply(this, arguments);

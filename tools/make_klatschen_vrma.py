@@ -8,7 +8,7 @@ leaves the face free for the procedural layer of waifu.js (mode overlays,
 lookAt, lip-sync). The source has no expression/lookAt tracks at all, so
 there is no facial animation to strip beyond that.
 
-  1. read unused/Clapping.vrma (GLB)
+  1. read Clapping.vrma (GLB)
   2. keep only rotation channels (drops hips root motion) whose target bone is
      NOT head or neck
   3. rename the animation to 'Klatschen', declare specVersion 1.0
@@ -17,7 +17,7 @@ there is no facial animation to strip beyond that.
 import json
 import struct
 
-SRC = 'static/anims/unused/Clapping.vrma'
+SRC = 'static/anims/Clapping.vrma'
 DST = 'static/anims/Klatschen.vrma'
 
 # head motion: 'neck' is dropped too — it swings the head just as much as

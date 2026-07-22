@@ -26,6 +26,11 @@ house_data/
 
 # Speaker lock: downloaded embedding models + the enrolled voice profile
 models/
+# Waifu avatar: VRM models stay local (size/licensing) — EXCEPT the freely
+# usable default avatar, which ships with the repo as a fallback
+!static/models/
+static/models/*
+!static/models/default.vrm
 *.onnx
 speaker_profile.json
 # Single-Mode-Profile pro Agent (biometrische Stimm-Embeddings)

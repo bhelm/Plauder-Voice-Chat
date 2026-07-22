@@ -2151,6 +2151,11 @@
           renderTtsStat();
         }
       },
+      'audio.mark': (m) => {
+        // In-order playback cue (e.g. laughter): pin it to the next audio
+        // chunk so the avatar can align to the real sound (see playback.js).
+        try { markStreamCue(m.turnId, m.kind, m.durMs); } catch (_) {}
+      },
       'audio.meta': (m) => {
         // Klassischer Pfad (STREAMING=0): WAV folgt als VCT1-Binary.
         appendTtsToAgentBubble(m.turnId, m.ttsMs);

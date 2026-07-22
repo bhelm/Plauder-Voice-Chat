@@ -7,7 +7,7 @@ drop every arm channel (shoulder/upper arm/lower arm/hand/fingers); those bones
 then stay on the procedural layer of waifu.js (REST pose, arms down, idle sway)
 because the clip layer only touches nodes it has tracks for.
 
-  1. read unused/Clapping.vrma (GLB)
+  1. read Clapping.vrma (GLB)
   2. keep only rotation channels (drops hips root motion) whose target bone is
      NOT part of an arm
   3. rename the animation to 'Lachen', declare specVersion 1.0
@@ -16,7 +16,7 @@ because the clip layer only touches nodes it has tracks for.
 import json
 import struct
 
-SRC = 'static/anims/unused/Clapping.vrma'
+SRC = 'static/anims/Clapping.vrma'
 DST = 'static/anims/Lachen.vrma'
 
 # substrings that mark a humanoid bone as "arm" (fingers included)

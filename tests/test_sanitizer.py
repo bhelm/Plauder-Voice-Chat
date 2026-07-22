@@ -129,3 +129,60 @@ def test_strip_ghost_sentences_embedded():
     # Disabled filter → no-op.
     hf_off = sanitizer.HallucinationFilter(enabled=False)
     assert hf_off.strip_ghost_sentences("A. Vielen Dank. B.") == "A. Vielen Dank. B."
+
+
+# --- laugh-unit splitting (audio-coupled laugh animation) --------------------
+def test_split_laugh_units_isolates_tag_plus_spelled_laugh():
+    from plauder.server import _split_laugh_units
+    assert _split_laugh_units("[laughter] Hahaha! Und weiter.") == [
+        ("[laughter] Hahaha!", True), ("Und weiter.", False)]
+
+
+def test_split_laugh_units_midsentence():
+    from plauder.server import _split_laugh_units
+    assert _split_laugh_units("Das war lustig [laughter] wirklich.") == [
+        ("Das war lustig", False), ("[laughter]", True), ("wirklich.", False)]
+
+
+def test_split_laugh_units_plain_sentence_unchanged():
+    from plauder.server import _split_laugh_units
+    assert _split_laugh_units("Ein ganz normaler Satz.") == [
+        ("Ein ganz normaler Satz.", False)]
+
+
+def test_split_laugh_units_bare_soft_tag():
+    from plauder.server import _split_laugh_units
+    assert _split_laugh_units("*lacht* na gut.") == [
+        ("*lacht*", True), ("na gut.", False)]
+
+
+# --- emote-tag detection (audio-cued avatar emotes) --------------------------
+def test_detect_emote_kinds_silent_and_omnivoice_tags():
+    from plauder.server import _detect_emote_kinds
+    # silent avatar tag + OmniVoice tag, in text order
+    assert _detect_emote_kinds("Na gut [sigh], dann eben [wave] tschüss.") == [
+        "sigh", "wave"]
+
+
+def test_detect_emote_kinds_order_of_appearance():
+    from plauder.server import _detect_emote_kinds
+    assert _detect_emote_kinds("[blush] also [confirmation-en] ja.") == [
+        "blush", "nod"]
+
+
+def test_detect_emote_kinds_german_soft_tags_and_variants():
+    from plauder.server import _detect_emote_kinds
+    assert _detect_emote_kinds("*staunt* [waves-hand] [yawn]") == [
+        "surprise", "wave", "sleepy"]
+
+
+def test_detect_emote_kinds_plain_text_empty():
+    from plauder.server import _detect_emote_kinds
+    assert _detect_emote_kinds("Ein ganz normaler Satz ohne alles.") == []
+
+
+def test_detect_emote_kinds_ignores_laughter():
+    # laughter has its own audio-coupled path (_split_laugh_units) and must
+    # NOT additionally produce a start-only mark
+    from plauder.server import _detect_emote_kinds
+    assert _detect_emote_kinds("[laughter] Hahaha!") == []
